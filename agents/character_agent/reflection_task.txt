@@ -1,0 +1,41 @@
+## Self-Reflection Phase
+
+Time has passed and several events have occurred. Before continuing, take a moment to reflect on your recent experiences and update your self-reflection.
+
+You are pausing to look inward — reviewing what happened, how your feelings shifted, and what you want next.
+
+Below are your recent thoughts from the last several turns:
+
+{recent_thoughts}
+
+And here is your current self-reflection (if any — it may be empty on first reflection):
+
+{current_reflection}
+
+---
+
+**Instructions:**
+
+Review the above and produce an updated self-reflection using the `output_reflection` tool. Treat this as a merge + refine update (not a rewrite): start from current reflection entries, integrate recent thoughts, then decide what to keep, update, merge, add, or remove within the fixed limits.
+
+Guidelines:
+- **relationships**: List entities (people, organizations, factions) you have formed an opinion about. Include their nature (ally, enemy, acquaintance, subordinate, etc.), your attitude toward them, and any relevant notes. Refine existing entries first, remove entries that are no longer relevant, and merge duplicates.
+- **goals**: List your current goals with priority (immediate/short-term/long-term) and status (active/planned/completed/abandoned). Refine existing goals first, remove completed or abandoned goals if they are no longer relevant, and add only meaningful new goals that emerged from recent events.
+- **beliefs**: List factual beliefs about the world — things you've learned, rules you've discovered, assumptions you hold. Refine existing beliefs first, remove beliefs that were proven wrong, and add only meaningful new ones.
+- **emotional_state**: A brief description of your current emotional state and trajectory. How do you feel? Is that changing?
+
+Hard limits (must obey):
+- relationships: at most 12
+- goals: at most 8
+- beliefs: at most 20
+- emotional_state: one short paragraph only
+
+Selection priority when over limit:
+1) keep items directly relevant to your current and near-future actions,
+2) keep items reinforced by recent events,
+3) keep high-impact long-term items (strategic goals, stable world rules, enduring relationships) so short-term items do not replace everything,
+4) drop stale or duplicate items.
+
+Be selective — this is a living document, not a diary. Keep what matters, drop what doesn't. Prefer updating/merging old entries over adding many short-term new ones.
+
+Reflect as your character would, in their voice and mindset.

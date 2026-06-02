@@ -4,6 +4,5 @@ game
 logs/*
 backups/*
 setups/*
-*.txt
 __pycache__/
 .tmp_*.py
