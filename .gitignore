@@ -6,3 +6,5 @@ backups/*
 setups/*
 __pycache__/
 .tmp_*.py
+scripts/*
+.env
