@@ -1,0 +1,65 @@
+<div class="config-section">
+  <div class="config-section-title">Game Controls</div>
+
+  {% if message %}
+    <div class="config-message {{ 'success' if success else 'error' }}">{{ message }}</div>
+  {% endif %}
+
+  <div class="form-section">
+    <div class="form-section-title">Restart Game</div>
+    <p style="color:var(--muted);font-size:14px;margin:0 0 16px 0;line-height:1.5">
+      This will <strong style="color:#f87171">delete all current game progress</strong> and start fresh using the characters and plot defined in init/.
+      Make sure to create a backup first if you want to save your current game state.
+    </p>
+    
+    <div class="config-row" style="align-items:center">
+      <div class="config-field" style="flex:0 0 auto">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <input type="checkbox" id="confirm-restart" style="width:auto" />
+          <span>I understand this will delete my current game</span>
+        </label>
+      </div>
+    </div>
+    
+    <div class="config-actions" style="margin-top:16px;justify-content:flex-start">
+      <button class="btn btn-danger"
+              id="restart-btn"
+              hx-post="/api/config/game/restart"
+              hx-target="#config-game"
+              hx-swap="innerHTML"
+              disabled
+              onclick="return confirm('Are you absolutely sure you want to restart? All progress will be lost.')">
+        <span style="display:flex;align-items:center;gap:6px">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+            <path d="M3 3v5h5"/>
+          </svg>
+          Restart Game
+        </span>
+      </button>
+    </div>
+  </div>
+</div>
+
+<div class="config-section">
+  <div class="config-section-title">Current Game Status</div>
+  <div class="form-section">
+    <div class="kv"><span class="k">Game folder:</span> <span>{{ game_exists and 'Exists' or 'Not initialized' }}</span></div>
+    {% if game_exists %}
+    <div class="kv"><span class="k">Characters:</span> <span>{{ character_count }} character(s)</span></div>
+    <div class="kv"><span class="k">Story file:</span> <span>{{ story_exists and 'Present' or 'Not created yet' }}</span></div>
+    {% endif %}
+  </div>
+</div>
+
+<script>
+(function() {
+  const checkbox = document.getElementById('confirm-restart');
+  const btn = document.getElementById('restart-btn');
+  if (checkbox && btn) {
+    checkbox.addEventListener('change', function() {
+      btn.disabled = !this.checked;
+    });
+  }
+})();
+</script>

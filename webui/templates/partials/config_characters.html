@@ -1,0 +1,186 @@
+<div class="config-section">
+  <div class="config-section-title">Initial Characters (init/)</div>
+  <div class="config-section-subtitle">Character definitions used when starting a new game. Changes won't affect an already-running game.</div>
+
+  {% if message %}
+    <div class="config-message {{ 'success' if success else 'error' }}">{{ message }}</div>
+  {% endif %}
+
+  {% if characters %}
+    {% for char in characters %}
+      <div class="config-card" x-data="{ expanded: false }">
+        <div class="config-card-header" @click="expanded = !expanded">
+          <div>
+            <div class="config-card-title">{{ char.name }}</div>
+            <div class="config-card-subtitle">{{ char.race or 'Unknown race' }} · {{ char.location or 'No location' }}</div>
+          </div>
+          <div class="config-card-actions">
+            <button class="btn btn-danger" 
+                    hx-delete="/api/config/character/{{ char.name | urlencode }}"
+                    hx-target="#config-characters"
+                    hx-swap="innerHTML"
+                    hx-confirm="Delete character '{{ char.name }}'? This cannot be undone."
+                    @click.stop>
+              Delete
+            </button>
+            <span class="btn" x-text="expanded ? '▲' : '▼'"></span>
+          </div>
+        </div>
+        <div class="config-card-body" :class="expanded ? 'expanded' : 'collapsed'">
+          <form hx-post="/api/config/character/{{ char.name | urlencode }}"
+                hx-target="#config-characters"
+                hx-swap="innerHTML">
+            
+            <div class="form-section">
+              <div class="form-section-title">Basic Info</div>
+              <div class="config-field">
+                <label>General Description <span class="required">*</span></label>
+                <textarea name="general" rows="3" required>{{ char.general or '' }}</textarea>
+              </div>
+              <div class="config-row">
+                <div class="config-field">
+                  <label>Race <span class="required">*</span></label>
+                  <input type="text" name="race" value="{{ char.race or '' }}" placeholder="e.g., Human, Elf, Undead" required />
+                </div>
+                <div class="config-field">
+                  <label>Starting Location</label>
+                  <input type="text" name="location" value="{{ char.location or '' }}" placeholder="e.g., Castle Entrance" />
+                </div>
+              </div>
+            </div>
+
+            <div class="form-section">
+              <div class="form-section-title">Personality</div>
+              <div class="config-row">
+                <div class="config-field">
+                  <label>MBTI Type</label>
+                  <input type="text" name="personality_mbti" value="{{ char.personality.mbti if char.personality else '' }}" placeholder="e.g., INTJ, ENFP" />
+                </div>
+                <div class="config-field">
+                  <label>Alignment</label>
+                  <select name="personality_alignment">
+                    <option value="">-- Select --</option>
+                    {% for align in ['Lawful Good', 'Neutral Good', 'Chaotic Good', 'Lawful Neutral', 'True Neutral', 'Chaotic Neutral', 'Lawful Evil', 'Neutral Evil', 'Chaotic Evil', 'Extremely Evil'] %}
+                      <option value="{{ align }}" {{ 'selected' if char.personality and char.personality.alignment == align else '' }}>{{ align }}</option>
+                    {% endfor %}
+                  </select>
+                </div>
+              </div>
+              <div class="config-field">
+                <label>Traits</label>
+                <input type="text" name="personality_traits" value="{{ char.personality.traits if char.personality else '' }}" placeholder="e.g., Brave, Cautious, Cunning" />
+              </div>
+              <div class="config-field">
+                <label>Personality Details</label>
+                <textarea name="personality_details" rows="5" placeholder="Detailed personality description, motivations, backstory notes...">{{ char.personality.details if char.personality else '' }}</textarea>
+              </div>
+            </div>
+
+            <div class="form-section">
+              <div class="form-section-title">Appearance</div>
+              <div class="config-field">
+                <label>Physical Description</label>
+                <textarea name="appearance" rows="3">{{ char.appearance.base if char.appearance else '' }}</textarea>
+              </div>
+            </div>
+
+            <div class="form-section">
+              <div class="form-section-title">Status</div>
+              <div class="config-row">
+                <div class="config-field">
+                  <label>Health</label>
+                  <select name="status_health">
+                    <option value="healthy" {{ 'selected' if char.status and char.status.health == 'healthy' else '' }}>Healthy</option>
+                    <option value="injured" {{ 'selected' if char.status and char.status.health == 'injured' else '' }}>Injured</option>
+                    <option value="critical" {{ 'selected' if char.status and char.status.health == 'critical' else '' }}>Critical</option>
+                  </select>
+                </div>
+                <div class="config-field" style="flex:2">
+                  <label>Current State / Situation</label>
+                  <input type="text" name="status_state" value="{{ char.status.state if char.status else '' }}" placeholder="e.g., Resting at camp" />
+                </div>
+              </div>
+            </div>
+
+            <div class="form-section">
+              <div class="form-section-title">Skills & Equipment</div>
+              <div class="config-field">
+                <label>Skills / Abilities</label>
+                <textarea name="skills" rows="2">{{ char.skills_text or '' }}</textarea>
+              </div>
+              <div class="config-field">
+                <label>Equipment</label>
+                <textarea name="equipment" rows="2">{{ char.equipment_text or '' }}</textarea>
+              </div>
+            </div>
+
+            <div class="config-actions">
+              <button type="submit" class="btn btn-primary">Save Changes</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    {% endfor %}
+  {% else %}
+    <div class="config-empty">No characters found in init/characters/</div>
+  {% endif %}
+</div>
+
+<div class="config-section">
+  <div class="config-section-title">Add New Character</div>
+  <form hx-post="/api/config/character"
+        hx-target="#config-characters"
+        hx-swap="innerHTML">
+    
+    <div class="form-section">
+      <div class="config-row">
+        <div class="config-field">
+          <label>Character Name <span class="required">*</span></label>
+          <input type="text" name="name" placeholder="e.g., Gandalf" required />
+        </div>
+        <div class="config-field">
+          <label>Race <span class="required">*</span></label>
+          <input type="text" name="race" placeholder="e.g., Human, Elf" required />
+        </div>
+      </div>
+      <div class="config-field">
+        <label>General Description <span class="required">*</span></label>
+        <textarea name="general" rows="3" placeholder="Brief description of who this character is..." required></textarea>
+      </div>
+      <div class="config-field">
+        <label>Personality</label>
+        <div class="config-row">
+          <div class="config-field">
+            <label>MBTI Type</label>
+            <input type="text" name="personality_mbti" placeholder="e.g., INTJ, ENFP" />
+          </div>
+          <div class="config-field">
+            <label>Alignment</label>
+            <select name="personality_alignment">
+              <option value="">-- Select --</option>
+              {% for align in ['Lawful Good', 'Neutral Good', 'Chaotic Good', 'Lawful Neutral', 'True Neutral', 'Chaotic Neutral', 'Lawful Evil', 'Neutral Evil', 'Chaotic Evil', 'Extremely Evil'] %}
+                <option value="{{ align }}">{{ align }}</option>
+              {% endfor %}
+            </select>
+          </div>
+        </div>
+        <div class="config-field">
+          <label>Traits</label>
+          <input type="text" name="personality_traits" placeholder="e.g., Brave, Cautious, Cunning" />
+        </div>
+        <div class="config-field">
+          <label>Personality Details</label>
+          <textarea name="personality_details" rows="5" placeholder="Detailed personality description, motivations, backstory notes..."></textarea>
+        </div>
+      </div>
+      <div class="config-field">
+        <label>Starting Location</label>
+        <input type="text" name="location" placeholder="e.g., The Shire" />
+      </div>
+    </div>
+
+    <div class="config-actions">
+      <button type="submit" class="btn btn-primary">Create Character</button>
+    </div>
+  </form>
+</div>

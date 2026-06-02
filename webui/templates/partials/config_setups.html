@@ -1,0 +1,64 @@
+<div class="config-section">
+  <div class="config-section-title">Setup Profiles</div>
+  <div class="config-section-subtitle">
+    Save and load initial setup profiles (init/characters + init/plot.json). This does not modify game/ directly.
+  </div>
+
+  {% if message %}
+    <div class="config-message {{ 'success' if success else 'error' }}">{{ message }}</div>
+  {% endif %}
+
+  <form hx-post="/api/config/setup"
+        hx-target="#config-setups"
+        hx-swap="innerHTML"
+        style="margin-bottom:20px">
+    <div class="config-row" style="align-items:flex-end">
+      <div class="config-field">
+        <label>Setup Name</label>
+        <input type="text" name="name" required placeholder="e.g., overlord_core_cast" />
+      </div>
+      <button type="submit" class="btn btn-primary">Save Setup</button>
+    </div>
+  </form>
+</div>
+
+<div class="config-section">
+  <div class="config-section-title">Saved Setups</div>
+
+  {% if setups %}
+    {% for setup in setups %}
+      <div class="backup-item">
+        <div class="backup-info">
+          <div class="backup-name">{{ setup.name }}</div>
+          <div class="backup-meta">
+            {{ setup.date }} · {{ setup.characters }} character(s) · plot: {{ setup.plot_exists and 'yes' or 'no' }} · {{ setup.size }}
+          </div>
+        </div>
+        <div class="backup-actions">
+          <button class="btn"
+                  hx-post="/api/config/setup/{{ setup.name | urlencode }}/load"
+                  hx-target="#config-setups"
+                  hx-swap="innerHTML"
+                  hx-confirm="Load setup '{{ setup.name }}' into init/? Then use Restart Game to apply.">
+            Load
+          </button>
+          <button class="btn btn-danger"
+                  hx-delete="/api/config/setup/{{ setup.name | urlencode }}"
+                  hx-target="#config-setups"
+                  hx-swap="innerHTML"
+                  hx-confirm="Delete setup '{{ setup.name }}'? This cannot be undone.">
+            Delete
+          </button>
+        </div>
+      </div>
+    {% endfor %}
+  {% else %}
+    <div class="config-empty">No setup profiles yet. Save your current init configuration first.</div>
+  {% endif %}
+</div>
+
+<div class="config-section">
+  <div class="config-section-subtitle">
+    Tip: after loading a setup into init/, open Game tab and click Restart Game to apply it to active game state.
+  </div>
+</div>

@@ -1,0 +1,13 @@
+{% if note %}
+  <div class="muted">{{ note }}</div>
+{% endif %}
+
+{% if text %}
+  <pre class="mono">{{ text }}</pre>
+{% else %}
+  {% if mode == 'turn' %}
+    <div class="empty">(turn finished — stream cleared)</div>
+  {% else %}
+    <div class="empty">(stream is empty)</div>
+  {% endif %}
+{% endif %}

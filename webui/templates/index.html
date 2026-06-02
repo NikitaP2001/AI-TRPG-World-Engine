@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LLM World</title>
+
+  <link rel="stylesheet" href="/static/app.css" />
+
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
+</head>
+<body x-data="{ showLog: false, showConfig: false, configTab: 'characters', showSidebar: false, turnInProgress: false }"
+     @htmx:before-request.camel="if ($event.detail.requestConfig && $event.detail.requestConfig.verb === 'post' && $event.detail.elt.closest('#composer')) turnInProgress = true"
+     @htmx:after-request.camel="if ($event.detail.elt.closest('#composer')) turnInProgress = false">
+  <div x-show="showSidebar" @click="showSidebar = false"
+       style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:199"></div>
+  <aside class="sidebar"
+         :style="showSidebar ? 'position:fixed;top:0;left:0;bottom:0;height:100vh;width:260px;z-index:200;overflow-y:auto;background:#111827;padding:14px;transform:translateX(0)' : ''">
+      <div class="brand-row">
+        <div class="brand">LLM World</div>
+        <div style="display:flex;gap:6px">
+          <button class="config-btn" @click="showConfig = true; configTab = 'game'" title="Restart Game"
+                  style="color:#f87171">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+              <path d="M3 3v5h5"/>
+            </svg>
+          </button>
+          <button class="config-btn" @click="showConfig = true" title="Settings">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="3"/>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+      <div class="sidebar-section">
+        <div class="sidebar-title">Arcs</div>
+        <div class="tree">
+          {% for arc in arc_tree %}
+            <div class="tree-arc">
+              <div class="tree-arc-title">{{ arc.name }}</div>
+
+              {% if arc.has_ongoing %}
+                <button
+                  class="tree-item {% if current_arc == arc.arc_index and current_para == 'ongoing' %}active{% endif %}"
+                  hx-get="/partials/chat?arc={{ arc.arc_index }}&para=ongoing&limit=10"
+                  hx-target="#chat"
+                  hx-swap="innerHTML"
+                  hx-push-url="/?arc={{ arc.arc_index }}&para=ongoing"
+                >
+                  Ongoing
+                </button>
+              {% endif %}
+
+              {% for p in arc.paragraphs %}
+                <button
+                  class="tree-item {% if current_arc == arc.arc_index and current_para == (p.paragraph_index|string) %}active{% endif %}"
+                  hx-get="/partials/chat?arc={{ arc.arc_index }}&para={{ p.paragraph_index }}&limit=10"
+                  hx-target="#chat"
+                  hx-swap="innerHTML"
+                  hx-push-url="/?arc={{ arc.arc_index }}&para={{ p.paragraph_index }}"
+                >
+                  {{ p.name }}
+                </button>
+              {% endfor %}
+            </div>
+          {% endfor %}
+        </div>
+  </aside>
+
+  <div class="app" :class="showLog ? 'with-log' : ''">
+    <main class="main">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button class="hamburger" @click="showSidebar = !showSidebar">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+          </button>
+          <div class="title">Chat</div>
+          <div class="subtitle">Shows last 10 finalized turns</div>
+        </div>
+        <div class="topbar-right">
+          <span id="conn" class="pill">connecting</span>
+          <button class="btn" style="margin-left:10px" @click="showLog = !showLog" :class="showLog ? 'active' : ''">
+            Stream log
+          </button>
+        </div>
+      </header>
+
+      <section class="debugbar" id="debug" hx-get="/partials/debug_clear" hx-trigger="load" hx-swap="innerHTML"></section>
+
+      <section class="chat" id="chat">
+        {% include 'partials/chat.html' %}
+      </section>
+
+      <section
+        class="composer"
+        id="composer"
+        hx-get="/partials/composer"
+        hx-trigger="load"
+        hx-swap="innerHTML"
+      ></section>
+    </main>
+
+    <aside class="logpane" x-show="showLog" x-cloak
+           :style="showLog && window.innerWidth <= 1100 ? 'display:flex;position:fixed;inset:0;z-index:200;background:#0b0f14;flex-direction:column' : ''">
+      <div class="logpane-header">
+        <div>
+          <div class="logpane-title">Live stream</div>
+          <div class="logpane-subtitle">Tail of logs/stream.txt (auto-updates)</div>
+        </div>
+        <button class="btn" @click="showLog = false">Close</button>
+      </div>
+
+      <div
+        class="logpane-body"
+        id="streamlog"
+        hx-get="/partials/stream_log?mode=turn&lines=600"
+        hx-trigger="load, every 750ms"
+        hx-swap="innerHTML"
+        x-data="{ savedScrollTop: 0 }"
+        @htmx:before-swap.camel="savedScrollTop = $el.scrollTop"
+        @htmx:after-swap.camel="$el.scrollTop = savedScrollTop"
+      ></div>
+    </aside>
+
+    <!-- Config Modal -->
+    <div class="modal-overlay" x-show="showConfig" x-cloak @click.self="showConfig = false">
+      <div class="modal">
+        <div class="modal-header">
+          <div class="modal-title">Settings</div>
+          <button class="btn" @click="showConfig = false">×</button>
+        </div>
+        <div class="modal-tabs">
+          <button class="modal-tab" :class="configTab === 'game' ? 'active' : ''" @click="configTab = 'game'">Game</button>
+          <button class="modal-tab" :class="configTab === 'setups' ? 'active' : ''" @click="configTab = 'setups'">Setups</button>
+          <button class="modal-tab" :class="configTab === 'characters' ? 'active' : ''" @click="configTab = 'characters'">Characters</button>
+          <button class="modal-tab" :class="configTab === 'plot' ? 'active' : ''" @click="configTab = 'plot'">Plot</button>
+          <button class="modal-tab" :class="configTab === 'backups' ? 'active' : ''" @click="configTab = 'backups'">Backups</button>
+        </div>
+        <div class="modal-body">
+          <div x-show="configTab === 'game'"
+               id="config-game"
+               hx-get="/partials/config_game"
+               hx-trigger="intersect once"
+               hx-swap="innerHTML">
+            <div class="empty">Loading...</div>
+          </div>
+          <div x-show="configTab === 'setups'"
+               id="config-setups"
+               hx-get="/partials/config_setups"
+               hx-trigger="intersect once"
+               hx-swap="innerHTML">
+            <div class="empty">Loading...</div>
+          </div>
+          <div x-show="configTab === 'characters'"
+               id="config-characters"
+               hx-get="/partials/config_characters"
+               hx-trigger="intersect once"
+               hx-swap="innerHTML">
+            <div class="empty">Loading...</div>
+          </div>
+          <div x-show="configTab === 'plot'"
+               id="config-plot"
+               hx-get="/partials/config_plot"
+               hx-trigger="intersect once"
+               hx-swap="innerHTML">
+            <div class="empty">Loading...</div>
+          </div>
+          <div x-show="configTab === 'backups'"
+               id="config-backups"
+               hx-get="/partials/config_backups"
+               hx-trigger="intersect once"
+               hx-swap="innerHTML">
+            <div class="empty">Loading...</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+  (function () {
+    const conn = document.getElementById('conn');
+    let es = null;
+
+    function currentParams() {
+      const params = new URLSearchParams(window.location.search);
+      return {
+        arc: params.get('arc') ?? '0',
+        para: params.get('para') ?? 'ongoing',
+      };
+    }
+
+    // Panel state to restore after chat is refreshed by story_changed.
+    // Keyed by article index so the same turn re-opens after innerHTML swap.
+    let _savedPanels = [];
+
+    document.getElementById('chat').addEventListener('htmx:afterSwap', () => {
+      if (_savedPanels.length === 0) return;
+      const toRestore = _savedPanels.splice(0);
+      // Wait for Alpine to initialise the newly-inserted article elements.
+      Alpine.nextTick(() => {
+        const articles = document.querySelectorAll('#chat article[x-data]');
+        toRestore.forEach(({ idx, panel }) => {
+          if (articles[idx]) {
+            try { Alpine.$data(articles[idx]).openPanel = panel; } catch(e) {}
+          }
+        });
+      });
+    });
+
+    function refreshChat() {
+      // Snapshot which panels are open (by article index) before blowing away the DOM.
+      _savedPanels = [];
+      document.querySelectorAll('#chat article[x-data]').forEach((el, idx) => {
+        try {
+          const panel = Alpine.$data(el).openPanel;
+          if (panel) _savedPanels.push({ idx, panel });
+        } catch(e) {}
+      });
+      const { arc, para } = currentParams();
+      htmx.ajax('GET', `/partials/chat?arc=${encodeURIComponent(arc)}&para=${encodeURIComponent(para)}&limit=10`, { target: '#chat', swap: 'innerHTML' });
+    }
+
+    function connectStream() {
+      const { arc, para } = currentParams();
+
+      if (es) {
+        es.close();
+        es = null;
+      }
+
+      conn.textContent = 'connecting';
+      conn.classList.remove('ok');
+
+      es = new EventSource(`/stream?arc=${encodeURIComponent(arc)}&para=${encodeURIComponent(para)}`);
+      es.addEventListener('ready', () => {
+        conn.textContent = 'live';
+        conn.classList.add('ok');
+        // Re-fetch composer on every server (re)connect so stale HTMX form state is cleared.
+        htmx.ajax('GET', '/partials/composer', { target: '#composer', swap: 'innerHTML' });
+      });
+      es.addEventListener('story_changed', () => {
+        refreshChat();
+      });
+      es.onerror = () => {
+        conn.textContent = 'offline';
+        conn.classList.remove('ok');
+      };
+    }
+
+    document.body.addEventListener('htmx:pushedIntoHistory', () => {
+      refreshChat();
+      connectStream();
+    });
+    window.addEventListener('popstate', () => {
+      refreshChat();
+      connectStream();
+    });
+
+    connectStream();
+  })();
+</script>
+</body>
+</html>

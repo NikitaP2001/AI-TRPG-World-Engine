@@ -1,0 +1,22 @@
+<div class="debug-shell">
+  <div class="debug-header">
+    <div>
+      <div class="debug-title">Debug: {{ title }}</div>
+      <div class="debug-subtitle">Shows the most recent prompt only</div>
+    </div>
+    <div class="debug-actions">
+      <button
+        class="btn"
+        type="button"
+        hx-get="/partials/debug_prompt?agent={{ agent }}&name={{ name|urlencode }}"
+        hx-target="#debug-body"
+        hx-swap="innerHTML"
+      >View last prompt</button>
+      <button class="btn" type="button" hx-get="/partials/debug_clear" hx-target="#debug" hx-swap="innerHTML">Close</button>
+    </div>
+  </div>
+
+  <div id="debug-body" class="debug-body">
+    <div class="muted">Click “View last prompt” to load it.</div>
+  </div>
+</div>

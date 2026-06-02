@@ -1,0 +1,109 @@
+{% set has_prompt = pending_prompt is not none %}
+<div class="composer-title">{% if has_prompt %}Input as {{ pending_prompt.character_name }} (one turn){% else %}Character override (optional){% endif %}</div>
+
+<form
+  class="composer-form-2"
+  hx-post="{% if has_prompt %}/cmd/continue_with_decision{% else %}/cmd/continue{% endif %}"
+  hx-target="#composer"
+  hx-swap="innerHTML"
+  hx-disabled-elt="find button, find select, find textarea, find input"
+>
+  <label>
+    Character
+    <select name="override_character" {% if has_prompt %}disabled{% endif %}>
+      <option value="" {% if selected_character == '' %}selected{% endif %}>(none)</option>
+      {% for name in character_names %}
+        <option value="{{ name }}" {% if selected_character == name %}selected{% endif %}>{{ name }}</option>
+      {% endfor %}
+    </select>
+  </label>
+
+  {% if has_prompt %}
+    <input type="hidden" name="character_name" value="{{ pending_prompt.character_name }}" />
+
+    {% if pending_prompt.gm_correction_notice %}
+      <div class="composer-wide" style="border:1px solid #7f5f1d; background:#2f2614; border-radius:8px; padding:10px;">
+        <div class="panel-subtitle">GM correction notice</div>
+        <pre class="mono" style="white-space:pre-wrap; margin:0;">{{ pending_prompt.gm_correction_notice }}</pre>
+        {% if pending_prompt.current_intent %}
+          <div class="panel-subtitle" style="margin-top:8px;">Your previous intent</div>
+          <pre class="mono" style="white-space:pre-wrap; margin:0;">{{ pending_prompt.current_intent }}</pre>
+        {% endif %}
+      </div>
+    {% endif %}
+
+    <div class="composer-wide">
+      <div class="panel-subtitle">Character input</div>
+      <pre class="mono composer-character-input">{{ pending_prompt.character_input }}</pre>
+    </div>
+
+    <label class="composer-wide">
+      Thoughts
+      <textarea name="thoughts" rows="2" placeholder="(optional)"></textarea>
+    </label>
+
+    <label class="composer-wide">
+      Intent
+      <textarea name="intent" rows="3" placeholder="Concrete, observable steps + quoted dialogue"></textarea>
+    </label>
+
+    <div class="composer-wide" style="margin-top:8px; padding-top:8px; border-top:1px dashed #2a2f45;">
+      <div class="panel-subtitle">Ask GM before deciding (optional)</div>
+      <div>
+        <label class="composer-wide">
+          Question
+          <textarea name="gm_question" rows="2" placeholder="Ask what your character can perceive/know right now..."></textarea>
+        </label>
+        <div class="composer-actions" style="margin-top:8px;">
+          <button
+            type="button"
+            :disabled="turnInProgress"
+            hx-post="/cmd/override_ask_gm"
+            hx-target="#composer"
+            hx-swap="innerHTML"
+            hx-indicator="#turn-indicator"
+            hx-disabled-elt="closest .composer-form-2 button, closest .composer-form-2 textarea, closest .composer-form-2 input"
+            hx-include="[name='character_name'], [name='gm_question']"
+          >Ask GM</button>
+        </div>
+      </div>
+
+      {% if gm_answer %}
+        <div class="panel-subtitle" style="margin-top:8px;">GM answer</div>
+        {% if gm_question %}
+          <div class="muted" style="margin-bottom:6px;"><strong>Q:</strong> {{ gm_question }}</div>
+        {% endif %}
+        <pre class="mono">{{ gm_answer }}</pre>
+      {% endif %}
+    </div>
+
+    <div class="composer-actions">
+      <button type="submit" :disabled="turnInProgress">Continue</button>
+      <div class="muted">This will submit your decision and resume the turn.</div>
+    </div>
+  {% else %}
+    <div class="composer-actions">
+      <button type="submit" :disabled="turnInProgress">Continue</button>
+      <button 
+        type="button" 
+        :disabled="turnInProgress"
+        hx-post="/cmd/continue_until_paragraph"
+        hx-include="closest form"
+        hx-target="#composer"
+        hx-swap="innerHTML"
+        hx-disabled-elt="#composer button, #composer select, #composer textarea, #composer input">
+        Continue → ¶
+      </button>
+    </div>
+    <div class="muted">If a character is selected, the turn will pause when they are prompted. "Continue → ¶" runs until paragraph complete.</div>
+  {% endif %}
+</form>
+
+<div class="turn-indicator" x-show="turnInProgress" style="display:none">
+  <span class="spinner" aria-hidden="true"></span>
+  <span>Processing turn…</span>
+</div>
+
+{% if message %}
+  <div class="muted">{{ message }}</div>
+{% endif %}

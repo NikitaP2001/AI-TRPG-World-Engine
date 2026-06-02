@@ -1,0 +1,136 @@
+<article class="turn" x-data="{ openPanel: '' }">
+  <div class="turn-border">
+    <div class="turn-header">
+      <div class="turn-meta">
+        <div class="turn-time">{{ t.start_time }} → {{ t.end_time }}</div>
+        <div class="turn-loc">{{ t.location }}</div>
+      </div>
+      <div class="turn-badges">
+        <form hx-post="/cmd/checkin_turn"
+              hx-target="#composer"
+              hx-swap="innerHTML"
+              hx-confirm="Check in to this turn and discard all subsequent turns in the active story line?"
+              style="display:inline-block;margin-right:6px">
+          <input type="hidden" name="start_time" value="{{ t.start_time }}" />
+          <input type="hidden" name="end_time" value="{{ t.end_time }}" />
+          <input type="hidden" name="location" value="{{ t.location }}" />
+          <button class="pill pill-btn" type="submit">Check in here</button>
+        </form>
+        {% if t.has_details %}
+          <button class="pill ok pill-btn" type="button" @click.stop="openPanel = (openPanel === 'gm' ? '' : 'gm')">GM details</button>
+        {% else %}
+          <span class="pill">partial</span>
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="turn-body">
+      <div class="gm-label">Story</div>
+      <div class="story-grid">
+        <div
+          class="story-panel story-panel-click"
+          role="button"
+          tabindex="0"
+          hx-get="/partials/debug_shell?agent=gm"
+          hx-target="#debug"
+          hx-swap="innerHTML"
+        >
+          <div class="story-title">Scene description</div>
+          {% if t.scene_description %}
+            <div class="story-text">{{ t.scene_description | highlight_quotes | replace('\n', '<br/>') | safe }}</div>
+          {% else %}
+            <div class="story-empty">No scene description captured.</div>
+          {% endif %}
+        </div>
+
+        <div
+          class="story-panel story-panel-click"
+          role="button"
+          tabindex="0"
+          hx-get="/partials/debug_shell?agent=gm"
+          hx-target="#debug"
+          hx-swap="innerHTML"
+        >
+          <div class="story-title">{{ 'Outcome' if t.outcome else 'Turn narration' }}</div>
+          {% if t.outcome %}
+            <div class="story-text">{{ t.outcome | highlight_quotes | replace('\n', '<br/>') | safe }}</div>
+          {% elif t.raw_narration %}
+            <div class="story-text">{{ t.raw_narration | highlight_quotes | replace('\n', '<br/>') | safe }}</div>
+          {% else %}
+            <div class="story-empty">No narration captured.</div>
+          {% endif %}
+        </div>
+      </div>
+
+      {% if t.actions|length > 0 %}
+        <div class="actions">
+          <div class="actions-title">Actions</div>
+          {% for a in t.actions %}
+            <div
+              class="action-row action-row-click"
+              role="button"
+              tabindex="0"
+              data-panel="actor:{{ a.name }}"
+              @click.stop="openPanel = (openPanel === $el.dataset.panel ? '' : $el.dataset.panel)"
+              @keydown.enter.prevent="openPanel = (openPanel === $el.dataset.panel ? '' : $el.dataset.panel)"
+            >
+              <div class="action-name">{{ a.name }}</div>
+              <div class="action-body">
+                <div class="action-text">{{ a.intent_short }}</div>
+                {% if a.thoughts_short %}
+                  <div class="action-thoughts">💭 {{ a.thoughts_short }}</div>
+                {% endif %}
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="turn-expand" x-show="openPanel !== ''" x-cloak>
+    <div class="panel" x-show="openPanel === 'gm'" x-cloak>
+      <div class="panel-title">GM Details</div>
+      {% if t.details.location_summary %}
+        <div class="kv"><span class="k">Location summary</span><span class="v">{{ t.details.location_summary }}</span></div>
+      {% endif %}
+      {% if t.details.turn_duration %}
+        <div class="kv"><span class="k">Duration</span><span class="v">{{ t.details.turn_duration }}</span></div>
+      {% endif %}
+
+      {% if t.meta %}
+        <div class="panel-subtitle">Stored meta</div>
+        <pre class="mono">{{ t.meta }}</pre>
+      {% endif %}
+    </div>
+
+    {% for a in t.actions %}
+      <div class="panel" x-show="openPanel === 'actor:{{ a.name }}'" x-cloak>
+        <div class="panel-title">{{ a.name }}</div>
+        <div class="panel-actions">
+          <button
+            class="btn"
+            type="button"
+            hx-get="/partials/debug_shell?agent=character&name={{ a.name|urlencode }}"
+            hx-target="#debug"
+            hx-swap="innerHTML"
+          >View last prompt</button>
+        </div>
+        <div class="panel-subtitle">Intent (raw)</div>
+        <pre class="mono">{{ a.intent | highlight_quotes | safe }}</pre>
+
+        {% if a.thoughts %}
+          <div class="panel-subtitle">Thoughts</div>
+          <pre class="mono">{{ a.thoughts | highlight_quotes | safe }}</pre>
+        {% endif %}
+
+        {% if a.character_input %}
+          <div class="panel-subtitle">Character input</div>
+          <pre class="mono">{{ a.character_input | highlight_quotes | safe }}</pre>
+        {% else %}
+          <div class="muted">Character input not captured for this turn.</div>
+        {% endif %}
+      </div>
+    {% endfor %}
+  </div>
+</article>

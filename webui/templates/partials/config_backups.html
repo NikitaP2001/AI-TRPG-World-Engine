@@ -1,0 +1,66 @@
+<div class="config-section">
+  <div class="config-section-title">Story Lines</div>
+  <div class="config-section-subtitle">Hidden snapshots are created each turn. Switch between story lines and branch safely without overwriting other lines.</div>
+
+  {% if message %}
+    <div class="config-message {{ 'success' if success else 'error' }}">{{ message }}</div>
+  {% endif %}
+
+  <form hx-post="/api/config/storyline"
+        hx-target="#config-backups"
+        hx-swap="innerHTML"
+        style="margin-bottom:20px">
+    <div class="config-row" style="align-items:flex-end">
+      <div class="config-field">
+        <label>New Story Line Name (optional)</label>
+        <input type="text" name="name" placeholder="e.g., Branch after interrogation" />
+      </div>
+      <button type="submit" class="btn btn-primary">Create Story Line</button>
+    </div>
+  </form>
+</div>
+
+<div class="config-section">
+  <div class="config-section-title">Existing Story Lines</div>
+  
+  {% if lines %}
+    {% for line in lines %}
+      <div class="backup-item">
+        <div class="backup-info">
+          <div class="backup-name">
+            {{ line.name }}
+            {% if line.id == current_line_id %}<span class="pill ok" style="margin-left:8px">active</span>{% endif %}
+          </div>
+          <div class="backup-meta">
+            turns: {{ line.turn_count }}
+            {% if line.last_turn %}
+              · last: {{ line.last_turn.end_time }} @ {{ line.last_turn.location }}
+            {% endif %}
+          </div>
+        </div>
+        <div class="backup-actions">
+          <button class="btn"
+                  hx-post="/api/config/storyline/{{ line.id | urlencode }}/switch"
+                  hx-target="#config-backups"
+                  hx-swap="innerHTML"
+                  hx-confirm="Switch to this story line? Current game state will jump to that line's latest turn.">
+            Switch
+          </button>
+          <button class="btn btn-danger"
+                  hx-delete="/api/config/storyline/{{ line.id | urlencode }}"
+                  hx-target="#config-backups"
+                  hx-swap="innerHTML"
+                  hx-confirm="Delete story line '{{ line.name }}'? This removes all snapshots in that line.">
+            Delete
+          </button>
+        </div>
+      </div>
+
+      {% if line.turns and line.id == current_line_id %}
+        <div class="config-section-subtitle" style="margin:6px 0 12px 0">Active line snapshots (use per-turn "Check in here" buttons in chat to rewind this line)</div>
+      {% endif %}
+    {% endfor %}
+  {% else %}
+    <div class="config-empty">No story lines found.</div>
+  {% endif %}
+</div>

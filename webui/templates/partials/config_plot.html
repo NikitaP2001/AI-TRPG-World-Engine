@@ -1,0 +1,44 @@
+<div class="config-section">
+  <div class="config-section-title">Initial Plot (init/plot.json)</div>
+  <div class="config-section-subtitle">The plot seed that gets injected as the first instruction when starting a new game. This sets up the initial scenario.</div>
+
+  {% if message %}
+    <div class="config-message {{ 'success' if success else 'error' }}">{{ message }}</div>
+  {% endif %}
+
+  <form hx-post="/api/config/plot"
+        hx-target="#config-plot"
+        hx-swap="innerHTML">
+    
+    <div class="form-section">
+      <div class="form-section-title">Initial Scenario</div>
+      <div class="config-field">
+        <label>Plot Setup <span class="required">*</span></label>
+        <textarea name="init" rows="8" placeholder="Describe the initial situation, where characters are, what's happening, and any important context for the GM to start the story..." required>{{ init or '' }}</textarea>
+        <div class="field-hint">Describe the starting scenario: where are the characters, what's the situation, what events are unfolding? The GM will use this to kick off the story.</div>
+      </div>
+    </div>
+
+    <div class="config-actions">
+      {% if exists %}
+        <button type="button" class="btn btn-danger"
+                hx-delete="/api/config/plot"
+                hx-target="#config-plot"
+                hx-swap="innerHTML"
+                hx-confirm="Delete plot? This cannot be undone.">
+          Delete Plot
+        </button>
+      {% endif %}
+      <button type="submit" class="btn btn-primary">Save Plot</button>
+    </div>
+  </form>
+</div>
+
+{% if not exists %}
+<div class="config-section">
+  <div class="config-empty">
+    <div style="margin-bottom:10px">No plot defined yet.</div>
+    <div style="font-size:13px">Fill in the form above to create an initial scenario for your game.</div>
+  </div>
+</div>
+{% endif %}

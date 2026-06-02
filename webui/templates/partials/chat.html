@@ -1,0 +1,7 @@
+{% for t in turns %}
+  {% include 'partials/turn_card.html' %}
+{% endfor %}
+
+{% if turns|length == 0 %}
+  <div class="empty">No turns found.</div>
+{% endif %}
