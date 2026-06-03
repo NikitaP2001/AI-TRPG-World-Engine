@@ -1163,7 +1163,10 @@ class GameMaster:
                                 msg += f"  thoughts: {thoughts}\n"
                     elif item_type == "correction":
                         char_name = str(item.get("character_name") or "").strip() or "Unknown"
+                        decline_reason = str(item.get("turn_insight") or "").strip()
                         msg += f"\n[Round {item_round} correction] {char_name}: intent rejected, replanning requested\n"
+                        if decline_reason:
+                            msg += f"Decline reason: {decline_reason}\n"
                     elif item_type == "replan":
                         char_name = str(item.get("character_name") or "").strip() or "Unknown"
                         msg += f"\n[Round {item_round} replan] {char_name}: new intent submitted (see current intentions below)\n"

@@ -669,9 +669,12 @@ class ConsoleApp:
         arc_summary = ""
         if do_arc_summary:
             from summarizer_agent import summarize_arc
+            ongoing_turns = ongoing_paragraph.get("turns") if isinstance(ongoing_paragraph.get("turns"), list) else []
             current_para = {
                 "name": name,
                 "summary": summary,
+                "start_time": str(ongoing_paragraph.get("start_time") or "").strip(),
+                "end_time": str((ongoing_turns[-1] or {}).get("end_time") or "").strip() if ongoing_turns else "",
                 "locations": list(ongoing_paragraph.get("locations") or []),
                 "characters": list(ongoing_paragraph.get("characters") or []),
                 "npcs": list(ongoing_paragraph.get("npcs") or []),
@@ -711,9 +714,16 @@ class ConsoleApp:
                 locations = ongoing_paragraph.get("locations") if isinstance(ongoing_paragraph.get("locations"), list) else []
                 characters = ongoing_paragraph.get("characters") if isinstance(ongoing_paragraph.get("characters"), list) else []
                 npcs_list = ongoing_paragraph.get("npcs") if isinstance(ongoing_paragraph.get("npcs"), list) else []
+                para_start_time = str(ongoing_paragraph.get("start_time") or "").strip()
+                para_end_time = ""
+                turns_for_time = ongoing_paragraph.get("turns") if isinstance(ongoing_paragraph.get("turns"), list) else []
+                if turns_for_time:
+                    para_end_time = str((turns_for_time[-1] or {}).get("end_time") or "").strip()
                 self._gm_injector.inject_paragraph_summary(
                     name=name,
                     summary=summary,
+                    start_time=para_start_time,
+                    end_time=para_end_time,
                     locations=list(locations),
                     characters=list(characters),
                     npcs=list(npcs_list),
@@ -728,10 +738,18 @@ class ConsoleApp:
                     agg_chars: list[str] = []
                     agg_npcs: list[str] = []
                     para_names: list[str] = []
+                    arc_start_time = ""
+                    arc_end_time = ""
                     for p in arc_all_paras:
                         pn = str(p.get("name") or "").strip()
                         if pn:
                             para_names.append(pn)
+                        p_start = str(p.get("start_time") or "").strip()
+                        p_end = str(p.get("end_time") or "").strip()
+                        if p_start and not arc_start_time:
+                            arc_start_time = p_start
+                        if p_end:
+                            arc_end_time = p_end
                         for loc in (p.get("locations") or []):
                             s = str(loc).strip()
                             if s and s not in agg_locs:
@@ -747,6 +765,8 @@ class ConsoleApp:
                     self._gm_injector.inject_arc_summary(
                         arc_name=arc_name,
                         arc_summary=arc_summary,
+                        start_time=arc_start_time,
+                        end_time=arc_end_time,
                         paragraph_names=para_names,
                         locations=agg_locs,
                         characters=agg_chars,

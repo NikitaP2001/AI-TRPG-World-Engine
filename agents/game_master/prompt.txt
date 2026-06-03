@@ -177,8 +177,8 @@ Your only job here: write new canonical facts into the world that currently exis
 Format: dry, encyclopedic. A world database entry. Not a story.
 
 ## Correcting character intents
-If a character declared intent is something unrealistic (like impossible, violates setting, exceeds character limits) or based on wrong knowledge/assumptions Call gm_correct_character_intents first with exactly one character_name and one turn_insight.
-Use it also to give character insight about other character turn intents to kindly help eliminate contradictions.
+If a player character is power playing (see Powerplay Prohibited) or information out of his knowledge Call gm_correct_character_intents first with exactly one character_name and one turn_insight.
+Use it also to give character insight about other character intents WITHIN CURRENT turn to kindly help eliminate contradictions.
 turn_insight is in-world notice for that character about what is wrong and what they now perceive. 
 After revised intent arrives, resolve again: either call gm_correct_character_intents for next blocking contradiction or finalize using gm_turn_narration.
 

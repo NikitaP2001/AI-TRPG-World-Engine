@@ -138,6 +138,9 @@ class HistoryInjector:
                 if not name or not summary or name == "Summary":
                     continue
 
+                para_start_time = str(para.get("start_time") or "").strip()
+                para_end_time = str(para.get("end_time") or "").strip()
+
                 locations = para.get("locations") if isinstance(para.get("locations"), list) else []
                 characters = para.get("characters") if isinstance(para.get("characters"), list) else []
                 npcs = para.get("npcs") if isinstance(para.get("npcs"), list) else []
@@ -148,9 +151,13 @@ class HistoryInjector:
 
                 parts = [
                     f'Story paragraph completed: "{name}"',
+                ]
+                if para_start_time or para_end_time:
+                    parts.append(f"Time period: {para_start_time or '?'} -> {para_end_time or '?'}")
+                parts.extend([
                     f"Locations: {loc_str}",
                     f"Players: {char_str}",
-                ]
+                ])
                 if npc_str != "none":
                     parts.append(f"NPCs: {npc_str}")
                 parts.append("")
@@ -166,6 +173,9 @@ class HistoryInjector:
             if not arc_name or not arc_summary:
                 continue
 
+            arc_start_time = str(arc.get("start_time") or "").strip()
+            arc_end_time = str(arc.get("end_time") or "").strip()
+
             arc_locs = arc.get("locations") if isinstance(arc.get("locations"), list) else []
             arc_chars = arc.get("characters") if isinstance(arc.get("characters"), list) else []
             arc_npcs = arc.get("npcs") if isinstance(arc.get("npcs"), list) else []
@@ -173,6 +183,8 @@ class HistoryInjector:
             parts = [
                 f'Arc finalized: "{arc_name}"',
             ]
+            if arc_start_time or arc_end_time:
+                parts.append(f"Time period: {arc_start_time or '?'} -> {arc_end_time or '?'}")
             if arc_locs:
                 parts.append(f"Arc locations: {', '.join(str(x) for x in arc_locs)}")
             if arc_chars:
@@ -192,6 +204,8 @@ class HistoryInjector:
         *,
         name: str,
         summary: str,
+        start_time: str,
+        end_time: str,
         locations: List[str],
         characters: List[str],
         npcs: List[str],
@@ -207,9 +221,15 @@ class HistoryInjector:
 
         parts = [
             f'Story paragraph completed: "{nm}"',
+        ]
+        if str(start_time or "").strip() or str(end_time or "").strip():
+            parts.append(
+                f"Time period: {str(start_time or '').strip() or '?'} -> {str(end_time or '').strip() or '?'}"
+            )
+        parts.extend([
             f"Locations: {loc_str}",
             f"Players: {char_str}",
-        ]
+        ])
         if npc_str != "none":
             parts.append(f"NPCs: {npc_str}")
         parts.append("")
@@ -225,6 +245,8 @@ class HistoryInjector:
         *,
         arc_name: str,
         arc_summary: str,
+        start_time: str,
+        end_time: str,
         paragraph_names: List[str],
         locations: List[str],
         characters: List[str],
@@ -236,6 +258,10 @@ class HistoryInjector:
             return
 
         parts: List[str] = [f'Arc finalized: "{an}"']
+        if str(start_time or "").strip() or str(end_time or "").strip():
+            parts.append(
+                f"Time period: {str(start_time or '').strip() or '?'} -> {str(end_time or '').strip() or '?'}"
+            )
         names = [str(x).strip() for x in (paragraph_names or []) if str(x).strip()]
         if names:
             parts.append(f"Paragraphs: {', '.join(repr(x) for x in names)}")
