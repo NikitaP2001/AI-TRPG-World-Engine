@@ -2,6 +2,8 @@
 
 A multi-agent LLM system that simulates a persistent, causally-consistent fictional world. The world is not a session—it is a continuous shared state that evolves between turns, between sessions, and independently of player interaction. Three autonomous agents operate over a common JSON world state: a **Game Master** that owns narrative and world causality, a **Storage Assistant** that owns structured world memory, and per-character **Character agents** that own player intent. No single agent has full authority; they compose reality through structured exchange.
 
+Main idea and design philosophy: summarization alone is not enough for long storytelling, because compressed memory can drop details that later cause contradictions or subtle lore drift. This project addresses that by separating concerns: a dedicated maintenance agent has tool-based access to full structured world data, can search and load specific historical details on demand, and continuously reconciles memory with current canon. In simple terms, narrative can stay compact, while factual consistency is protected by an agent that can always go back to the full state.
+
 ---
 
 ## Features
