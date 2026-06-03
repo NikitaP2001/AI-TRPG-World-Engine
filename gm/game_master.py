@@ -63,19 +63,19 @@ def gm_scene_description(
 
 
 @tool
-def gm_turn_narration(shared: str, duration: str, personal_json: str = "", world_facts: str = "") -> str:
+def gm_turn_narration(shared: str, duration: str, world_facts: str, personal_json: str = "" ) -> str:
     """Submit turn narration: shared outcome visible to all plus optional per-player personal parts.
 
     Args:
         shared: 3rd-person narrative of what happened — all events visible/audible to everyone
             present. Contains no private or secret information.
         duration: Elapsed time (e.g. "30s", "5m", "2h")
+        world_facts: Off-camera canonical world facts — dry, encyclopedic entries about
+            what exists outside the current scene, unknown to players.
         personal_json: Optional JSON object mapping player names to personal additions —
             only what THAT player exclusively experienced/perceived, not in shared.
             Written in 2nd person ("you"). Omit or pass "" if nothing is private.
             Example: {"Alice": "You feel a sharp chill run down your spine."}
-        world_facts: Off-camera canonical world facts — dry, encyclopedic entries about
-            what exists outside the current scene, unknown to players.
             
     """
     return "ok"
@@ -1039,38 +1039,34 @@ class GameMaster:
             "descriptions": descriptions,
             "combined": _combined,
         }
+    
+    def _build_message_world_seed(self, payload: Dict[str, Any]) -> str:
+        provided_characters = payload.get("character_names") if isinstance(payload.get("character_names"), list) else []
+        provided_characters = [str(x).strip() for x in provided_characters if str(x).strip()]
+        chars_line = ", ".join(provided_characters) if provided_characters else "(none provided)"
+        return (
+            "Generate the initial world seed for this world and return it via the gm_world_seed_result function.\n\n"
+            "How to use the function:\n"
+            "1) world_time argument: one exact datetime string in format Y0000-01-01 00:00:00.\n"
+            "   Choose a meaningful in-world date/time that fits the plot and setting (era, date, time of day).\n"
+            "   Do NOT use bootstrap-like values such as year 0000 or 0001.\n"
+            "2) seed_text argument: a plain-text seed body with the sections below.\n"
+            "   Put WORLD TIME only in world_time argument, not in seed_text.\n\n"
+            f"Provided characters to place: {chars_line}\n"
+            "Every provided player must appear once in PLAYER LOCATIONS.\n\n"
+            "seed_text template:\n"
+            "WORLD SEED\n"
+            "LOCATIONS:\n"
+            "- Name: <location name>\n"
+            "  Summary: <one-line summary>\n"
+            "  Details: <multi-line description>\n"
+            "(repeat location blocks as needed; at least one location)\n\n"
+            "PLAYER LOCATIONS:\n"
+            "- <player name> -> <location name>\n"
+            "(one line per provided player)\n"
+        )
 
-    def _task_to_message(self, task: str, payload: Dict[str, Any]) -> str:
-        """Convert task + payload into a natural language message for the GM."""
-        task = str(task or "").strip().upper()
-        
-        if task == "WORLD_SEED":
-            provided_characters = payload.get("character_names") if isinstance(payload.get("character_names"), list) else []
-            provided_characters = [str(x).strip() for x in provided_characters if str(x).strip()]
-            chars_line = ", ".join(provided_characters) if provided_characters else "(none provided)"
-            return (
-                "Generate the initial world seed for this adventure and return it via the gm_world_seed_result function.\n\n"
-                "How to use the function:\n"
-                "1) world_time argument: one exact datetime string in format Y0000-01-01 00:00:00.\n"
-                "   Choose a meaningful in-world date/time that fits the plot and setting (era, date, time of day).\n"
-                "   Do NOT use bootstrap-like values such as year 0000 or 0001.\n"
-                "2) seed_text argument: a plain-text seed body with the sections below.\n"
-                "   Put WORLD TIME only in world_time argument, not in seed_text.\n\n"
-                f"Provided characters to place: {chars_line}\n"
-                "Every provided player must appear once in PLAYER LOCATIONS.\n\n"
-                "seed_text template:\n"
-                "WORLD SEED\n"
-                "LOCATIONS:\n"
-                "- Name: <location name>\n"
-                "  Summary: <one-line summary>\n"
-                "  Details: <multi-line description>\n"
-                "(repeat location blocks as needed; at least one location)\n\n"
-                "PLAYER LOCATIONS:\n"
-                "- <player name> -> <location name>\n"
-                "(one line per provided player)\n"
-            )
-        
-        elif task == "SCENE_DESCRIPTION":
+    def _build_message_scene_description(self, payload: Dict[str, Any]) -> str:
             chars = payload.get("character_names") if isinstance(payload.get("character_names"), list) else []
             npcs = payload.get("npcs") if isinstance(payload.get("npcs"), list) else []
             location = str(payload.get("location") or "").strip()
@@ -1083,9 +1079,6 @@ class GameMaster:
                 "Create and describe the next scene using gm_scene_description.\n"
                 "Follow both ## Creating a scene and ## Scene description paragraphs.\n"
                 "\n"
-                f"Preselected location hint: {location or '(none)'}\n"
-                f"Preselected players hint: {', '.join(str(x) for x in chars) if chars else '(none)'}\n"
-                f"Preselected NPCs hint: {', '.join(str(x) for x in npcs) if npcs else '(none)'}\n"
             )
 
             if missing_locations:
@@ -1115,159 +1108,160 @@ class GameMaster:
             if world_tod:
                 msg += f"World time_of_day: {world_tod}\n"
 
-            msg += (
-                "Call gm_scene_description with:\n"
-                "- player_names: ordered list of scene participants (who should receive descriptions).\n"
-                "- location: selected scene location.\n"
-                "- npc_names: optional list of scene NPCs.\n"
-                "- time_shift: skipped passive interval before scene start (or '0').\n"
-                "- shared: 3rd-person description covering everything ALL players can observe "
-                "(atmosphere, environment, NPC activity, sensory details). No secrets or private info.\n"
-                "- personal_json: (if (turn_players > 1) JSON object for players who percieve something "
-                "EXCLUSIVELY private not percieved by others, addressed in 2nd person ('you')"
-                "!Omit entirely if nothing is relevant is private!\n"
-            )
             return msg
-        
-        elif task == "TURN_NARRATION":
-            char_plans = payload.get("character_plans") if isinstance(payload.get("character_plans"), list) else []
-            participant_names = [str(p.get("name") or "").strip() for p in char_plans if str(p.get("name") or "").strip()]
-            round_history = payload.get("turn_round_history") if isinstance(payload.get("turn_round_history"), list) else []
 
-            msg = "Resolve this turn by choosing exactly one tool:\n"
-            msg += (
-                "- gm_turn_narration: finalize the turn according to Narrating a turn paragraph\n"
-                "- gm_correct_character_intents: request exactly one character to revise intent before narration accoring to Correcting character intents.\n"
-                "  Use args: character_name, turn_insight. turn_insight must be in-world notice for that character.\n"
-            )
+    def _build_message_turn_narration(self, payload: Dict[str, Any]) -> str:
+        char_plans = payload.get("character_plans") if isinstance(payload.get("character_plans"), list) else []
+        participant_names = [str(p.get("name") or "").strip() for p in char_plans if str(p.get("name") or "").strip()]
+        round_history = payload.get("turn_round_history") if isinstance(payload.get("turn_round_history"), list) else []
 
-            if round_history:
-                msg += "\nRound history for this same turn (oldest first):\n"
-                for item in round_history:
-                    if not isinstance(item, dict):
-                        continue
-                    item_type = str(item.get("type") or "").strip().lower()
-                    item_round = str(item.get("round") or "?").strip() or "?"
-                    if item_type == "plans":
-                        plans_hist = item.get("character_plans") if isinstance(item.get("character_plans"), list) else []
-                        msg += f"\n[Round {item_round} plans]\n"
-                        msg += "DECLINED: do not apply these intents directly; use current intentions below.\n"
-                        for plan in plans_hist:
-                            if not isinstance(plan, dict):
-                                continue
-                            char_name = str(plan.get("name") or "").strip() or "Unknown"
-                            intent = str(plan.get("intent") or "").strip()
-                            thoughts = str(plan.get("thoughts") or "").strip()
-                            msg += f"- {char_name}: {intent or '(empty intent)'}\n"
-                            if thoughts:
-                                msg += f"  thoughts: {thoughts}\n"
-                    elif item_type == "correction":
-                        char_name = str(item.get("character_name") or "").strip() or "Unknown"
-                        decline_reason = str(item.get("turn_insight") or "").strip()
-                        msg += f"\n[Round {item_round} correction] {char_name}: intent rejected, replanning requested\n"
-                        if decline_reason:
-                            msg += f"Decline reason: {decline_reason}\n"
-                    elif item_type == "replan":
-                        char_name = str(item.get("character_name") or "").strip() or "Unknown"
-                        msg += f"\n[Round {item_round} replan] {char_name}: new intent submitted (see current intentions below)\n"
+        msg = "Resolve this turn by choosing exactly one tool:\n"
+        msg += (
+            "- gm_turn_narration: finalize the turn according to Narrating a turn paragraph\n"
+            "- gm_correct_character_intents: request exactly one character to revise intent before narration accoring to Correcting character intents.\n"
+            "  Use args: character_name, turn_insight. turn_insight must be in-world notice for that character.\n"
+        )
 
-            if participant_names:
-                msg += "\nParticipants:\n"
-                msg += ", ".join(participant_names) + "\n"
-
-            if char_plans:
-                msg += "\nPlayer intentions for this turn:\n"
-                msg += "\n--- TURN BEGIN ---\n"
-                for plan in char_plans:
-                    if isinstance(plan, dict):
-                        char_name = plan.get("name") or plan.get("character_name") or "Unknown"
-                        action = plan.get("intent") or plan.get("action") or plan.get("decision") or "acts"
-                        thoughts = str(plan.get("thoughts") or "").strip()
-
-                        msg += f"\n{char_name}:\n"
-                        msg += f"  Intent: {action}\n"
-                        if thoughts:
-                            msg += f"  Secret thoughts: {thoughts}\n"
-                msg += "\n--- TURN END ---\n"
-
-            if self._turn_qa_buffer:
-                msg += "\nAnswers you gave to player questions this turn:\n"
-                for entry in self._turn_qa_buffer:
-                    msg += f"\n[{entry['character_name']}]\n"
-                    msg += f"  Q: {entry['questions']}\n"
-                    msg += f"  A: {entry['answer']}\n"
-
-            return msg
-        
-        elif task == "PARAGRAPH_SUMMARY":
-            ongoing = payload.get("ongoing_paragraph") or {}
-            do_arc_summary = bool(payload.get("do_arc_summary"))
-            turns = ongoing.get("turns") if isinstance(ongoing.get("turns"), list) else []
-            # Build a compact representation of turns for the GM
-            turn_lines = []
-            for i, t in enumerate(turns, 1):
-                if not isinstance(t, dict):
+        if round_history:
+            msg += "\nRound history for this same turn (oldest first):\n"
+            for item in round_history:
+                if not isinstance(item, dict):
                     continue
-                loc = str(t.get("location") or "").strip()
-                narr = str(t.get("narration") or "").strip()
-                chars = t.get("characters") if isinstance(t.get("characters"), list) else []
-                prefix = f"[{loc}]" if loc else ""
-                char_str = f" ({', '.join(str(c) for c in chars)})" if chars else ""
-                turn_lines.append(f"Turn {i}{prefix}{char_str}: {narr}")
+                item_type = str(item.get("type") or "").strip().lower()
+                item_round = str(item.get("round") or "?").strip() or "?"
+                if item_type == "plans":
+                    plans_hist = item.get("character_plans") if isinstance(item.get("character_plans"), list) else []
+                    msg += f"\n[Round {item_round} plans]\n"
+                    msg += "DECLINED: do not apply these intents directly; use current intentions below.\n"
+                    for plan in plans_hist:
+                        if not isinstance(plan, dict):
+                            continue
+                        char_name = str(plan.get("name") or "").strip() or "Unknown"
+                        intent = str(plan.get("intent") or "").strip()
+                        thoughts = str(plan.get("thoughts") or "").strip()
+                        msg += f"- {char_name}: {intent or '(empty intent)'}\n"
+                        if thoughts:
+                            msg += f"  thoughts: {thoughts}\n"
+                elif item_type == "correction":
+                    char_name = str(item.get("character_name") or "").strip() or "Unknown"
+                    decline_reason = str(item.get("turn_insight") or "").strip()
+                    msg += f"\n[Round {item_round} correction] {char_name}: intent rejected, replanning requested\n"
+                    if decline_reason:
+                        msg += f"Decline reason: {decline_reason}\n"
+                elif item_type == "replan":
+                    char_name = str(item.get("character_name") or "").strip() or "Unknown"
+                    msg += f"\n[Round {item_round} replan] {char_name}: new intent submitted (see current intentions below)\n"
 
-            turns_text = "\n\n".join(turn_lines) if turn_lines else "(no turns)"
-            locations = ongoing.get("locations") if isinstance(ongoing.get("locations"), list) else []
-            characters = ongoing.get("characters") if isinstance(ongoing.get("characters"), list) else []
-            npcs = ongoing.get("npcs") if isinstance(ongoing.get("npcs"), list) else []
+        if participant_names:
+            msg += "\nParticipants:\n"
+            msg += ", ".join(participant_names) + "\n"
 
-            existing_names = payload.get("existing_paragraph_names") or []
-            existing_warning = ""
-            if existing_names:
-                existing_warning = (
-                    f"\nExisting paragraph names (do NOT reuse any of these): "
-                    f"{', '.join(repr(n) for n in existing_names)}\n"
-                )
+        if char_plans:
+            msg += "\nPlayer intentions for this turn:\n"
+            msg += "\n--- TURN BEGIN ---\n"
+            for plan in char_plans:
+                if isinstance(plan, dict):
+                    char_name = plan.get("name") or plan.get("character_name") or "Unknown"
+                    action = plan.get("intent") or plan.get("action") or plan.get("decision") or "acts"
+                    thoughts = str(plan.get("thoughts") or "").strip()
 
-            return (
-                "Summarize the following sequence of turns into a single named paragraph for the story record.\n\n"
-                f"Locations involved: {', '.join(str(x) for x in locations) if locations else 'unknown'}\n"
-                f"Characters involved: {', '.join(str(x) for x in characters) if characters else 'unknown'}\n"
-                f"NPCs involved: {', '.join(str(x) for x in npcs) if npcs else 'none'}\n"
-                f"{existing_warning}\n"
-                f"Turns:\n{turns_text}\n\n"
-                "Reply with STRICT JSON only (no markdown, no explanation):\n"
-                '{"name": "<short paragraph title, 3-10 words>", "summary": "<5-10 sentence summary of events>"}\n\n'
-                "Rules:\n"
-                "- Use only information from the turns above.\n"
-                "- Keep it in-world (no meta commentary).\n"
-                "- Focus on what happened, what changed, and what the players learned or achieved.\n"
-                "- The name MUST be unique — never repeat an existing paragraph name.\n"
+                    msg += f"\n{char_name}:\n"
+                    msg += f"  Intent: {action}\n"
+                    if thoughts:
+                        msg += f"  Secret thoughts: {thoughts}\n"
+            msg += "\n--- TURN END ---\n"
+
+        if self._turn_qa_buffer:
+            msg += "\nAnswers you gave to player questions this turn:\n"
+            for entry in self._turn_qa_buffer:
+                msg += f"\n[{entry['character_name']}]\n"
+                msg += f"  Q: {entry['questions']}\n"
+                msg += f"  A: {entry['answer']}\n"
+
+        return msg
+
+    def _build_message_paragraph_summary(self, payload: Dict[str, Any]) -> str:
+        ongoing = payload.get("ongoing_paragraph") or {}
+        do_arc_summary = bool(payload.get("do_arc_summary"))
+        turns = ongoing.get("turns") if isinstance(ongoing.get("turns"), list) else []
+        # Build a compact representation of turns for the GM
+        turn_lines = []
+        for i, t in enumerate(turns, 1):
+            if not isinstance(t, dict):
+                continue
+            loc = str(t.get("location") or "").strip()
+            narr = str(t.get("narration") or "").strip()
+            chars = t.get("characters") if isinstance(t.get("characters"), list) else []
+            prefix = f"[{loc}]" if loc else ""
+            char_str = f" ({', '.join(str(c) for c in chars)})" if chars else ""
+            turn_lines.append(f"Turn {i}{prefix}{char_str}: {narr}")
+
+        turns_text = "\n\n".join(turn_lines) if turn_lines else "(no turns)"
+        locations = ongoing.get("locations") if isinstance(ongoing.get("locations"), list) else []
+        characters = ongoing.get("characters") if isinstance(ongoing.get("characters"), list) else []
+        npcs = ongoing.get("npcs") if isinstance(ongoing.get("npcs"), list) else []
+
+        existing_names = payload.get("existing_paragraph_names") or []
+        existing_warning = ""
+        if existing_names:
+            existing_warning = (
+                f"\nExisting paragraph names (do NOT reuse any of these): "
+                f"{', '.join(repr(n) for n in existing_names)}\n"
             )
 
-        elif task == "ANSWER_QUESTION":
-            char_name = str(payload.get("character_name") or "Unknown").strip()
-            questions = str(payload.get("questions") or "").strip()
+        return (
+            "Summarize the following sequence of turns into a single named paragraph for the story record.\n\n"
+            f"Locations involved: {', '.join(str(x) for x in locations) if locations else 'unknown'}\n"
+            f"Characters involved: {', '.join(str(x) for x in characters) if characters else 'unknown'}\n"
+            f"NPCs involved: {', '.join(str(x) for x in npcs) if npcs else 'none'}\n"
+            f"{existing_warning}\n"
+            f"Turns:\n{turns_text}\n\n"
+            "Reply with STRICT JSON only (no markdown, no explanation):\n"
+            '{"name": "<short paragraph title, 3-10 words>", "summary": "<5-10 sentence summary of events>"}\n\n'
+            "Rules:\n"
+            "- Use only information from the turns above.\n"
+            "- Keep it in-world (no meta commentary).\n"
+            "- Focus on what happened, what changed, and what the players learned or achieved.\n"
+            "- The name MUST be unique — never repeat an existing paragraph name.\n"
+        )
+    
+    def _build_message_answer_question(self, payload: Dict[str, Any]) -> str:
+        char_name = str(payload.get("character_name") or "Unknown").strip()
+        questions = str(payload.get("questions") or "").strip()
 
-            prior_qa = ""
-            if self._turn_qa_buffer:
-                lines = ["Answers you already gave to players this turn:"]
-                for entry in self._turn_qa_buffer:
-                    lines.append(f"[{entry['character_name']}]")
-                    lines.append(f"  Q: {entry['questions']}")
-                    lines.append(f"  A: {entry['answer']}")
-                prior_qa = "\n".join(lines) + "\n\n"
+        prior_qa = ""
+        if self._turn_qa_buffer:
+            lines = ["Answers you already gave to players this turn:"]
+            for entry in self._turn_qa_buffer:
+                lines.append(f"[{entry['character_name']}]")
+                lines.append(f"  Q: {entry['questions']}")
+                lines.append(f"  A: {entry['answer']}")
+            prior_qa = "\n".join(lines) + "\n\n"
 
-            return (
-                prior_qa
-                + "Player question (as recall to their self-knowledge or perception).\n"
-                f"Player: {char_name}\n"
-                f"Questions:\n{questions}\n\n"
-                "Provide short, clear in-character answers based on what player CHARACTER can perceive and know. Do not give any meta-knonwledge"
-            )
+        return (
+            prior_qa
+            + "Player question (as recall to their self-knowledge or perception).\n"
+            f"Player: {char_name}\n"
+            f"Questions:\n{questions}\n\n"
+            "Provide short, clear in-character answers based on what player CHARACTER can perceive and know. Do not give any meta-knonwledge"
+        )
+
+    def _task_to_message(self, task: str, payload: Dict[str, Any]) -> str:
+        """Convert task + payload into a natural language message for the GM."""
+        task = str(task or "").strip().upper()
         
+        if task == "WORLD_SEED":
+            return self._build_message_world_seed(payload)    
+        elif task == "SCENE_DESCRIPTION":
+            return self._build_message_scene_description(payload)
+        elif task == "TURN_NARRATION":
+            return self._build_message_turn_narration(payload)    
+        elif task == "PARAGRAPH_SUMMARY":
+           return self._build_message_paragraph_summary(payload) 
+        elif task == "ANSWER_QUESTION":
+            return self._build_message_answer_question(payload)
         else:
-            # Fallback to JSON for unknown tasks
-            return json.dumps({"task": task, "payload": payload}, ensure_ascii=False, indent=2)
+            raise RuntimeError("Unexpected GM task type")
 
     def _task_to_history_message(self, task: str, payload: Dict[str, Any], default_msg: str) -> str:
         """Return a compact, durable history entry for a task.
@@ -1282,11 +1276,44 @@ class GameMaster:
             return default_msg
 
         if task_u == "TURN_NARRATION":
-            # Include full guidance in history so GM remembers the rules for TURN_NARRATION
-            # This preserves the "Narrate per ## Narrating a turn using gm_turn_narration call"
-            # instruction along with character plans.
-            # Strip TURN BEGIN/END anchors — they are prompt-only cues, not history.
-            return default_msg.replace("\n--- TURN BEGIN ---\n", "\n").replace("\n--- TURN END ---\n", "")
+            # Build a compact, durable history entry from payload fields only.
+            #
+            # Durable (persisted):
+            #   - turn location / start / end time
+            #   - final accepted character intents and thoughts
+            #
+            # Ephemeral (intentionally excluded — current turn only):
+            #   - "Resolve this turn…" instructional preamble
+            #   - turn_round_history / DECLINED rounds / corrections / replans
+            #   - _turn_qa_buffer (per-turn Q&A)
+            location = str(payload.get("location") or "").strip()
+            start_time = str(payload.get("turn_start_time") or "").strip()
+            end_time = str(payload.get("turn_end_time") or "").strip()
+            char_plans = payload.get("character_plans") if isinstance(payload.get("character_plans"), list) else []
+
+            header_parts: List[str] = []
+            if location:
+                header_parts.append(f"location: {location}")
+            if start_time:
+                header_parts.append(f"start: {start_time}")
+            if end_time:
+                header_parts.append(f"end: {end_time}")
+            parts: List[str] = ["Turn | " + " | ".join(header_parts) if header_parts else "Turn"]
+
+            if char_plans:
+                parts.append("Final character intentions:")
+                for plan in char_plans:
+                    if not isinstance(plan, dict):
+                        continue
+                    name = str(plan.get("name") or "").strip() or "Unknown"
+                    intent = str(plan.get("intent") or plan.get("action") or plan.get("decision") or "").strip()
+                    thoughts = str(plan.get("thoughts") or "").strip()
+                    line = f"- {name}: {intent or '(no intent)'}"
+                    if thoughts:
+                        line += f"\n  thoughts: {thoughts}"
+                    parts.append(line)
+
+            return "\n".join(parts)
 
         if task_u == "ANSWER_QUESTION":
             nm = str(payload.get("character_name") or "Unknown").strip()

@@ -3244,22 +3244,11 @@ class ConsoleApp:
         return ""
 
     def _write_world_facts(self, facts: str) -> None:
-        """Persist world facts into both GM and SA histories."""
+        """Persist world facts for SA; GM stores them in TURN_NARRATION assistant history."""
         try:
             text = str(facts or "").strip()
             if not text:
                 return
-
-            from memory_store import append_message
-
-            limits = limits_from_env()
-            if hasattr(self, "_game_master") and self._game_master and getattr(self._game_master, "_history_path", None):
-                append_message(
-                    self._game_master._history_path,
-                    role="user",
-                    content=f"[world_facts]\n{text}",
-                    limits=limits,
-                )
 
             # SA consumes in-memory self.state["messages"] during the active session.
             # Inject here so world_facts is visible immediately on the next SA invocation.

@@ -177,8 +177,9 @@ Your only job here: write new canonical facts into the world that currently exis
 Format: dry, encyclopedic. A world database entry. Not a story.
 
 ## Correcting character intents
-If a player character is power playing (see Powerplay Prohibited) or information out of his knowledge Call gm_correct_character_intents first with exactly one character_name and one turn_insight.
-Use it also to give character insight about other character intents WITHIN CURRENT turn to kindly help eliminate contradictions.
+Use this to block impossible intents or deliver per-player scene perception for synchronization
+If a player character is power playing (see Powerplay Prohibited) Call gm_correct_character_intents first with exactly one character_name and one turn_insight.
+Use it also to give character insight about other character intents WITHIN CURRENT turn to kindly help intent synchronization
 turn_insight is in-world notice for that character about what is wrong and what they now perceive. 
 After revised intent arrives, resolve again: either call gm_correct_character_intents for next blocking contradiction or finalize using gm_turn_narration.
 
