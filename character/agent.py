@@ -182,22 +182,22 @@ def ask_game_master(questions: str) -> str:
         
     except Exception as e:
         if logs_enabled():
-            safe_name = _CHARACTER_NAME.encode('ascii', errors='replace').decode('ascii')
-            print(f"[trace] ask_game_master error for {safe_name}: {e}")
+            print(f"[trace] ask_game_master error for {_CHARACTER_NAME}: {e}")
         return f"Error: Could not get GM answer: {e}"
 
 
 @tool
 def character_decision(
-    thoughts: str,
-    intent: str,
+    psyche_core: str, 
+    ego_rationalization: str, 
+    compromise_intent: str
 ) -> str:
     """Final output - commit to an intent.
     
     See prompt.txt section "### character_decision tool (REQUIRED OUTPUT)" for full details.
     """
 
-    intent_text = str(intent or "").strip()
+    intent_text = str(compromise_intent or "").strip()
     if not intent_text:
         raise ValueError("intent is required")
 
@@ -209,7 +209,7 @@ def character_decision(
         CharacterDecision(
             character_name=runtime_character_name,
             intent=intent_text,
-            thoughts=str(thoughts or ""),
+            thoughts=str(psyche_core or "") + str(ego_rationalization or ""),
         )
     )
 
@@ -221,7 +221,7 @@ def run_character_agent(
     current_scene_context: str,
     scene_location: str,
     world_time: str,
-    gm_correction_notice: str = "",
+    gm_reality_notice: str = "",
     previous_intent: str = "",
     require_decision: bool = False,
     persist_history: bool = True,
@@ -267,10 +267,17 @@ def run_character_agent(
     can_ask_gm_once = not require_decision
 
     def _current_allowed_tool_names() -> set[str]:
-        return {"ask_game_master", "character_decision"} if can_ask_gm_once else {"character_decision"}
+        names = {"character_decision"}
+        if can_ask_gm_once:
+            names.add("ask_game_master")
+        names.update({"relationship_update", "relationship_read"})
+        return names
 
     def _build_bound_llm(*, allow_gm_question: bool):
-        allowed_tools = [ask_game_master, character_decision] if allow_gm_question else [character_decision]
+        from .reflection import relationship_update as _rel_up, relationship_read as _rel_read
+        allowed_tools = [character_decision, _rel_up, _rel_read]
+        if allow_gm_question:
+            allowed_tools.insert(0, ask_game_master)
 
         # Force a tool call so models don't spend the output budget on free-form prose.
         # This also makes small max_tokens caps more reliable.
@@ -340,11 +347,11 @@ def run_character_agent(
     except Exception:
         pass
 
-    # Load relationships for entities currently present at recently visited locations.
-    relevant_rels: List[Dict[str, Any]] = []
+    # Load known relationships (lightweight name-attitude list for injection).
+    known_rels: List[Dict[str, str]] = []
     try:
-        from .reflection import _get_relevant_relationships
-        relevant_rels = _get_relevant_relationships(character_name)
+        from .reflection import _get_known_relationships
+        known_rels = _get_known_relationships(character_name)
     except Exception:
         pass
 
@@ -366,9 +373,9 @@ def run_character_agent(
     if reflection_data:
         _memory_parts.append("## Self Reflection")
         _memory_parts.append(json.dumps(reflection_data, ensure_ascii=False, indent=2))
-    if relevant_rels:
-        _memory_parts.append("## Relationships (people currently nearby)")
-        _memory_parts.append(json.dumps(relevant_rels, ensure_ascii=False, indent=2))
+    if known_rels:
+        _memory_parts.append("## Known Relationships")
+        _memory_parts.append(json.dumps(known_rels, ensure_ascii=False, indent=2))
     if diary_text:
         _memory_parts.append("## Your Diary")
         _memory_parts.append(diary_text)
@@ -416,15 +423,15 @@ def run_character_agent(
         "world_time": world_time,
         "current_scene_context": current_scene_context or "",
     }
-    correction_notice = str(gm_correction_notice or "").strip()
-    if correction_notice:
-        correction_obj: Dict[str, str] = {
-            "notice": correction_notice,
+    reality_notice = str(gm_reality_notice or "").strip()
+    if reality_notice:
+        notice_obj: Dict[str, str] = {
+            "notice": reality_notice,
         }
         prev_intent_text = str(previous_intent or "").strip()
         if prev_intent_text:
-            correction_obj["previous_intent"] = prev_intent_text
-        context_obj["gm_turn_notice"] = correction_obj
+            notice_obj["previous_intent"] = prev_intent_text
+        context_obj["gm_reality_notice"] = notice_obj
     if prev_turn_thoughts:
         context_obj["prev_turn_thoughts"] = prev_turn_thoughts
 
@@ -439,15 +446,17 @@ def run_character_agent(
     _anchor_lines = ["Review your context before acting:  ## Your Character (your identity and traits)"]
     if reflection_data:
         _anchor_lines.append("  ## Self Reflection (your current goals, beliefs, emotional state)")
-    if relevant_rels:
-        _anchor_lines.append("  ## Relationships (people you know who are currently nearby)")
+    if known_rels:
+        _anchor_lines.append("  ## Known Relationships")
     if diary_text:
         _anchor_lines.append("  ## Your Diary (your personal history and past experiences)")
     guidance_msg = HumanMessage(content=(
         "\n".join(_anchor_lines) + "\n\n"
-        "You must respond using following tools character_decision or ask_game_master.\n"
-        "In case you need information you may: call ask_game_master (see prompt section '### ask_game_master tool')\n"
-        "To commit your intent: call character_decision (see prompt section '### character_decision tool')\n"
+        "You must respond using following tools: character_decision | ask_game_master | relationship_update | relationship_read.\n"
+        "In case you need information: call ask_game_master (see prompt section)\n"
+        "To record impressions about someone: call relationship_update\n"
+        "To recall past observations: call relationship_read\n"
+        "To commit your intent: call character_decision (see prompt section)\n"
     ))
     
     state = {
@@ -638,8 +647,7 @@ def run_character_agent(
             ai_msg = bound_llm.invoke(state["messages"])
         except KeyboardInterrupt:
             if logs_enabled():
-                safe_name = character_name.encode('ascii', errors='replace').decode('ascii')
-                print(f"[trace] character {safe_name}: direct text abort — must use tool calls, retrying")
+                print(f"[trace] character {character_name}: direct text abort — must use tool calls, retrying")
             state["messages"].append(_retry_instruction(
                 why="you produced raw text instead of calling a tool. ALL output must go through tool calls"
             ))
@@ -665,8 +673,7 @@ def run_character_agent(
             _debug_log_invalid_model_output(why=why, msg=ai_msg)
 
             if logs_enabled():
-                safe_name = character_name.encode('ascii', errors='replace').decode('ascii')
-                print(f"[trace] character output invalid ({safe_name}): {why}; retrying")
+                print(f"[trace] character output invalid ({character_name}): {why}; retrying")
 
             state["messages"].append(_retry_instruction(why=why))
             continue
@@ -785,8 +792,7 @@ def run_character_agent(
             return json.dumps(payload, ensure_ascii=False, indent=2)
         except Exception as e:
             if logs_enabled():
-                safe_name = character_name.encode('ascii', errors='replace').decode('ascii')
-                print(f"[trace] character tool execution failed ({safe_name}): {tool_name}: {e}; retrying")
+                print(f"[trace] character tool execution failed ({character_name}): {tool_name}: {e}; retrying")
             # When character_decision fails (e.g. bad duration), force
             # the model to retry that exact tool instead of falling back
             # to ask_game_master.

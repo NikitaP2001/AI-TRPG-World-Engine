@@ -38,7 +38,7 @@ from world import World, WorldTime, WorldDuration, build_game_master_context_blo
 def gm_scene_description(
     player_names: List[str],
     location: str,
-    npc_names: Optional[List[str]] = None,
+    scene_npc: Optional[List[str]] = None,
     time_shift: str = "0",
     shared: str = "",
     personal_json: str = "",
@@ -47,9 +47,9 @@ def gm_scene_description(
     """Return selected scene metadata and scene description in one call.
 
     Args:
-        player_names: Players to include in the scene.
+        player_names: Players to include in this scene.
         location: Location name for the scene (existing or new if narratively needed).
-        npc_names: Optional NPC names to include.
+        scene_npc: All sentient beings present on scene who are not player characters — list every one of them by name.
         time_shift: Optional skipped time before the scene starts. Default is "0".
         shared: 3rd-person scene description - perception intersection, covering what every player can observe
             atmosphere, environment, NPC activity, sensory details. No secrets or private info.
@@ -63,15 +63,13 @@ def gm_scene_description(
 
 
 @tool
-def gm_turn_narration(shared: str, duration: str, world_facts: str, personal_json: str = "" ) -> str:
+def gm_turn_narration(shared: str, duration: str, personal_json: str = "" ) -> str:
     """Submit turn narration: shared outcome visible to all plus optional per-player personal parts.
 
     Args:
         shared: 3rd-person narrative of what happened — all events visible/audible to everyone
             present. Contains no private or secret information.
         duration: Elapsed time (e.g. "30s", "5m", "2h")
-        world_facts: Off-camera canonical world facts — dry, encyclopedic entries about
-            what exists outside the current scene, unknown to players.
         personal_json: Optional JSON object mapping player names to personal additions —
             only what THAT player exclusively experienced/perceived, not in shared.
             Written in 2nd person ("you"). Omit or pass "" if nothing is private.
@@ -89,6 +87,17 @@ def gm_correct_character_intents(character_name: str, turn_insight: str) -> str:
         character_name: Exact participant name whose current intent must be revised.
         turn_insight: In-world, character-facing notice that explains what they perceive
             now and why their declared intent should be corrected.
+    """
+    return "ok"
+
+
+@tool
+def gm_plan_world(world_facts: str) -> str:
+    """Pre-establish hidden canonical world facts that exist independently of player awareness.
+
+    Use this before finalizing turn narration to record off-camera details
+    that define the world's independent existence.
+    Call multiple times if needed, then finalize with gm_turn_narration.
     """
     return "ok"
 
@@ -142,6 +151,13 @@ def _coerce_duration(raw: str) -> Optional[str]:
 def _extract_tool_calls(msg: Any) -> List[Dict[str, Any]]:
     def _normalize(tc: Any) -> Optional[Dict[str, Any]]:
         if isinstance(tc, dict):
+            args_val = tc.get("args")
+            if isinstance(args_val, str) and args_val.strip():
+                tc = dict(tc)
+                try:
+                    tc["args"] = json.loads(args_val)
+                except Exception:
+                    pass
             return tc
         try:
             name = getattr(tc, "name", None)
@@ -150,6 +166,11 @@ def _extract_tool_calls(msg: Any) -> List[Dict[str, Any]]:
                 out: Dict[str, Any] = {"name": str(name)}
                 if isinstance(args, dict):
                     out["args"] = args
+                elif isinstance(args, str) and args.strip():
+                    try:
+                        out["args"] = json.loads(args)
+                    except Exception:
+                        out["args"] = args
                 elif args is not None:
                     out["args"] = args
                 return out
@@ -642,7 +663,7 @@ class GameMaster:
             HumanMessage(content=human_msg + ctx_note),
         ]
 
-        # Require exactly one tool call: either final narration or character correction.
+        # Require a tool call: correct intents or finalize narration.
         # NOTE: bind_tools() MUST come before with_config() — calling
         # with_config first wraps the LLM in a RunnableBinding, and
         # bind_tools on that delegates via __getattr__ to the underlying
@@ -661,7 +682,6 @@ class GameMaster:
 
         narrations: Dict[str, str] = {}
         _coerced_dur: Optional[str] = None
-        _world_facts: str = ""
         _shared_narration: str = ""
         _personal_narration: Dict[str, str] = {}
 
@@ -713,12 +733,20 @@ class GameMaster:
             tc0 = tool_calls[0]
             tool_name0 = str(tc0.get("name") or "").strip()
             args0 = tc0.get("args") if isinstance(tc0, dict) else {}
+            if isinstance(args0, str) and args0.strip():
+                try:
+                    args0 = json.loads(args0)
+                except Exception:
+                    print(f"[debug] GM run_turn_narration: failed to parse args0 string: {args0[:200]!r}")
+                    args0 = {}
             if not isinstance(args0, dict):
+                print(f"[debug] GM run_turn_narration: non-dict args0 type={type(args0).__name__} value={str(args0)[:200]!r}")
                 args0 = {}
 
             if tool_name0 == "gm_correct_character_intents":
                 correction_character = str(args0.get("character_name") or "").strip()
                 correction_notice = str(args0.get("turn_insight") or "").strip()
+                print(f"[debug] GM correction: character={correction_character!r} turn_insight={correction_notice[:100]!r}")
                 if not correction_character or not correction_notice:
                     if logs_enabled():
                         print(
@@ -796,7 +824,6 @@ class GameMaster:
                 c: (_shared0 + "\n\n" + _personal0[c]) if c in _personal0 else _shared0
                 for c in selected_characters
             }
-            _world_facts = str(args0.get("world_facts") or "").strip()
             _shared_narration = _shared0
             _personal_narration = _personal0
             break
@@ -805,7 +832,7 @@ class GameMaster:
             _coerced_dur = None
 
         duration = _coerced_dur or ""
-        world_facts = _world_facts
+        world_facts = ""
 
         # Combined narration for history, recaps and fallback delivery.
         # Format: shared text + optional personal blocks (only the per-player delta).
@@ -834,14 +861,13 @@ class GameMaster:
         if self._history_path and combined_narration:
             limits = limits_from_env()
             append_message(self._history_path, role="user", content=history_user_msg, limits=limits)
-            assistant_mem = (
-                (
-                    (f"Turn end time: {turn_end_time}\n" if turn_end_time else "")
-                    + f"Turn duration: {duration}\n\n{combined_narration}"
-                ).strip()
-                if duration
-                else combined_narration
-            )
+            assistant_parts: List[str] = []
+            if turn_end_time:
+                assistant_parts.append(f"Turn end time: {turn_end_time}")
+            if duration:
+                assistant_parts.append(f"Turn duration: {duration}")
+            assistant_parts.append(combined_narration)
+            assistant_mem = "\n\n".join(assistant_parts)
             append_message(self._history_path, role="assistant", content=assistant_mem, limits=limits)
 
         # Clear the per-turn Q&A buffer once narration is committed.
@@ -855,6 +881,141 @@ class GameMaster:
             "duration": duration,
             "world_facts": world_facts,
         }
+
+    def run_world_planning(
+        self,
+        *,
+        context_text: str,
+        llm: Optional[ChatOpenAI] = None,
+    ) -> str:
+        """Pre-establish hidden canonical world facts before player intents arrive.
+
+        Called after scene description, before the turn narration loop.
+        Only gm_plan_world tool is available — the GM plans without knowing
+        what players will do.
+
+        Returns the aggregated world facts string, or empty string.
+        Persists results to GM conversation history.
+        """
+        print(f"[trace] GM run_world_planning: starting (history={self._history_path is not None})")
+        if llm is None:
+            llm = build_openrouter_chat_llm(
+                temperature=float(self._temperature),
+                streaming=True,
+                title_suffix="-game-master",
+                max_tokens=1500,
+                parallel_tool_calls=False,
+            )
+
+        callbacks = openrouter_logging_callbacks(scope="game_master", label="world_planning")
+
+        human_msg = (
+            "Pre-establish hidden canonical world facts for the upcoming turn.\n"
+            "Use gm_plan_world to record off-camera details that define the world's independent existence."
+        )
+
+        # Load conversation history
+        history_msgs: List[BaseMessage] = []
+        if self._history_path and self._history_path.exists():
+            history = load_history(self._history_path)
+            for h in history:
+                role = (h.get("role") or "").strip().lower()
+                content = str(h.get("content") or "")
+                if role == "user":
+                    history_msgs.append(HumanMessage(content=content))
+                elif role == "assistant":
+                    history_msgs.append(AIMessage(content=content))
+
+        ctx_note = ("\n\n---\n" + context_text.strip()) if context_text and context_text.strip() else ""
+        messages = [
+            SystemMessage(content=self._prompt_text),
+            *history_msgs,
+            HumanMessage(content=human_msg + ctx_note),
+        ]
+
+        try:
+            bound_llm = llm.bind_tools(
+                [gm_plan_world],
+                tool_choice="required",
+            ).with_config({"callbacks": callbacks})
+        except TypeError:
+            bound_llm = llm.bind_tools([gm_plan_world]).with_config({"callbacks": callbacks})
+
+        _world_plan_buffer: List[str] = []
+        max_retries = 3
+        for _attempt in range(max_retries):
+            enable_direct_text_abort(max_words=15)
+            try:
+                out = bound_llm.invoke(messages)
+            except KeyboardInterrupt:
+                if logs_enabled():
+                    print(f"[trace] GM run_world_planning: direct text abort — retrying")
+                messages.append(AIMessage(content="(text output suppressed)"))
+                messages.append(HumanMessage(
+                    content="ERROR: You produced raw text instead of calling gm_plan_world. "
+                    "You MUST use the gm_plan_world tool."
+                ))
+                continue
+            finally:
+                disable_direct_text_abort()
+
+            tool_calls = _extract_tool_calls(out)
+            if not tool_calls:
+                if logs_enabled():
+                    print(f"[trace] GM run_world_planning: no tool call, retrying ({_attempt + 1}/{max_retries})")
+                _append_tool_rejection(messages, out, "ERROR: You MUST call gm_plan_world tool. Do not write text directly.")
+                continue
+
+            tc0 = tool_calls[0]
+            tool_name0 = str(tc0.get("name") or "").strip()
+            args0 = tc0.get("args") if isinstance(tc0, dict) else {}
+            if isinstance(args0, str) and args0.strip():
+                try:
+                    args0 = json.loads(args0)
+                except Exception:
+                    print(f"[debug] GM run_world_planning: failed to parse args0 string: {args0[:200]!r}")
+                    args0 = {}
+            if not isinstance(args0, dict):
+                args0 = {}
+
+            if tool_name0 == "gm_plan_world":
+                plan_world_facts = str(args0.get("world_facts") or "").strip()
+                if not plan_world_facts:
+                    if logs_enabled():
+                        print(
+                            f"[trace] GM run_world_planning: empty world_facts, retrying ({_attempt + 1}/{max_retries})"
+                        )
+                    _append_tool_rejection(
+                        messages, out,
+                        "ERROR: gm_plan_world world_facts is empty. Provide canonical world facts.",
+                    )
+                    continue
+                _world_plan_buffer.append(plan_world_facts)
+                break
+            else:
+                if logs_enabled():
+                    print(
+                        f"[trace] GM run_world_planning: unexpected tool {tool_name0!r}, retrying ({_attempt + 1}/{max_retries})"
+                    )
+                _append_tool_rejection(
+                    messages, out,
+                    "ERROR: Use gm_plan_world to pre-establish world facts.",
+                )
+                continue
+
+        world_facts = "\n\n".join(_world_plan_buffer) if _world_plan_buffer else ""
+        if world_facts:
+            print(f"[trace] GM run_world_planning: {len(_world_plan_buffer)} fact(s) recorded ({len(world_facts)} chars)")
+        else:
+            print("[trace] GM run_world_planning: no facts produced after retries")
+
+        # Persist to GM conversation history.
+        if self._history_path and world_facts:
+            limits = limits_from_env()
+            append_message(self._history_path, role="user", content="GM Pre-established private world facts:", limits=limits)
+            append_message(self._history_path, role="assistant", content=world_facts, limits=limits)
+
+        return world_facts
 
     def run_scene_description(
         self,
@@ -950,7 +1111,7 @@ class GameMaster:
 
             _selected_location = str(args.get("location") or "").strip()
 
-            raw_npcs = args.get("npc_names")
+            raw_npcs = args.get("scene_npc")
             if isinstance(raw_npcs, list):
                 _selected_npcs = [str(x).strip() for x in raw_npcs if str(x).strip()]
             elif isinstance(raw_npcs, str):
@@ -1032,7 +1193,7 @@ class GameMaster:
         return {
             "character_names": _selected_characters,
             "location": _selected_location,
-            "npc_names": _selected_npcs,
+            "scene_npc": _selected_npcs,
             "time_shift": _time_shift,
             "shared": _shared_result,
             "personal": _personal_result,
@@ -1076,8 +1237,7 @@ class GameMaster:
             overview = payload.get("character_time_overview")
 
             msg = (
-                "Create and describe the next scene using gm_scene_description.\n"
-                "Follow both ## Creating a scene and ## Scene description paragraphs.\n"
+                "Create and describe the next scene using gm_scene_description following Creating a scene and Scene description paragraphs\n"
                 "\n"
             )
 
@@ -1115,12 +1275,7 @@ class GameMaster:
         participant_names = [str(p.get("name") or "").strip() for p in char_plans if str(p.get("name") or "").strip()]
         round_history = payload.get("turn_round_history") if isinstance(payload.get("turn_round_history"), list) else []
 
-        msg = "Resolve this turn by choosing exactly one tool:\n"
-        msg += (
-            "- gm_turn_narration: finalize the turn according to Narrating a turn paragraph\n"
-            "- gm_correct_character_intents: request exactly one character to revise intent before narration accoring to Correcting character intents.\n"
-            "  Use args: character_name, turn_insight. turn_insight must be in-world notice for that character.\n"
-        )
+        msg = "Resolve this turn by choosing tools based on Correcting character intents and Narrating a turn paragraphs:\n"
 
         if round_history:
             msg += "\nRound history for this same turn (oldest first):\n"
@@ -1132,7 +1287,15 @@ class GameMaster:
                 if item_type == "plans":
                     plans_hist = item.get("character_plans") if isinstance(item.get("character_plans"), list) else []
                     msg += f"\n[Round {item_round} plans]\n"
-                    msg += "DECLINED: do not apply these intents directly; use current intentions below.\n"
+                    # DECLINED only if a correction/replan exists AFTER this entry.
+                    item_idx = round_history.index(item) if item in round_history else -1
+                    has_following_correction = any(
+                        isinstance(round_history[i], dict)
+                        and str(round_history[i].get("type") or "").strip().lower() in ("correction", "replan")
+                        for i in range(item_idx + 1, len(round_history))
+                    )
+                    if has_following_correction:
+                        msg += "DECLINED: do not apply these intents directly; use current intentions below.\n"
                     for plan in plans_hist:
                         if not isinstance(plan, dict):
                             continue
@@ -1151,6 +1314,12 @@ class GameMaster:
                 elif item_type == "replan":
                     char_name = str(item.get("character_name") or "").strip() or "Unknown"
                     msg += f"\n[Round {item_round} replan] {char_name}: new intent submitted (see current intentions below)\n"
+                elif item_type == "final_decision":
+                    char_name = str(item.get("character_name") or "").strip() or "Unknown"
+                    ruling = str(item.get("gm_final_ruling") or "").strip()
+                    msg += f"\n[Round {item_round} final_decision] {char_name}: correction limit reached — your GM ruling is final.\n"
+                    if ruling:
+                        msg += f"GM final decision: {ruling}\n"
 
         if participant_names:
             msg += "\nParticipants:\n"
@@ -1240,10 +1409,10 @@ class GameMaster:
 
         return (
             prior_qa
-            + "Player question (as recall to their self-knowledge or perception).\n"
+            + "Player question (as recall to his self-knowledge or perception).\n"
             f"Player: {char_name}\n"
             f"Questions:\n{questions}\n\n"
-            "Provide short, clear in-character answers based on what player CHARACTER can perceive and know. Do not give any meta-knonwledge"
+            "Provide short, clear in-character answers limited to what player CHARACTER can perceive and know. Do not give any meta-knonwledge or accept any complex intents."
         )
 
     def _task_to_message(self, task: str, payload: Dict[str, Any]) -> str:

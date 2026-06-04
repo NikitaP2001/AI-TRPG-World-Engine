@@ -977,7 +977,7 @@ class ConsoleApp:
                 selected_location = str(result.get("location") or "").strip()
                 selected_npcs = [
                     str(x).strip()
-                    for x in (result.get("npc_names") if isinstance(result.get("npc_names"), list) else [])
+                    for x in (result.get("scene_npc") if isinstance(result.get("scene_npc"), list) else [])
                     if str(x).strip()
                 ]
                 scene_time_shift = str(result.get("time_shift") or "0").strip() or "0"
@@ -1143,6 +1143,19 @@ class ConsoleApp:
                     f"[trace] scene auto-started at '{selected_location}' with "
                     f"{selected_characters}"
                 )
+
+            # World planning: GM pre-establishes hidden facts before knowing player intents.
+            try:
+                plan_ctx = build_game_master_context(self.world)
+                print("[trace] world_planning: starting...")
+                world_facts = self._game_master.run_world_planning(context_text=plan_ctx)
+                if world_facts:
+                    print("[trace] world_planning: facts received, injecting into SA")
+                    self._inject_sa_delta(f"[world_facts]\n{world_facts}")
+                else:
+                    print("[trace] world_planning: GM returned no facts")
+            except Exception as e:
+                print(f"[trace] world_planning error: {type(e).__name__}: {e}")
         except Exception as e:  # noqa: BLE001
             print(f"Error: failed to auto-start scene after description: {e}")
             return True
@@ -1531,6 +1544,8 @@ class ConsoleApp:
         narration = ""
         narrations: Dict[str, str] = {}
         turn_duration = ""
+        MAX_CORRECTION_ROUNDS = 5
+        correction_counts: Dict[str, int] = {}
 
         while True:
             round_counter += 1
@@ -1560,6 +1575,10 @@ class ConsoleApp:
                     print("Error: Game Master correction has empty turn_insight")
                     return False
 
+                # Per-character correction limit
+                correction_counts[corrected_name] = correction_counts.get(corrected_name, 0) + 1
+                current_count = correction_counts[corrected_name]
+
                 round_history.append(
                     {
                         "type": "correction",
@@ -1568,6 +1587,51 @@ class ConsoleApp:
                         "turn_insight": turn_insight,
                     }
                 )
+
+                if current_count >= MAX_CORRECTION_ROUNDS:
+                    # Hard safety: if GM still corrects after final_decision was already applied,
+                    # abort the turn — prevents infinite loops.
+                    if current_count >= MAX_CORRECTION_ROUNDS + 2:
+                        print(
+                            f"Error: {corrected_name} already exhausted corrections; "
+                            f"GM issued correction #{current_count}. "
+                            "Aborting turn to prevent infinite correction loop."
+                        )
+                        return False
+
+                    # Character exhausted all corrections — GM's word is final.
+                    # Mark exhausted in scene, set GM's ruling as the decision.
+                    if logs_enabled():
+                        print(f"[trace] {corrected_name} exhausted {MAX_CORRECTION_ROUNDS} corrections; applying GM final ruling")
+
+                    try:
+                        scene = self.world.get_scene()
+                        chars = scene.get("characters") if isinstance(scene.get("characters"), dict) else {}
+                        entry = chars.get(corrected_name) if isinstance(chars.get(corrected_name), dict) else {}
+                        entry["corrections_exhausted"] = True
+                        entry["last_decision"] = f"[gm_final_decision] {turn_insight}"
+                        entry["last_thoughts"] = ""
+                        chars[corrected_name] = entry
+                        scene["characters"] = chars
+                        self.world.set_scene(scene)
+                    except Exception:
+                        pass
+
+                    round_history.append({
+                        "type": "final_decision",
+                        "round": round_counter,
+                        "character_name": corrected_name,
+                        "gm_final_ruling": turn_insight,
+                    })
+
+                    try:
+                        scene = self.world.get_scene()
+                    except Exception:
+                        return False
+                    chars = scene.get("characters") if isinstance(scene.get("characters"), dict) else {}
+                    plans = _build_plans_from_scene(chars)
+                    payload = _build_payload(scene, plans)
+                    continue
 
                 entry = chars.get(corrected_name) if isinstance(chars.get(corrected_name), dict) else {}
                 loc_name = str(scene.get("location") or "").strip()
@@ -1619,7 +1683,7 @@ class ConsoleApp:
                         scene_location=loc_name,
                         world_time=world_time_str,
                         character_input=current_scene_context,
-                        gm_correction_notice=turn_insight,
+                        gm_reality_notice=turn_insight,
                         current_intent=prev_intent,
                     )
                     return False
@@ -1636,7 +1700,7 @@ class ConsoleApp:
                         current_scene_context=current_scene_context,
                         scene_location=loc_name,
                         world_time=world_time_str,
-                        gm_correction_notice=turn_insight,
+                        gm_reality_notice=turn_insight,
                         previous_intent=prev_intent,
                         require_decision=False,
                         persist_history=False,

@@ -19,7 +19,7 @@ def main() -> int:
         app = ConsoleApp()
     except Exception as e:  # noqa: BLE001
         print(f"Startup error: {e}")
-        print("Tip: copy .env.example to .env and set OPENROUTER_API_KEY.")
+        print("Tip: copy .env.example to .env and set DEEPSEEK_API_KEY.")
         return 1
 
     return app.run()

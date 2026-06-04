@@ -316,6 +316,8 @@ def update_location(name: str, json_pointer: str, value_json: str) -> str:
         return _tool_error("/name cannot be modified via update_location")
     if ptr == "/last_active":
         return _tool_error("/last_active is runtime-managed; it cannot be set via GM tools")
+    if ptr in {"/parent_location", "/sublocations_names"}:
+        return _tool_error(f"{ptr} is auto-synced from location hierarchy; update parent_location on the child location instead")
 
     data = _WORLD.add_location_json(name=name, pointer=json_pointer, value=value_json)
     return _json(data)
@@ -339,6 +341,8 @@ def delete_location_path(name: str, json_pointer: str) -> str:
         return _tool_error("/name cannot be deleted")
     if ptr == "/last_active":
         return _tool_error("/last_active is runtime-managed; it cannot be deleted via GM tools")
+    if ptr in {"/parent_location", "/sublocations_names"}:
+        return _tool_error(f"{ptr} is auto-synced from location hierarchy; delete parent_location on the child location instead")
 
     if logs_enabled():
         print(f"[trace] delete_location_path: {name} {ptr}")
@@ -418,6 +422,13 @@ def update_npc(name: str, json_pointer: str, value_json: str) -> str:
     if not val_raw:
         return _tool_error("value_json is required")
 
+    if ptr in {"/name", ""}:
+        return _tool_error("/name cannot be modified via update_npc")
+    if ptr == "/location":
+        return _tool_error("/location is runtime-managed; it is synced from the scene when a turn ends")
+    if ptr == "/last_acted":
+        return _tool_error("/last_acted is runtime-managed; it is set automatically when a turn ends")
+
     if logs_enabled():
         print(f"[trace] update_npc field: {name} {ptr} = {val_raw}")
 
@@ -434,6 +445,8 @@ def delete_npc_path(name: str, json_pointer: str) -> str:
         return err
     _WORLD.ensure_initialized()
 
+    if ptr == "/location":
+        return _tool_error("/location is runtime-managed; it cannot be deleted via GM tools")
     ptr = str(json_pointer or "").strip()
     if not ptr:
         return _tool_error("json_pointer is required")
@@ -516,8 +529,11 @@ def update_character(name: str, json_pointer: str, value_json: str) -> str:
         return err
     _WORLD.ensure_initialized()
 
-    if str(json_pointer or "").strip() == "/last_acted":
+    ptr = str(json_pointer or "").strip()
+    if ptr == "/last_acted":
         return _tool_error("/last_acted is runtime-managed; it cannot be set via GM tools")
+    if ptr == "/location":
+        return _tool_error("/location is runtime-managed; it is synced from the scene when a turn ends")
 
     try:
         data = _WORLD.add_character_json(name=name, pointer=json_pointer, value=value_json)
@@ -529,6 +545,17 @@ def update_character(name: str, json_pointer: str, value_json: str) -> str:
 @tool
 def add_character(name: str, json_pointer: str, value_json: str) -> str:
     """Add/create a JSON field in a character description using JSON Pointer (creates missing containers)."""
+
+    err = _guard_tool("add_character", require_unlocked=True)
+    if err:
+        return err
+    _WORLD.ensure_initialized()
+
+    ptr = str(json_pointer or "").strip()
+    if ptr == "/last_acted":
+        return _tool_error("/last_acted is runtime-managed; it cannot be set via GM tools")
+    if ptr == "/location":
+        return _tool_error("/location is runtime-managed; it is synced from the scene when a turn ends")
 
     err = _guard_tool("add_character", require_unlocked=True)
     if err:
@@ -563,6 +590,10 @@ def delete_character_path(name: str, json_pointer: str) -> str:
         return _tool_error("json_pointer is required")
     if ptr == "/":
         return _tool_error("Cannot delete document root")
+    if ptr == "/last_acted":
+        return _tool_error("/last_acted is runtime-managed; it cannot be deleted via GM tools")
+    if ptr == "/location":
+        return _tool_error("/location is runtime-managed; it cannot be deleted via GM tools")
 
     if logs_enabled():
         print(f"[trace] delete_character_path: {name} {ptr}")

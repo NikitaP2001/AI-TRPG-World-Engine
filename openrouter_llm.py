@@ -7,7 +7,7 @@ from typing import List, Optional, Union
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
-from config import load_openrouter_config
+from config import load_deepseek_config
 from openrouter_langchain_logging import OpenRouterLoggingCallback, logs_enabled
 
 
@@ -22,7 +22,7 @@ def build_openrouter_chat_llm(
     title_suffix: Optional[str] = None,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
-    include_openrouter_headers: Optional[bool] = None,
+    include_headers: Optional[bool] = None,
     timeout: float = 60.0,
     max_retries: int = 2,
     streaming: bool = True,
@@ -30,7 +30,7 @@ def build_openrouter_chat_llm(
     parallel_tool_calls: bool = True,
     thinking: Optional[bool] = None,
 ) -> ChatOpenAI:
-    """Create a ChatOpenAI client configured for OpenRouter.
+    """Create a ChatOpenAI client configured for DeepSeek (or any OpenAI-compatible backend).
 
     `title_suffix` is appended to the X-Title header for easier debugging.
     `parallel_tool_calls` controls whether the model can call multiple tools in one response.
@@ -41,18 +41,18 @@ def build_openrouter_chat_llm(
 
     # If caller provides explicit transport settings, allow using any
     # OpenAI-compatible backend (e.g., local Qwen server) without requiring
-    # OPENROUTER_API_KEY.
+    # DEEPSEEK_API_KEY.
     explicit_transport = bool(str(base_url or "").strip() or str(api_key or "").strip())
 
     cfg = None
     if not explicit_transport:
-        cfg = load_openrouter_config()
+        cfg = load_deepseek_config()
 
     effective_model = (str(model).strip() if str(model or "").strip() else (cfg.model if cfg else ""))
     effective_base_url = (
         str(base_url).strip()
         if str(base_url or "").strip()
-        else (cfg.base_url if cfg else (os.getenv("OPENAI_BASE_URL") or "https://openrouter.ai/api/v1"))
+        else (cfg.base_url if cfg else (os.getenv("OPENAI_BASE_URL") or "https://api.deepseek.com/v1"))
     )
     effective_api_key = (
         str(api_key).strip()
@@ -64,13 +64,13 @@ def build_openrouter_chat_llm(
         )
     )
 
-    include_headers = include_openrouter_headers
-    if include_headers is None:
-        include_headers = not explicit_transport
+    _use_headers = include_headers
+    if _use_headers is None:
+        _use_headers = not explicit_transport
 
     default_headers = None
-    if include_headers:
-        title = (cfg.app_name if cfg else None) or os.getenv("OPENROUTER_APP_NAME") or "llm_world"
+    if _use_headers:
+        title = "llm_world"
         if title_suffix:
             s = str(title_suffix).strip()
             if s:
@@ -78,7 +78,6 @@ def build_openrouter_chat_llm(
                     s = "-" + s
                 title = title + s
         default_headers = {
-            "HTTP-Referer": (cfg.site_url if cfg else None) or os.getenv("OPENROUTER_SITE_URL") or "http://localhost",
             "X-Title": title,
         }
 
@@ -110,7 +109,7 @@ def build_openrouter_chat_llm(
     
     if logs_enabled():
         import sys
-        print(f"[DEBUG] OpenRouter LLM created with parallel_tool_calls={bool(parallel_tool_calls)}", file=sys.stderr)
+        print(f"[DEBUG] DeepSeek LLM created with parallel_tool_calls={bool(parallel_tool_calls)}", file=sys.stderr)
     
     if max_tokens is not None:
         try:

@@ -6,25 +6,21 @@ from typing import Optional
 
 
 @dataclass(frozen=True)
-class OpenRouterConfig:
+class DeepSeekConfig:
 	api_key: str
 	base_url: str
 	model: str
-	site_url: Optional[str] = None
-	app_name: Optional[str] = None
 
 
-def load_openrouter_config() -> OpenRouterConfig:
-	api_key = os.getenv("OPENROUTER_API_KEY")
+def load_deepseek_config() -> DeepSeekConfig:
+	api_key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENROUTER_API_KEY")
 	if not api_key:
 		raise RuntimeError(
-			"Missing OPENROUTER_API_KEY. Set it in your environment or in a .env file."
+			"Missing DEEPSEEK_API_KEY. Set it in your environment or in a .env file."
 		)
 
-	return OpenRouterConfig(
+	return DeepSeekConfig(
 		api_key=api_key,
-		base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-		model=os.getenv("OPENROUTER_MODEL", "tngtech/deepseek-r1t2-chimera:free"),
-		site_url=os.getenv("OPENROUTER_SITE_URL") or None,
-		app_name=os.getenv("OPENROUTER_APP_NAME") or None,
+		base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
+		model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
 	)

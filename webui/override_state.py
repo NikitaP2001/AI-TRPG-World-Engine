@@ -106,7 +106,7 @@ class OverrideStore:
         scene_location: str,
         world_time: str,
         character_input: str,
-        gm_correction_notice: str = "",
+        gm_reality_notice: str = "",
         current_intent: str = "",
     ) -> PendingPrompt:
         data = self.load()
@@ -115,7 +115,7 @@ class OverrideStore:
             "scene_location": scene_location,
             "world_time": world_time,
             "character_input": character_input,
-            "gm_correction_notice": str(gm_correction_notice or ""),
+            "gm_reality_notice": str(gm_reality_notice or ""),
             "current_intent": str(current_intent or ""),
             "created_at": self._now(),
         }
@@ -141,7 +141,7 @@ class OverrideStore:
                 scene_location=str(p.get("scene_location") or ""),
                 world_time=str(p.get("world_time") or ""),
                 character_input=self._normalize_character_input_text(raw_character_input),
-                gm_correction_notice=str(p.get("gm_correction_notice") or p.get("gm_notice") or ""),
+                gm_reality_notice=str(p.get("gm_reality_notice") or p.get("gm_notice") or ""),
                 current_intent=str(p.get("current_intent") or p.get("last_intent") or ""),
                 created_at=str(p.get("created_at") or ""),
             )

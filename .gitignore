@@ -8,3 +8,8 @@ __pycache__/
 .tmp_*.py
 scripts/*
 .env
+.cursorignore
+.vscode/
+old_agent_def.txt
+plans.txt
+rag.txt

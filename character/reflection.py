@@ -71,12 +71,13 @@ def _clean_text(value: Any, *, max_chars: int = 500) -> str:
 
 
 def _safe_name_for_logging(name: str) -> str:
-    """Convert character name to ASCII-safe string for use in file names and logging labels.
-    
-    This prevents Unicode encoding errors when logging systems try to write to files
-    or format strings with ASCII-only environments.
-    """
-    return name.encode("ascii", errors="replace").decode("ascii")
+    """Sanitize character name for use in file names — strip only truly illegal chars,
+    preserving full Unicode (Cyrillic, CJK, etc.)."""
+    if not name:
+        return "unknown"
+    # Windows-illegal in filenames: <>:"/\|?*
+    safe = "".join(ch for ch in name if ch not in '<>:"/\\|?*')
+    return safe.strip() or "unknown"
 
 
 def _dedupe_strings(values: Any, *, max_items: int, max_chars: int = 280) -> List[str]:
@@ -179,24 +180,11 @@ def _apply_reflection_limits(
 
 
 def _has_nonempty_reflection_content(value: Any) -> bool:
-    """Return True when reflection has at least one meaningful field."""
+    """Return True when reflection has meaningful content."""
     if not isinstance(value, dict):
         return False
-
-    relationships = value.get("relationships")
-    goals = value.get("goals")
-    beliefs = value.get("beliefs")
-    emotional_state = str(value.get("emotional_state") or "").strip()
-
-    if isinstance(relationships, list) and any(isinstance(x, dict) for x in relationships):
-        return True
-    if isinstance(goals, list) and any(isinstance(x, dict) for x in goals):
-        return True
-    if isinstance(beliefs, list) and any(str(x or "").strip() for x in beliefs):
-        return True
-    if emotional_state:
-        return True
-    return False
+    reflection_text = str(value.get("reflection") or "").strip()
+    return len(reflection_text) >= 10
 
 
 # ---------------------------------------------------------------------------
@@ -204,33 +192,154 @@ def _has_nonempty_reflection_content(value: Any) -> bool:
 # ---------------------------------------------------------------------------
 
 @tool
-def output_reflection(
-    relationships: list,
-    goals: list,
-    beliefs: list,
-    emotional_state: str,
+def character_reflection(
+    reflection_text: str,
 ) -> str:
-    """Output your self-reflection.
+    """Write your current self-reflection.
 
-    This is the ONLY tool available during the reflection phase.
-    Call it exactly once with your updated self-reflection.
-
-    Args:
-        relationships: List of relationship objects, each with keys: entity, nature, attitude, notes
-        goals: List of goal objects, each with keys: goal, priority (immediate/short-term/long-term), status (active/planned/completed/abandoned)
-        beliefs: List of belief strings — factual beliefs about the world
-        emotional_state: Brief description of current emotional state and trajectory
+    A single paragraph capturing your emotional state, active drives,
+    inner conflicts, and recent realizations. MAX 200 words.
+    Be honest and introspective — this is your private inner monologue.
     """
     return json.dumps(
-        {
-            "relationships": relationships,
-            "goals": goals,
-            "beliefs": beliefs,
-            "emotional_state": str(emotional_state or ""),
-        },
+        {"reflection": str(reflection_text or "").strip()},
         ensure_ascii=False,
         indent=2,
     )
+
+
+@tool
+def relationship_update(
+    entity: str,
+    nature: str,
+    attitude: str,
+    observation: str,
+) -> str:
+    """Record or update your impression of a character or NPC you interacted with.
+
+    Call this after a meaningful interaction to save your current view.
+
+    Args:
+        entity: Name of the character or NPC.
+        nature: Role type — e.g. ally, enemy, superior, subordinate, stranger, lover.
+        attitude: Emotional stance — e.g. trusting, suspicious, fearful, admiring, contemptuous.
+        observation: What you noticed or felt this time (max 200 chars).
+    """
+    _upsert_single_relationship(
+        character_name="",
+        entity=entity,
+        nature=nature,
+        attitude=attitude,
+        observation=observation,
+    )
+    return f"Relationship with {entity} updated."
+
+
+@tool
+def relationship_read(name: str) -> str:
+    """Recall your memories about a specific character or NPC.
+
+    Args:
+        name: The name of the character or NPC to recall.
+    """
+    return _format_relationship_memory(name)
+
+
+# These are referenced by the tools above but defined at module level.
+_relationship_store_char: str = ""
+
+
+def _resolve_character_name() -> str:
+    """Return the character name for relationship operations.
+
+    Uses the thread-local or explicitly set character name.
+    """
+    return _relationship_store_char
+
+
+def _upsert_single_relationship(
+    *,
+    character_name: str,
+    entity: str,
+    nature: str,
+    attitude: str,
+    observation: str,
+) -> None:
+    """Append a new observation for an entity in relationships.json."""
+    name = character_name or _resolve_character_name()
+    if not name:
+        return
+
+    now_ts = datetime.now(timezone.utc).isoformat()
+    _record_observation(name, entity, nature, attitude, observation, now_ts)
+
+
+def _record_observation(
+    character_name: str,
+    entity: str,
+    nature: str,
+    attitude: str,
+    observation: str,
+    timestamp: str,
+) -> None:
+    """Append or create a relationship observation entry."""
+    rels_path = _character_dir(character_name) / "relationships.json"
+    data = _read_json(rels_path)
+    if not isinstance(data, dict):
+        data = {}
+
+    key = entity.strip().lower()
+    now_t = (timestamp or datetime.now(timezone.utc)).isoformat()
+
+    if key in data:
+        entry = data[key]
+        entry["nature"] = nature
+        entry["attitude"] = attitude
+        entry["last_seen"] = now_t
+        obs_list = entry.get("observations") or []
+        obs_list.append(observation[:200])
+        # Keep last 5 observations for GC
+        entry["observations"] = obs_list[-5:]
+        data[key] = entry
+    else:
+        data[key] = {
+            "entity": entity.strip(),
+            "nature": nature,
+            "attitude": attitude,
+            "first_seen": now_t,
+            "last_seen": now_t,
+            "observations": [observation[:200]],
+        }
+
+    _write_json(rels_path, data)
+
+
+def _format_relationship_memory(name: str) -> str:
+    """Format stored observations about an entity into a readable string."""
+    # This is called from relationship_read tool, which is invoked during
+    # character agent execution — figure out which character from context.
+    return "Relationship memory lookup requires an active character context."
+
+
+def _get_known_relationships(character_name: str) -> List[Dict[str, str]]:
+    """Return a simple name-attitude list for all entities the character has met.
+
+    This is the lightweight "known relationships" injection — just entity + attitude.
+    """
+    rels_path = _character_dir(character_name) / "relationships.json"
+    data = _read_json(rels_path)
+    if not isinstance(data, dict):
+        return []
+
+    known: List[Dict[str, str]] = []
+    for key, entry in data.items():
+        if not isinstance(entry, dict):
+            continue
+        entity = str(entry.get("entity") or "").strip()
+        attitude = str(entry.get("attitude") or "").strip()
+        if entity and attitude:
+            known.append({"name": entity, "attitude": attitude})
+    return known
 
 
 # ---------------------------------------------------------------------------
@@ -441,17 +550,17 @@ def _get_relevant_relationships(character_name: str) -> List[Dict[str, str]]:
     """Return relationships for entities currently present at the character's recent locations.
 
     Algorithm:
-    1. Collect ``scene_location`` values from the last 5 memory.json entries.
+    1. Collect ``scene_location`` values from the last 10 memory.json entries.
     2. From world/info.json (player characters) and world/npc.json (NPCs), find
        every entity whose current location matches any of those locations.
     3. Return the subset of relationships.json whose entity is in that set.
     """
-    # Step 1: locations from last 5 memory entries.
+    # Step 1: locations from last 10 memory entries.
     memory_path = _character_dir(character_name) / "memory.json"
     data = _read_json(memory_path)
     recent_locs: set = set()
     if isinstance(data, list):
-        for entry in data[-5:]:
+        for entry in data[-10:]:
             if isinstance(entry, dict):
                 meta = entry.get("meta") or {}
                 loc = str(meta.get("scene_location") or "").strip()
@@ -495,13 +604,13 @@ def _get_recently_met_names(character_name: str, exclude_name: str = "") -> List
     """Return canonical names of characters/NPCs co-present in the last 5 memory entry locations.
 
     'Recently met' is defined as any entity currently located at a scene location
-    that the character visited in their last 5 turns.
+    that the character visited in their last 10 turns.
     """
     memory_path = _character_dir(character_name) / "memory.json"
     data = _read_json(memory_path)
     recent_locs: set = set()
     if isinstance(data, list):
-        for entry in data[-5:]:
+        for entry in data[-10:]:
             if isinstance(entry, dict):
                 meta = entry.get("meta") or {}
                 loc = str(meta.get("scene_location") or "").strip()
@@ -638,11 +747,11 @@ def run_reflection(
 
     try:
         bound_llm = llm.bind_tools(
-            [output_reflection],
-            tool_choice={"type": "function", "function": {"name": "output_reflection"}},
+            [character_reflection],
+            tool_choice={"type": "function", "function": {"name": "character_reflection"}},
         ).with_config({"callbacks": callbacks})
     except TypeError:
-        bound_llm = llm.bind_tools([output_reflection]).with_config({"callbacks": callbacks})
+        bound_llm = llm.bind_tools([character_reflection]).with_config({"callbacks": callbacks})
 
     # 8. Invoke with retries
     max_attempts = 3
@@ -656,8 +765,8 @@ def run_reflection(
                     print(f"[trace] reflection {character_name}: direct text abort — retrying")
                 # Don't append the failed output; just add a stronger correction
                 messages.append(HumanMessage(
-                    content="ERROR: You produced raw text instead of calling output_reflection. "
-                    "Do NOT write text. Call the output_reflection tool NOW with your self-reflection."
+                    content="ERROR: You produced raw text instead of calling character_reflection. "
+                    "Do NOT write text. Call the character_reflection tool NOW with your self-reflection."
                 ))
                 continue
             finally:
@@ -673,69 +782,61 @@ def run_reflection(
                 if logs_enabled():
                     content_preview = str(getattr(ai_msg, "content", "") or "")
                     print(f"[trace] reflection attempt {attempt}: no tool call (content: {content_preview!r}), retrying")
-                # Don't append failed ai_msg — it grows context and confuses the model
                 messages.append(HumanMessage(
-                    content="CRITICAL: You MUST call output_reflection tool NOW. "
-                    "Do not write any text. Use the tool calling interface to call output_reflection "
-                    "with: relationships, goals, beliefs, emotional_state."
+                    content="CRITICAL: You MUST call character_reflection tool NOW. "
+                    "Do not write any text. Use the tool calling interface to call character_reflection "
+                    "with your reflection_text."
                 ))
                 continue
 
-            # Parse the first output_reflection call
+            # Parse the first character_reflection call
             tc = tool_calls[0]
             args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})
+            if isinstance(args, str) and args.strip():
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    if logs_enabled():
+                        print(f"[trace] reflection {character_name}: failed to parse args string, retrying")
+                    messages.append(HumanMessage(
+                        content="ERROR: output_reflection arguments were malformed. Provide valid JSON arguments "
+                        "with relationships, goals, beliefs, emotional_state."
+                    ))
+                    continue
             if not isinstance(args, dict):
+                if logs_enabled():
+                    print(f"[trace] reflection {character_name}: non-dict args type={type(args).__name__}, retrying")
                 args = {}
+                messages.append(HumanMessage(
+                    content="ERROR: output_reflection arguments malformed. Provide valid JSON arguments."
+                ))
+                continue
 
             # Invoke the tool to get structured output
-            result_str = output_reflection.invoke(args, config={"callbacks": callbacks})
+            result_str = character_reflection.invoke(args, config={"callbacks": callbacks})
             result = json.loads(result_str)
             if not isinstance(result, dict):
                 result = {}
 
-            # Check content validity on the raw LLM result (before relationships are split off).
+            # Check content validity
             if not _has_nonempty_reflection_content(result):
                 if logs_enabled():
                     print(f"[trace] reflection attempt {attempt}: empty reflection content, retrying")
                 messages.append(HumanMessage(
-                    content=(
-                        "Your reflection was empty. Call output_reflection again with meaningful content. "
-                        "At minimum provide emotional_state and/or at least one item in relationships/goals/beliefs."
-                    )
+                    content="Your reflection was empty. Write at least a few sentences about your "
+                    "current state of mind."
                 ))
                 continue
 
-            # Filter out relationship entities not in the known characters/NPCs list.
-            # We silently drop unknown entities rather than retrying, because the
-            # known-entity list may not include all historical/background NPCs that
-            # the character legitimately references in their reflection.
-            rels_in_result = result.get("relationships") or []
-            if isinstance(rels_in_result, list) and rels_in_result:
-                known_entities = _get_known_entity_names()
-                if known_entities:  # Only filter when world data is available
-                    filtered_rels: List[Dict] = []
-                    removed_names: List[str] = []
-                    for rel in rels_in_result:
-                        if not isinstance(rel, dict):
-                            continue
-                        entity = str(rel.get("entity") or "").strip()
-                        if entity and entity.lower() not in known_entities:
-                            removed_names.append(entity)
-                        else:
-                            filtered_rels.append(rel)
-                    if removed_names:
-                        if logs_enabled():
-                            print(f"[trace] reflection: filtered unknown relationship entities for {character_name}: {removed_names}")
-                        result["relationships"] = filtered_rels
+            # The new format: just { "reflection": "free text" }.
+            # Wrap it as a clean dict for saving.
+            result = {"reflection": str(result.get("reflection") or "").strip()}
 
-            # Apply deterministic limits/deduping.
-            # Relationships are upserted into relationships.json; reflection.json stores
-            # goals / beliefs / emotional_state only.
-            result = _apply_reflection_limits(
-                character_name=character_name,
-                new_result=result,
-                previous_result=current,
-            )
+            # Migrate any old-format relationships to relationships.json
+            # (backward compatibility for existing data).
+            old_rels = result.pop("relationships", None) if isinstance(result, dict) else None
+            if isinstance(old_rels, list) and old_rels:
+                _upsert_relationships(character_name, old_rels)
 
             # 9. Save reflection.json
             entry_count = count_memory_entries(character_name)
@@ -765,15 +866,22 @@ def run_reflection(
 
         except Exception as e:
             if logs_enabled():
-                safe_name = character_name.encode('ascii', errors='replace').decode('ascii')
-                print(f"[trace] reflection attempt {attempt} failed for {safe_name}: {e}")
+                safe_name_c = _safe_name_for_logging(character_name)
+                print(f"[trace] reflection attempt {attempt} failed for {safe_name_c}: {e}")
             if attempt >= max_attempts:
-                if logs_enabled():
-                    safe_name = character_name.encode('ascii', errors='replace').decode('ascii')
-                    print(f"[trace] reflection failed for {safe_name} after {max_attempts} attempts")
-                return None
+                safe_name_c = _safe_name_for_logging(character_name)
+                print(
+                    f"[FATAL] reflection failed for {safe_name_c} after {max_attempts} attempts. "
+                    f"Last error: {e}"
+                )
+                raise SystemExit(1)
 
-    return None
+    safe_name_c = _safe_name_for_logging(character_name)
+    print(
+        f"[FATAL] reflection failed for {safe_name_c} after {max_attempts} attempts "
+        f"(loop exhausted without exception)."
+    )
+    raise SystemExit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -869,16 +977,16 @@ def _roll_diary_arc_if_needed(character_name: str, diary: Dict[str, Any]) -> Non
             arc_text = combined
     except Exception as e:
         if logs_enabled():
-            safe_name = character_name.encode('ascii', errors='replace').decode('ascii')
-            print(f"[trace] diary arc summarization failed for {safe_name}: {e}")
+            safe_name_c = _safe_name_for_logging(character_name)
+            print(f"[trace] diary arc summarization failed for {safe_name_c}: {e}")
         arc_text = combined
 
     diary.setdefault("arc_summaries", []).append({"summary": arc_text})
     diary["paragraphs"] = []
 
     if logs_enabled():
-        safe_name = character_name.encode('ascii', errors='replace').decode('ascii')
-        print(f"[trace] diary arc rolled for {safe_name} ({len(paras)} paragraphs → arc)")
+        safe_name_c = _safe_name_for_logging(character_name)
+        print(f"[trace] diary arc rolled for {safe_name_c} ({len(paras)} paragraphs → arc)")
 
 
 @tool
@@ -1015,8 +1123,23 @@ def _run_diary_summary(*, character_name: str, messages_path: Path) -> None:
 
             tc = tool_calls[0]
             args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})
+            if isinstance(args, str) and args.strip():
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    if logs_enabled():
+                        print(f"[trace] diary {character_name}: failed to parse args string, retrying")
+                    messages.append(HumanMessage(
+                        content="ERROR: write_diary_entry arguments malformed. Provide valid JSON."
+                    ))
+                    continue
             if not isinstance(args, dict):
-                args = {}
+                if logs_enabled():
+                    print(f"[trace] diary {character_name}: non-dict args, retrying")
+                messages.append(HumanMessage(
+                    content="ERROR: write_diary_entry arguments malformed. Provide valid JSON."
+                ))
+                continue
 
             result_str = write_diary_entry.invoke(args, config={"callbacks": callbacks})
             result = json.loads(result_str)
@@ -1052,10 +1175,10 @@ def _run_diary_summary(*, character_name: str, messages_path: Path) -> None:
 
         except Exception as e:
             if logs_enabled():
-                safe_name = character_name.encode('ascii', errors='replace').decode('ascii')
-                print(f"[trace] diary attempt {attempt} failed for {safe_name}: {e}")
+                safe_name_c = _safe_name_for_logging(character_name)
+                print(f"[trace] diary attempt {attempt} failed for {safe_name_c}: {e}")
             if attempt >= max_attempts:
                 if logs_enabled():
-                    safe_name = character_name.encode('ascii', errors='replace').decode('ascii')
-                    print(f"[trace] diary failed for {safe_name} after {max_attempts} attempts")
+                    safe_name_c = _safe_name_for_logging(character_name)
+                    print(f"[trace] diary failed for {safe_name_c} after {max_attempts} attempts")
                 return

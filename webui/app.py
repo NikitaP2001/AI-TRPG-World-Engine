@@ -1503,6 +1503,28 @@ def cmd_checkin_turn(
         drop_after=True,
     )
     if ok:
+        # After restoring a snapshot, reset all character "acted" flags so
+        # the system waits for fresh player intents instead of immediately
+        # finalizing the turn with the old last_decision.
+        try:
+            import json as _json
+            scene_path = Path(REPO_ROOT) / "game" / "scene.json"
+            if scene_path.exists():
+                scene_data = _json.loads(scene_path.read_text(encoding="utf-8"))
+                chars = scene_data.get("characters") or {}
+                changed = False
+                for name, entry in chars.items():
+                    if isinstance(entry, dict) and entry.get("acted") is True:
+                        entry["acted"] = False
+                        entry["last_decision"] = ""
+                        entry["last_thoughts"] = ""
+                        entry["output_source"] = ""
+                        changed = True
+                if changed:
+                    scene_data["characters"] = chars
+                    scene_path.write_text(_json.dumps(scene_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
         _reload_world_state_reader()
     return _render_composer(
         request=request,

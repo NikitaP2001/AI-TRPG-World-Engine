@@ -475,6 +475,9 @@ def ensure_scene_schema_v2(*, scene_json: Path) -> None:
             if "last_thoughts" not in e:
                 e["last_thoughts"] = ""
                 changed = True
+            if "corrections_exhausted" not in e:
+                e["corrections_exhausted"] = False
+                changed = True
             chars[name] = e
         scene["characters"] = chars
 

@@ -591,9 +591,11 @@ class StorageAssistantFactory:
             _ensure_local_sa_runtime(base_url=self._base_url, api_key=self._api_key)
         else:
             self._model = (
-                os.getenv("OPENROUTER_MODEL_SA")
+                os.getenv("DEEPSEEK_MODEL_SA")
+                or os.getenv("OPENROUTER_MODEL_SA")
+                or os.getenv("DEEPSEEK_STORAGE_ASSISTANT_MODEL")
                 or os.getenv("OPENROUTER_STORAGE_ASSISTANT_MODEL")
-                or "qwen/qwen3-32b:nitro"
+                or "deepseek-v4-flash"
             )
             self._base_url = None
             self._api_key = None
@@ -639,7 +641,7 @@ class StorageAssistantFactory:
             model=self._model,
             base_url=self._base_url,
             api_key=self._api_key,
-            include_openrouter_headers=(False if self._sa_use_local else None),
+            include_headers=(False if self._sa_use_local else None),
             streaming=True,
             max_tokens=max_tokens,
             title_suffix=f"-storage-assistant-{max_tokens}t",

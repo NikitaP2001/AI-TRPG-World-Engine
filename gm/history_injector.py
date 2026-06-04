@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any, Callable, Dict, List
+from world import World
 
 from memory_store import load_history, trim_history
 from world.delta import build_gm_world_meta_content
@@ -114,8 +115,25 @@ class HistoryInjector:
             self.inject_if_absent(marker=marker, content=json.dumps(npc, ensure_ascii=False, indent=2))
         except Exception:
             return
+        
+    def _location_common_top_level(self, world: World, locations):
+        unique_parents = set()
+        for x in locations:
+            arc_loc = str(x)
+            visited = set()
+            while loc_json := world.get_location(arc_loc):
+                if arc_loc in visited:
+                    break
+                visited.add(arc_loc)
+                if parent := loc_json.get("parent_location"):
+                    arc_loc = parent
+                else:
+                    break
+            unique_parents.add(arc_loc)
+            
+        return unique_parents 
 
-    def ensure_story_summaries(self, *, world: Any) -> None:
+    def ensure_story_summaries(self, *, world: World) -> None:
         """Recover paragraph/arc summary deltas if they were trimmed out of GM history."""
         try:
             arcs = world.get_story()
@@ -145,7 +163,9 @@ class HistoryInjector:
                 characters = para.get("characters") if isinstance(para.get("characters"), list) else []
                 npcs = para.get("npcs") if isinstance(para.get("npcs"), list) else []
 
-                loc_str = ", ".join(str(x) for x in locations) if locations else "unknown"
+                # for those who have parents, find common top most parent to keet list minimalistic
+                loc_common = self._location_common_top_level(locations) 
+                loc_str = ", ".join(str(x) for x in loc_common) if locations else "unknown"
                 char_str = ", ".join(str(x) for x in characters) if characters else "unknown"
                 npc_str = ", ".join(str(x) for x in npcs) if npcs else "none"
 
