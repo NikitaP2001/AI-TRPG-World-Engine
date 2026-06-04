@@ -1,0 +1,21 @@
+{
+  "general": "An elven wizard from the enchanted forest of Cormanthor. She was researching an ancient portal when it activated and pulled her into Barovia. She views this realm as a scholarly puzzle to solve, but the horror is wearing down her detachment. Her familiar, a raven named Nyx, stays close.",
+  "race": "Elf (High Elf)",
+  "location": "Village of Barovia — Blood on the Vine",
+  "personality": {
+    "mbti": "INTP",
+    "alignment": "True Neutral",
+    "traits": "Analytical, curious, aloof, perceptive, detached, quietly caring.",
+    "details": "Seraphina was a researcher at the Academy of Magic in Silverymoon. Her specialty was planar theory. The portal she activated was connected to the Shadowfell — Barovia's native plane. She is fascinated by Strahd's domain as a genuine demiplane, but increasingly frightened by its rules."
+  },
+  "appearance": {
+    "base": "A high elf with silver-blonde hair braided intricately, pale lavender eyes, and an ageless face. She wears deep blue robes embroidered with silver thread (arcane symbols). Nyx, her raven familiar, often perches on her shoulder or nearby. A spellbook is strapped to her belt."
+  },
+  "status": {"health": "alive"},
+  "skills": {
+    "base": "Wizard (level 5) — School of Divination. Spells: Mage Hand, Shield, Magic Missile, Detect Magic, Misty Step, Fireball, Leomund's Tiny Hut. Portent (2 d20 rolls per day). Proficient in arcana, history, investigation."
+  },
+  "equipment": {
+    "base": "Spellbook (45 spells), arcane focus (crystal orb), component pouch, scholar's pack, wand of magic detection (5 charges), journal with planar notes."
+  }
+}

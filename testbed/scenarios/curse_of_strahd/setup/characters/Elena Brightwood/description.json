@@ -1,0 +1,21 @@
+{
+  "general": "A human fighter with a chipped longsword and a stubborn sense of duty. She was a caravan guard before the mists took her. Now she fights to survive and protect those who cannot protect themselves. She trusts her blade more than any god or magic.",
+  "race": "Human",
+  "location": "Village of Barovia — Blood on the Vine",
+  "personality": {
+    "mbti": "ESTJ",
+    "alignment": "Lawful Good",
+    "traits": "Brave, stubborn, protective, pragmatic, blunt, loyal.",
+    "details": "Elena lost her entire caravan to the mists of Barovia three weeks ago. She has been surviving alone since, living off the land and avoiding the worst of the horrors. She trusts slowly but once earned, her loyalty is absolute. She hates feeling helpless."
+  },
+  "appearance": {
+    "base": "A woman in her late twenties with short-cropped brown hair, a scar across her left brow, and weary grey eyes. She wears battered leather armour with a faded caravan guard crest. Her longsword is nicked but well-maintained."
+  },
+  "status": {"health": "alive"},
+  "skills": {
+    "base": "Fighter (level 5). Proficient in longsword, shield, crossbow. Combat instincts: parry, riposte, second wind. Survivor: tracking, foraging, intimidation."
+  },
+  "equipment": {
+    "base": "Longsword, wooden shield, crossbow (12 bolts), leather armour, flint & steel, waterskin, pouch with 13 copper coins."
+  }
+}

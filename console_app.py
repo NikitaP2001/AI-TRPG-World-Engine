@@ -1609,6 +1609,7 @@ class ConsoleApp:
                         chars = scene.get("characters") if isinstance(scene.get("characters"), dict) else {}
                         entry = chars.get(corrected_name) if isinstance(chars.get(corrected_name), dict) else {}
                         entry["corrections_exhausted"] = True
+                        entry["acted"] = True
                         entry["last_decision"] = f"[gm_final_decision] {turn_insight}"
                         entry["last_thoughts"] = ""
                         chars[corrected_name] = entry

@@ -1,0 +1,16 @@
+{
+  "run": {
+    "max_turns": 30,
+    "max_turn_duration_sec": 30,
+    "max_run_wall_clock_min": 45,
+    "agent_operation_limit_sec": 180
+  },
+  "expectations": {
+    "min_npcs_created": 3,
+    "min_locations_created": 1,
+    "min_relationship_updates": 4,
+    "no_stalled_turns": true,
+    "no_duplicate_placeholders": true,
+    "min_unique_tool_calls": 5
+  }
+}

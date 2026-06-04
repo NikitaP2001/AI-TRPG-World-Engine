@@ -1,0 +1,21 @@
+{
+  "general": "A half-elf cleric of the Morninglord, carrying a sunburst holy symbol and a heavy conscience. He fled his temple after a vision of death and found himself in Barovia. He believes the Morninglord sent him here to bring light to this dark place, but his faith is fraying.",
+  "race": "Half-Elf",
+  "location": "Village of Barovia — Blood on the Vine",
+  "personality": {
+    "mbti": "INFJ",
+    "alignment": "Neutral Good",
+    "traits": "Compassionate, introspective, conflicted, devout, gentle, prone to melancholy.",
+    "details": "Marek was a respected acolyte in the temple of the Morninglord in Daggerford. Three nights ago, he had a waking vision: a land of mist, a castle of shadows, and a voice whispering 'come'. He left that night and walked into the mists. Now he wonders if his god led him here to die."
+  },
+  "appearance": {
+    "base": "A lean half-elf in his early thirties with pale skin, tired amber eyes, and shoulder-length dark hair tied back. He wears tattered priestly robes over chainmail. A sunburst amulet rests on his chest. His hands are steady but his eyes betray exhaustion."
+  },
+  "status": {"health": "alive"},
+  "skills": {
+    "base": "Cleric (level 5) — Domain of Light. Spells: Cure Wounds, Guiding Bolt, Bless, Spiritual Weapon, Turn Undead. Proficient in mace, scale mail, religion, medicine."
+  },
+  "equipment": {
+    "base": "Mace, chainmail, shield, holy symbol (sunburst of the Morninglord), priest's pack, healer's kit, journal with half-filled pages."
+  }
+}

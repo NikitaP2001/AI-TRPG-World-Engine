@@ -1,0 +1,21 @@
+{
+  "general": "A halfling rogue with quick hands and a quicker mouth. He was a burglar in Waterdeep before he picked the wrong pocket — a noble with connections to a wizard who cursed him into the mists. He treats everything as a game, because if he stops laughing he'll start screaming.",
+  "race": "Halfling",
+  "location": "Village of Barovia — Blood on the Vine",
+  "personality": {
+    "mbti": "ESFP",
+    "alignment": "Chaotic Neutral",
+    "traits": "Witty, opportunistic, charming, selfish in small ways, surprisingly brave in crises.",
+    "details": "Tiko has been in Barovia for two months — longer than anyone else in the party. He knows the village, the routes, which locals can be trusted and which are spies for Strahd. He hides his fear behind jokes and bravado. He has a map of the valley, incomplete but better than nothing."
+  },
+  "appearance": {
+    "base": "A lightfoot halfling with chestnut curls, a impish grin, and quick brown eyes. He wears a dark leather vest over a stained white shirt, trousers tucked into knee-high boots, and a hooded cloak that's too big for him. A silver locket (stolen) hangs around his neck."
+  },
+  "status": {"health": "alive"},
+  "skills": {
+    "base": "Rogue (level 5) — Thief archetype. Proficient in stealth, sleight of hand, lockpicking, perception, persuasion. Sneak attack (3d6). Cunning action: dash, disengage, hide."
+  },
+  "equipment": {
+    "base": "Two shortswords, dagger (hidden in boot), shortbow (20 arrows), thieves' tools, hooded lantern, grappling hook, pouch with 7 silver and various trinkets."
+  }
+}
