@@ -1,10 +1,11 @@
-"""Storage Assistant agent: ReAct loop with tools for world/scene management.
+"""Storage Assistant agent: On-demand bookkeeper ReAct loop.
 
 This is one of two main LLM agents in the system:
 
 1. Storage Assistant (this file):
-    - ReAct agent with tools (run_scene + storage maintenance)
-   - Manages simulation state and scene flow
+    - On-demand bookkeeper ReAct agent with storage maintenance tools
+    - Called only at specific trigger points (after summaries, new entities, world planning)
+    - Does NOT manage scenes or drive game flow
     - Persistent history in game/storage_assistant_messages.json
     - Context: atomic marker-based deltas in persistent history
     - Prompt: agents/storage_assistant/prompt.txt
@@ -514,6 +515,15 @@ def _custom_react_loop(input_dict: Dict[str, Any]) -> Dict[str, Any]:
                 print(f"[trace] custom_react_loop: Context changed, stopping")
             return {"messages": messages}
         
+        # Check if bookkeeping_done was called — immediate termination.
+        if any(
+            tool_call.get("name", "") == "bookkeeping_done"
+            for tool_call in tool_calls
+        ):
+            if logs_enabled():
+                print(f"[trace] custom_react_loop: bookkeeping_done called, stopping")
+            break
+        
         # Detect read-only tool loops: if several consecutive iterations called
         # only read-only tools, the SA has no useful work and is aimlessly looping.
         all_readonly = all(
@@ -624,7 +634,7 @@ class StorageAssistantFactory:
                 continue
 
         max_tokens = gm_max_tokens_default
-        if tool_names == {"gm_output_turn"}:
+        if tool_names == {"bookkeeping_done"}:
             max_tokens = gm_max_tokens_finalize
 
         # Important: use a fresh LLM instance per build so tool bindings cannot

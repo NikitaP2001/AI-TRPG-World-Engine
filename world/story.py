@@ -131,107 +131,12 @@ def append_turn_to_story(
     ongoing["characters"] = _merge_unique(ongoing.get("characters"), list(characters or []))
     ongoing["npcs"] = _merge_unique(ongoing.get("npcs"), list(npcs or []))
 
-    # Summarize when we reached 10 turns.
-    if len(turns) >= 10:
-        try:
-            if summarizer is not None:
-                summary_out = summarizer("", ongoing)
-            else:
-                # Fallback to standalone summarizer agent (legacy path).
-                from summarizer_agent import summarize_ongoing_paragraph
-                summary_out = summarize_ongoing_paragraph(world_context="", ongoing_paragraph=ongoing)
-        except Exception as e:
-            summary_out = {"name": "Summary", "summary": "(failed to summarize paragraph)"}
-        para_obj = {
-            "name": summary_out.get("name") or "Summary",
-            "start_time": str(ongoing.get("start_time") or ""),
-            "end_time": str(end_time),
-            "locations": ongoing.get("locations") or [],
-            "characters": ongoing.get("characters") or [],
-            "npcs": ongoing.get("npcs") or [],
-            "summary": summary_out.get("summary") or "",
-            "turn_count": len(turns),
-            # Keep full turns for offline debugging / tooling (not injected to the model).
-            "turns": turns,
-        }
+    # Paragraph summarization moved to gm/scheduler.py (TickScheduler).
+    # The summarizer callback parameter is kept for API compatibility but
+    # inline summarization is no longer triggered here.
+    _ = summarizer  # unused — scheduled jobs handle paragraph + arc summaries
 
-        paras = arc0.get("paragraphs")
-        if not isinstance(paras, list):
-            paras = []
-        paras.append(para_obj)
-        arc0["paragraphs"] = paras
-
-        # Arc-level checkpoint: every 10th paragraph of the ongoing arc.
-        arc_checkpoint = (len(paras) % 10 == 0)
-        if arc_checkpoint:
-            agg_locations: List[str] = []
-            agg_characters: List[str] = []
-            agg_npcs: List[str] = []
-            for p in paras:
-                if not isinstance(p, dict):
-                    continue
-                agg_locations = _merge_unique(agg_locations, list(p.get("locations") or []))
-                agg_characters = _merge_unique(agg_characters, list(p.get("characters") or []))
-                agg_npcs = _merge_unique(agg_npcs, list(p.get("npcs") or []))
-
-            finalized_arc_name = str(summary_out.get("arc_name") or "").strip() or str(arc0.get("name") or "").strip() or "Arc"
-            finalized_arc_summary = str(summary_out.get("arc_summary") or "").strip() or str(para_obj.get("summary") or "")
-
-            arc0["name"] = finalized_arc_name
-            arc0["summary"] = finalized_arc_summary
-            arc0["paragraph_count"] = len(paras)
-            if not str(arc0.get("start_time") or "").strip():
-                arc0["start_time"] = str(paras[0].get("start_time") or para_obj.get("start_time") or "")
-            arc0["end_time"] = str(para_obj.get("end_time") or "")
-            arc0["locations"] = agg_locations
-            arc0["characters"] = agg_characters
-            arc0["npcs"] = agg_npcs
-
-            # Keep finalized arc frozen (no ongoing paragraph on finalized arcs);
-            # prepend a fresh ongoing arc for new paragraphs.
-            arc0.pop("ongoing_paragraph", None)
-            arcs[0] = arc0
-            arcs.insert(
-                0,
-                {
-                    "name": "Ongoing Arc",
-                    "paragraphs": [],
-                    "ongoing_paragraph": {
-                        "start_time": str(end_time),
-                        "turns": [],
-                        "locations": [],
-                        "characters": [],
-                        "npcs": [],
-                    },
-                },
-            )
-        else:
-            # Continue same ongoing arc until paragraph-count checkpoint.
-            arc0["ongoing_paragraph"] = {
-                "start_time": str(end_time),
-                "turns": [],
-                "locations": [],
-                "characters": [],
-                "npcs": [],
-            }
-            arcs[0] = arc0
-
-        # Dedicated log for GM context summary updates.
-        try:
-            _append_jsonl(
-                (workspace / "logs" / "gm_context_summary_updates.jsonl").resolve(),
-                {
-                    "event": "gm_context_summary_updated",
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "paragraph": para_obj,
-                },
-            )
-        except Exception:
-            pass
-
-    else:
-        arc0["ongoing_paragraph"] = ongoing
-        arcs[0] = arc0
+    arcs[0] = arc0
 
     _write_json(story_json, arcs)
 
@@ -543,4 +448,130 @@ def _process_pending_summaries(
                 )
             except Exception:
                 pass
+
+# ---------------------------------------------------------------------------
+# Scheduler-callable paragraph finalization
+# ---------------------------------------------------------------------------
+
+def finalize_paragraph(
+    *,
+    story_json: Path,
+    paragraph_obj: Dict[str, Any],
+    end_time: str,
+) -> None:
+    """Write a finalized paragraph into the story and optionally trigger arc close.
+
+    Called by the TickScheduler when the paragraph_summary job fires.
+    """
+    try:
+        arcs = _read_json(story_json)
+    except Exception:
+        arcs = None
+    if not isinstance(arcs, list) or not arcs or not isinstance(arcs[0], dict):
+        return
+
+    arc0: Dict[str, Any] = arcs[0]
+    ongoing = arc0.get("ongoing_paragraph") if isinstance(arc0.get("ongoing_paragraph"), dict) else {}
+    turns = ongoing.get("turns") if isinstance(ongoing.get("turns"), list) else []
+    end_t = str(end_time or "").strip()
+
+    para = {
+        "name": str(paragraph_obj.get("name") or "Summary"),
+        "start_time": str(ongoing.get("start_time") or ""),
+        "end_time": end_t,
+        "locations": ongoing.get("locations") or [],
+        "characters": ongoing.get("characters") or [],
+        "npcs": ongoing.get("npcs") or [],
+        "summary": str(paragraph_obj.get("summary") or ""),
+        "turn_count": len(turns),
+        "turns": turns,
+    }
+
+    paras = arc0.get("paragraphs") if isinstance(arc0.get("paragraphs"), list) else []
+    paras.append(para)
+    arc0["paragraphs"] = paras
+
+    def _merge_unique(dst: Any, items: List[str]) -> List[str]:
+        out: List[str] = []
+        if isinstance(dst, list):
+            out.extend([str(x) for x in dst if str(x).strip()])
+        for it in items:
+            s = str(it).strip()
+            if s and s not in out:
+                out.append(s)
+        return out
+
+    # Arc checkpoint: every 10th paragraph
+    arc_checkpoint = (len(paras) % 10 == 0)
+    if arc_checkpoint:
+        agg_locations: List[str] = []
+        agg_characters: List[str] = []
+        agg_npcs: List[str] = []
+        for p in paras:
+            if not isinstance(p, dict):
+                continue
+            agg_locations = _merge_unique(agg_locations, list(p.get("locations") or []))
+            agg_characters = _merge_unique(agg_characters, list(p.get("characters") or []))
+            agg_npcs = _merge_unique(agg_npcs, list(p.get("npcs") or []))
+
+        finalized_arc_name = (
+            str(paragraph_obj.get("arc_name") or "").strip()
+            or str(arc0.get("name") or "").strip()
+            or "Arc"
+        )
+        finalized_arc_summary = str(paragraph_obj.get("arc_summary") or "").strip() or str(para.get("summary") or "")
+
+        arc0["name"] = finalized_arc_name
+        arc0["summary"] = finalized_arc_summary
+        arc0["paragraph_count"] = len(paras)
+        if not str(arc0.get("start_time") or "").strip():
+            arc0["start_time"] = str(paras[0].get("start_time") or para.get("start_time") or "")
+        arc0["end_time"] = str(para.get("end_time") or "")
+        arc0["locations"] = agg_locations
+        arc0["characters"] = agg_characters
+        arc0["npcs"] = agg_npcs
+
+        arc0.pop("ongoing_paragraph", None)
+        arcs[0] = arc0
+        arcs.insert(
+            0,
+            {
+                "name": "Ongoing Arc",
+                "paragraphs": [],
+                "ongoing_paragraph": {
+                    "start_time": str(end_t),
+                    "turns": [],
+                    "locations": [],
+                    "characters": [],
+                    "npcs": [],
+                },
+            },
+        )
+    else:
+        arc0["ongoing_paragraph"] = {
+            "start_time": str(end_t),
+            "turns": [],
+            "locations": [],
+            "characters": [],
+            "npcs": [],
+        }
+        arcs[0] = arc0
+
+    _write_json(story_json, arcs)
+
+    # Log
+    try:
+        _append_jsonl(
+            Path("logs") / "gm_context_summary_updates.jsonl",
+            {
+                "event": "paragraph_finalized",
+                "name": para.get("name"),
+                "turn_count": len(turns),
+                "summary_length": len(para.get("summary", "")),
+                "arc_checkpoint": arc_checkpoint,
+                "total_paragraphs": len(paras),
+            },
+        )
+    except Exception:
+        pass
 

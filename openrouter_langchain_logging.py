@@ -705,7 +705,7 @@ def _tool_label(tool_name: str, parsed_input: Any, input_str: str) -> Optional[s
             return f"{n} {ptr}"
         return n or ptr
 
-    if tool_name in {"start_scene", "run_scene"}:
+    if tool_name in {"start_scene", "bookkeeping_done"}:
         loc = _get_str("location")
         chars = data.get("character_names")
         chars_s = None

@@ -3,18 +3,19 @@
 This is one of two main LLM agents in the system:
 
 1. Storage Assistant (gm/operator.py):
-    - ReAct agent with tools (run_scene + storage maintenance)
-   - Manages simulation state and scene flow
+    - On-demand bookkeeper ReAct agent with storage maintenance tools
+    - Called at specific trigger points (after summaries, new entities, world planning)
+    - Does NOT manage scenes or drive game flow
     - Persistent history in game/storage_assistant_messages.json
     - Context: atomic marker-based deltas in persistent history
     - Prompt: agents/storage_assistant/prompt.txt
 
 2. Game Master (this file):
-   - Narrative agent for creative writing (world seed, scene descriptions, narration)
-   - Maintains roleplay identity with persistent conversation history
-   - History stored in game/game_master_messages.json
-   - Context: build_game_master_context_block() without iteration mechanics
-   - Prompt: agents/game_master/prompt.txt
+    - Narrative agent for creative writing (world seed, scene descriptions, narration)
+    - Maintains roleplay identity with persistent conversation history
+    - History stored in game/game_master_messages.json
+    - Context: build_game_master_context_block() without iteration mechanics
+    - Prompt: agents/game_master/prompt.txt
 """
 from __future__ import annotations
 

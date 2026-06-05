@@ -71,12 +71,17 @@ def _clean_text(value: Any, *, max_chars: int = 500) -> str:
 
 
 def _safe_name_for_logging(name: str) -> str:
-    """Sanitize character name for use in file names — strip only truly illegal chars,
-    preserving full Unicode (Cyrillic, CJK, etc.)."""
+    """Sanitize character name for ASCII-safe contexts (HTTP headers, filenames, logging).
+
+    Replaces non-ASCII characters with underscore so the result is safe for
+    HTTP header values (httpx enforces ASCII) and filename use.
+    """
     if not name:
         return "unknown"
-    # Windows-illegal in filenames: <>:"/\|?*
-    safe = "".join(ch for ch in name if ch not in '<>:"/\\|?*')
+    # Replace anything outside printable ASCII with underscore.
+    safe = "".join(ch if 32 <= ord(ch) < 127 else "_" for ch in name)
+    # Also strip Windows-illegal filename chars as a safety net.
+    safe = "".join(ch for ch in safe if ch not in '<>:"/\\|?*')
     return safe.strip() or "unknown"
 
 
@@ -1182,3 +1187,13 @@ def _run_diary_summary(*, character_name: str, messages_path: Path) -> None:
                     safe_name_c = _safe_name_for_logging(character_name)
                     print(f"[trace] diary failed for {safe_name_c} after {max_attempts} attempts")
                 return
+
+
+def run_diary(character_name: str) -> None:
+    """Public entry point: run diary summary for a character.
+
+    Called by the scheduler (char_diary jobs).
+    """
+    workspace_root = Path(__file__).resolve().parent.parent
+    messages_path = (workspace_root / "game" / "characters" / character_name / "messages.json").resolve()
+    _run_diary_summary(character_name=character_name, messages_path=messages_path)

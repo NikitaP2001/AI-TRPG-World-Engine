@@ -1,22 +1,23 @@
-"""Console application runner for the LLM World simulation.
+"""Game orchestrator for the LLM World simulation.
 
 This module orchestrates two separate LLM agents:
 
 1. Storage Assistant (gm/operator.py):
-    - ReAct agent with tool access (scene management, world updates)
-    - Maintains persistent conversation history in game/storage_assistant_messages.json
+    - On-demand bookkeeper ReAct agent with storage maintenance tools
+    - Called at specific trigger points (after summaries, new entities, world planning)
+    - Does NOT manage scenes or drive game flow
+    - Persistent history in game/storage_assistant_messages.json
     - Uses atomic marker-based context deltas in persistent history
-   - Prompt: agents/storage_assistant/prompt.txt
-   - Scope: "storage_assistant"
+    - Prompt: agents/storage_assistant/prompt.txt
 
 2. Game Master (gm/game_master.py):
     - Narrative-only agent for creative writing tasks (world seed, scene descriptions, turn narration)
     - Maintains persistent history in game/game_master_messages.json
     - Uses build_game_master_context_block() without iteration mechanics
-   - Prompt: agents/game_master/prompt.txt
-   - Scope: "game_master"
+    - Prompt: agents/game_master/prompt.txt
    
-The Storage Assistant runs the simulation loop, while Game Master generates narrative content.
+Scenes are auto-started by orchestration without SA involvement.
+SA is called on-demand at trigger points via bookkeeping_done().
 """
 
 from __future__ import annotations
@@ -48,9 +49,16 @@ from gm.tools import (
     reset_turn_lock,
     is_context_changed,
     signal_context_changed,
-    is_scene_request_pending,
-    clear_scene_request,
 )
+from gm.injection_models import InjectionProfile, InjectionRule, InjectionEngine
+from gm.injection_builders import (
+    build_world_meta,
+    build_character_description,
+    build_location_description,
+    build_npc_description,
+    build_story_summaries,
+)
+from gm.scheduler import TickScheduler, Job, TurnCount, ParagraphCount, MemoryEntryCount
 from character.agent import run_character_agent, set_game_master_for_characters
 from character.reflection import needs_reflection, run_reflection
 from memory_store import HistoryLimits, approx_token_count, limits_from_env, trim_history, load_history
@@ -79,38 +87,34 @@ from scene.context import (
 )
 from turn_runner import run_turn
 
-
-# ---------------------------------------------------------------------------
-# Turn recap persistence (for WebUI display of character thoughts/actions)
-# ---------------------------------------------------------------------------
-_TURN_RECAPS_FILENAME = "turn_recaps.jsonl"
-_GUI_STREAM_INPUT_LOCK = threading.Lock()
-
-
-def _append_turn_recap(game_root: Path, result: Dict[str, Any]) -> None:
-    """Append a turn recap dict as a single JSON line to turn_recaps.jsonl.
-
-    The WebUI reads this file to display per-character thoughts and actions
-    on each turn card.  We keep it separate from SA messages so we don't
-    inject orphaned ToolMessages that would confuse the SA's ReAct loop.
-    """
-    try:
-        recaps_path = game_root / _TURN_RECAPS_FILENAME
-        with open(recaps_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(result, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+# Import extracted utilities
+from console_app_utils import (
+    _TURN_RECAPS_FILENAME,
+    _GUI_STREAM_INPUT_LOCK,
+    append_turn_recap,
+    backup_slug,
+    is_invalid_gm_text_output,
+    is_tool_error_message,
+    is_transient_assistant_error_message,
+    strip_tool_error_pairs,
+    looks_like_pseudo_tool_markup,
+    extract_pseudo_tool_markup_syntax,
+    log_pseudo_tool_markup_event,
+)
 
 
-class ConsoleApp:
+
+
+
+class GameOrchestrator:
     _startup_scene_cleanup_done: bool = False
 
     def __init__(self) -> None:
         self.world = World()
         self.world.ensure_initialized()
-        if not ConsoleApp._startup_scene_cleanup_done:
+        if not GameOrchestrator._startup_scene_cleanup_done:
             self._discard_interrupted_scene_state()
-            ConsoleApp._startup_scene_cleanup_done = True
+            GameOrchestrator._startup_scene_cleanup_done = True
 
         self.limits = limits_from_env()
         self.max_turns = gm_max_turns_from_env()
@@ -191,6 +195,41 @@ class ConsoleApp:
             delta_injector=self._inject_sa_delta,
         )
 
+        # ── Injection engines (profile-based, ready for multi-agent expansion) ──
+        # Each agent type gets its own InjectionProfile and InjectionEngine.
+        # The existing HistoryInjector instances (^ above) still handle current
+        # injection logic. The engines below are additive — they can be used
+        # alongside or as a replacement in future refactors.
+        self._engines: Dict[str, InjectionEngine] = {}
+
+        # GM engine — mirrors the injections done by self._gm_injector
+        _gm_loader = lambda: trim_history(load_history(self.gm_master_history_path), limits=self.limits)
+        self._engines["gm"] = InjectionEngine(
+            profile=InjectionProfile("game_master", [
+                InjectionRule("[world_snapshot:world_meta]", build_world_meta, scope="world", priority=100),
+            ]),
+            history_loader=_gm_loader,
+            delta_injector=self._game_master.inject_delta,
+        )
+
+        # SA engine — mirrors the injections done by self._sa_injector
+        _sa_load = lambda: list(self.state.get("messages") or [])
+        self._engines["sa"] = InjectionEngine(
+            profile=InjectionProfile("storage_assistant", [
+                InjectionRule("[world_snapshot:world_meta]", build_world_meta, scope="world", priority=100),
+            ]),
+            history_loader=_sa_load,
+            delta_injector=self._inject_sa_delta,
+        )
+
+        # ── Unified job scheduler ──
+        self._scheduler = TickScheduler(
+            state_path=self.world.game_root / "world" / "scheduler_state.json",
+        )
+
+        # Register periodic jobs.
+        self._register_scheduled_jobs()
+
         # Live streaming: always write to logs/stream.txt; optionally echo to console.
         raw_stream = os.getenv("LLM_WORLD_STREAM_ECHO")
         if raw_stream is None or not raw_stream.strip():
@@ -202,6 +241,156 @@ class ConsoleApp:
 
     def _apply_stream_env(self) -> None:
         os.environ["LLM_WORLD_STREAM_ECHO"] = "1" if self.stream_echo else "0"
+
+    # ======================================================================
+    # Job scheduler
+    # ======================================================================
+
+    def _register_scheduled_jobs(self) -> None:
+        """Register all periodic jobs in the unified scheduler."""
+
+        # --- Paragraph summary (every 10 turns) ---
+        self._scheduler.register(
+            Job("paragraph_summary", self._run_paragraph_summary,
+                trigger=TurnCount(interval=10),
+                priority=50),
+
+            # --- Arc summary (every 10 paragraphs) ---
+            Job("arc_summary", self._run_arc_summary,
+                trigger=ParagraphCount(interval=10),
+                depends_on=["paragraph_summary"],
+                priority=40),
+
+            # --- SA bookkeeping (after each paragraph summary) ---
+            Job("sa_bookkeeping", self._run_sa_after_turn,
+                trigger=TurnCount(interval=10),
+                depends_on=["paragraph_summary"],
+                priority=30),
+        )
+
+        # --- Per-character reflection (every N memory entries) ---
+        try:
+            from character.reflection import get_reflection_interval
+            ref_interval = get_reflection_interval()
+            for cname in self.world.list_character_names():
+                nm = str(cname).strip()
+                if not nm:
+                    continue
+                self._scheduler.register(
+                    Job(f"char_reflection:{nm}",
+                        self._make_reflection_job(nm),
+                        trigger=MemoryEntryCount(interval=ref_interval, character=nm),
+                        priority=30),
+                    Job(f"char_diary:{nm}",
+                        self._make_diary_job(nm),
+                        trigger=MemoryEntryCount(interval=ref_interval, character=nm),
+                        depends_on=[f"char_reflection:{nm}"],
+                        priority=20),
+                    # --- Relationship review (every 10 memory entries) ---
+                    Job(f"char_review:{nm}",
+                        self._make_review_job(nm),
+                        trigger=MemoryEntryCount(interval=10, character=nm),
+                        priority=25),
+                )
+        except Exception:
+            pass
+
+    def _make_review_job(self, character_name: str):
+        """Return a callable that runs relationship review for one character."""
+        def _run():
+            try:
+                from character.relationship_review import run_relationship_review
+                run_relationship_review(
+                    character_name=character_name,
+                    world=self.world,
+                )
+            except Exception as e:
+                import logging
+                logging.exception(f"[scheduler] review failed for {character_name}: {e}")
+                raise
+        return _run
+
+    def _make_reflection_job(self, character_name: str):
+        """Return a callable that runs reflection for one character."""
+        def _run():
+            try:
+                from character.reflection import run_reflection
+                try:
+                    char_desc = self.world.get_character_description(character_name)
+                except Exception:
+                    char_desc = {}
+                run_reflection(character_name=character_name, character_description=char_desc)
+            except Exception as e:
+                import logging
+                logging.exception(f"[scheduler] reflection failed for {character_name}: {e}")
+                raise
+        return _run
+
+    def _make_diary_job(self, character_name: str):
+        """Return a callable that runs diary for one character."""
+        def _run():
+            try:
+                from character.reflection import run_diary
+                run_diary(character_name=character_name)
+            except Exception as e:
+                import logging
+                logging.exception(f"[scheduler] diary failed for {character_name}: {e}")
+                raise
+        return _run
+
+    def _run_paragraph_summary(self) -> None:
+        """Run paragraph summary job: called by scheduler every 10 turns."""
+        import logging
+        try:
+            arc0 = self._load_story_arc0()
+            ongoing = arc0.get("ongoing_paragraph") if isinstance(arc0, dict) else None
+            if not isinstance(ongoing, dict):
+                return
+
+            turns = ongoing.get("turns")
+            if not isinstance(turns, list) or len(turns) < 10:
+                return
+
+            result = self._gm_summarizer("", ongoing)
+            if not result or not result.get("name"):
+                return
+
+            # Write paragraph to story.json
+            from world.story import finalize_paragraph
+            finalize_paragraph(
+                story_json=self.world.paths.story_json,
+                paragraph_obj=result,
+                end_time=str((turns[-1] or {}).get("end_time") or ""),
+            )
+        except Exception as e:
+            logging.exception(f"[scheduler] paragraph_summary failed: {e}")
+            raise
+
+    def _run_arc_summary(self) -> None:
+        """Run arc summary job: called by scheduler every 10 paragraphs."""
+        # Arc summary is handled inside _gm_summarizer when do_arc_summary is True.
+        # This job exists as a dependency placeholder and safety net.
+        # The actual arc logic runs during paragraph_summary if paragraphs % 10 == 0.
+        pass
+
+    def _scheduler_tick(self) -> None:
+        """Call scheduler.tick() with current game counters."""
+        try:
+            turns, paras, _ = self.story_progress_and_last_text()
+        except Exception:
+            turns, paras = 0, 0
+
+        try:
+            char_names = self.world.list_character_names()
+        except Exception:
+            char_names = []
+
+        self._scheduler.tick(
+            turn_count=turns,
+            paragraph_count=paras,
+            world=self.world,
+            character_names=char_names,
+        )
 
     def _load_active_gm_history(self) -> List[Dict[str, str]]:
         try:
@@ -224,6 +413,128 @@ class ConsoleApp:
         msgs = list(self.state.get("messages") or [])
         msgs.append(HumanMessage(content=body))
         self.state = {"messages": msgs}
+
+    # ======================================================================
+    # SA invocation helpers (on-demand bookkeeper trigger points)
+    # ======================================================================
+
+    def _invoke_sa_once(self, trigger_content: str) -> None:
+        """Invoke SA with a single trigger message, expecting bookkeeping_done.
+
+        This is the core SA invocation method for the bookkeeper model.
+        SA is called with a specific trigger message, does its work, and
+        signals completion via bookkeeping_done().
+
+        reset_turn_lock() is called first so write tools (create/update/delete)
+        are not silently blocked by a stale turn-lock from turn finalization.
+        Placeholder locations are cleaned up before invocation so the SA
+        doesn't waste tokens on auto-created duplicates.
+        """
+        reset_turn_lock()
+        self._cleanup_placeholder_locations()
+        msgs = list(self.state.get("messages") or [])
+        msgs.append(HumanMessage(content=trigger_content))
+        self.state = {"messages": msgs}
+
+        try:
+            graph = self._gm_factory.build(tools=gm_tools_for_current_context())
+            result = graph.invoke({"messages": msgs})
+            self.state = {"messages": list(result.get("messages") or [])}
+        except Exception as e:
+            if logs_enabled():
+                print(f"[trace] SA invocation error: {e}")
+            # Keep state as-is on error to avoid losing history.
+            return
+        finally:
+            self.save_gm_history()
+
+    def _run_sa_after_turn(self) -> None:
+        """Call SA for post-turn bookkeeping after paragraph/arc summary produced."""
+        try:
+            _, _, last_text = self.story_progress_and_last_text()
+            summary_info = ""
+            if last_text:
+                summary_info = f"\nLatest narration:\n{last_text}"
+        except Exception:
+            summary_info = ""
+
+        trigger = (
+            "[bookkeeping_tick]\n"
+            "Periodic bookkeeping call after a turn completed."
+            f"{summary_info}\n"
+            "Review the latest story data and perform storage maintenance as needed. "
+            "Call bookkeeping_done() when finished."
+        )
+        self._invoke_sa_once(trigger)
+
+    def _cleanup_placeholder_locations(self) -> None:
+        """Remove auto-created placeholder locations that have real entries.
+
+        Scans locations.json for entries whose details match the auto-created
+        placeholder pattern and removes them if a better (non-placeholder)
+        entry with similar name exists.
+        """
+        try:
+            locs = self.world.get_locations()
+            if not isinstance(locs, dict):
+                return
+
+            placeholder_marker = "Created automatically by orchestration"
+            to_remove: list[str] = []
+
+            for name, entry in locs.items():
+                if not isinstance(entry, dict):
+                    continue
+                details = str(entry.get("details") or "")
+                if placeholder_marker in details:
+                    to_remove.append(name)
+
+            if not to_remove:
+                return
+
+            for name in to_remove:
+                try:
+                    self.world.delete_location(name)
+                    if logs_enabled():
+                        print(f"[trace] cleaned up placeholder location: {name}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _run_sa_new_entities(self, location_names: list[str], npc_names: list[str]) -> None:
+        """Call SA to create minimal entries for newly introduced entities.
+
+        Args:
+            location_names: List of new location names that lack filled story entries.
+            npc_names: List of new NPC names that lack filled story entries.
+        """
+        parts: list[str] = ["[new_entities]"]
+        if location_names:
+            parts.append(f"New locations (need story entries): {', '.join(location_names)}")
+        if npc_names:
+            parts.append(f"New NPCs (need story entries): {', '.join(npc_names)}")
+        parts.append(
+            "These entities were introduced but do not have filled story entries yet. "
+            "Create minimal placeholder entries for them using create_location/create_npc "
+            "with whatever context is available. Call bookkeeping_done() when finished."
+        )
+        self._invoke_sa_once("\n".join(parts))
+
+    def _run_sa_world_planning(self, world_facts: str) -> None:
+        """Call SA to integrate world planning facts into storage.
+
+        Args:
+            world_facts: The world facts text produced by GM's world_planning task.
+        """
+        trigger = (
+            "[world_planning]\n"
+            "GM has established hidden world facts. Integrate them into storage.\n\n"
+            f"{world_facts}\n\n"
+            "Create or update location/NPC entries to reflect these facts. "
+            "Call bookkeeping_done() when finished."
+        )
+        self._invoke_sa_once(trigger)
 
     def _gm_history_contains(self, marker: str) -> bool:
         return self._gm_injector.history_contains(marker)
@@ -387,11 +698,6 @@ class ConsoleApp:
 
         try:
             self.world.clear_scene()
-        except Exception:
-            pass
-
-        try:
-            clear_scene_request()
         except Exception:
             pass
 
@@ -778,18 +1084,21 @@ class ConsoleApp:
         return out
 
 
-    def _maybe_run_scene_description(self) -> bool:
-        if not is_scene_request_pending():
-            return False
+    def _auto_start_next_scene(self) -> bool:
+        """Auto-start the next scene if no scene is active and game is ready.
 
-        # If a scene is already active, clear stale request and continue.
+        Returns True if a scene was started or is being prepared.
+        """
         try:
             cur_scene = self.world.get_scene()
             if isinstance(cur_scene, dict) and str(cur_scene.get("state") or "").strip() == "active":
-                clear_scene_request()
-                return False
+                return False  # Scene already active
         except Exception:
             pass
+
+        # Don't start a scene if world seed is still needed.
+        if self._needs_world_seed():
+            return False
 
         scene: Dict[str, Any] = {}
 
@@ -799,7 +1108,6 @@ class ConsoleApp:
             scene = {}
 
         if isinstance(scene, dict) and str(scene.get("state") or "").strip() == "active":
-            clear_scene_request()
             return False
 
         self._ensure_gm_bootstrap()
@@ -1137,7 +1445,6 @@ class ConsoleApp:
                 player_descriptions=descriptions,
                 time_shift=scene_time_shift,
             )
-            clear_scene_request()
             if logs_enabled():
                 print(
                     f"[trace] scene auto-started at '{selected_location}' with "
@@ -1145,12 +1452,15 @@ class ConsoleApp:
                 )
 
             # World planning: GM pre-establishes hidden facts before knowing player intents.
+            # Facts are injected into SA history as context, NOT processed immediately —
+            # invoking SA here would trigger premature writes before characters act.
+            # SA processes world facts during post-turn bookkeeping.
             try:
                 plan_ctx = build_game_master_context(self.world)
                 print("[trace] world_planning: starting...")
                 world_facts = self._game_master.run_world_planning(context_text=plan_ctx)
                 if world_facts:
-                    print("[trace] world_planning: facts received, injecting into SA")
+                    print("[trace] world_planning: facts received, injecting into SA history")
                     self._inject_sa_delta(f"[world_facts]\n{world_facts}")
                 else:
                     print("[trace] world_planning: GM returned no facts")
@@ -1288,12 +1598,16 @@ class ConsoleApp:
                     char_desc = ""
 
                 try:
+                    _scene_npcs = scene.get("npcs") if isinstance(scene.get("npcs"), list) else None
+                    _scene_players = [c for c in (scene.get("initiative_order") or []) if str(c).strip()]
                     decision_json = run_character_agent(
                         character_name=character_name,
                         character_description=char_desc,
                         current_scene_context=current_scene_context,
                         scene_location=loc_name,
                         world_time=world_time_str,
+                        scene_npcs=_scene_npcs,
+                        scene_players=_scene_players,
                         require_decision=False,
                         persist_history=False,
                     )
@@ -1695,12 +2009,16 @@ class ConsoleApp:
                     char_desc = ""
 
                 try:
+                    _scene_npcs = scene.get("npcs") if isinstance(scene.get("npcs"), list) else None
+                    _scene_players = [c for c in (scene.get("initiative_order") or []) if str(c).strip()]
                     decision_json = run_character_agent(
                         character_name=corrected_name,
                         character_description=char_desc,
                         current_scene_context=current_scene_context,
                         scene_location=loc_name,
                         world_time=world_time_str,
+                        scene_npcs=_scene_npcs,
+                        scene_players=_scene_players,
                         gm_reality_notice=turn_insight,
                         previous_intent=prev_intent,
                         require_decision=False,
@@ -1927,13 +2245,13 @@ class ConsoleApp:
             pass
 
         # Inject a structured post-turn message into SA history.
-        # From the SA's perspective it called run_scene and now receives
-        # the turn outcome so it knows exactly what to persist.
+        # The SA will be called at the next bookkeeping trigger with
+        # this context so it knows exactly what to persist.
         try:
             # Write turn recap to a dedicated file for the WebUI to read.
             # (We do NOT inject into SA messages — an orphaned ToolMessage
             # would confuse the SA's LLM and cause infinite loops.)
-            _append_turn_recap(self.world.game_root, result)
+            append_turn_recap(self.world.game_root, result)
 
             # Hidden per-turn snapshot for storyline backup/check-in UI.
             try:
@@ -1996,8 +2314,8 @@ class ConsoleApp:
                             _storage_notices.append(
                                 f"[storage_notice] Character '{_char_name}' description.json is {_sz_kb}KB"
                                 f" (limit {_TARGET_KB}KB). PRIORITY: delete stale/irrelevant fields from"
-                                f" this file before running run_scene. Use delete_character_path to remove"
-                                f" obsolete keys (old location intel, spent observations, resolved sub-plots)."
+                                " this file. Use delete_character_path to remove"
+                                " obsolete keys (old location intel, spent observations, resolved sub-plots)."
                             )
                     except Exception:
                         pass
@@ -2137,15 +2455,10 @@ class ConsoleApp:
             except Exception:
                 pass
             if _is_finalized():
-                # Before breaking, let the SA process the [turn_complete]
-                # message to persist facts from the narration.  The SA gets
-                # one invocation with full maintenance tools (no scene exists).
-                # It may then request the next scene via run_scene when ready.
-                if self._has_unprocessed_turn_complete():
-                    if logs_enabled():
-                        print("[trace] auto-advance: turn finalized but SA has unprocessed [turn_complete]; running SA once")
-                    self.invoke_once(None)
                 # One scene = one /continue click.  Always stop here.
+                # SA bookkeeping is handled below in _finalize_turn_if_ready,
+                # not here — _is_finalized() can trigger on stale progress
+                # from a previous session before the current turn completes.
                 if logs_enabled():
                     print("[trace] auto-advance: scene complete; stopping")
                 break
@@ -2171,11 +2484,9 @@ class ConsoleApp:
             if self._finalize_turn_if_ready():
                 if logs_enabled():
                     print("[trace] auto-advance: turn finalized with Game Master narration")
-                # Let the SA persist facts before breaking.
-                if self._has_unprocessed_turn_complete():
-                    if logs_enabled():
-                        print("[trace] auto-advance: running SA to process [turn_complete]")
-                    self.invoke_once(None)
+                # Run scheduler after finalization — SA bookkeeping is handled
+                # by the scheduled sa_bookkeeping job (every 10 turns).
+                self._scheduler_tick()
                 # One scene = one /continue click.  Always stop here.
                 if logs_enabled():
                     print("[trace] auto-advance: scene complete; stopping")
@@ -2395,10 +2706,8 @@ class ConsoleApp:
 
         try:
             for i in range(int(continue_turns)):
-                # Run pending reflections at the START of each turn so
-                # multi-turn /continue and paragraph auto-continue both
-                # keep checking all characters continuously.
-                self._run_pending_reflections()
+                # Run scheduler tick at the START of each turn.
+                self._scheduler_tick()
 
                 self._clear_turn_temp_dir()
                 before_time = self.world.get_world_time().to_seconds()
@@ -2468,7 +2777,7 @@ class ConsoleApp:
             name = parts[1].strip()
             try:
                 self.backup_game(name)
-                print(f"(backup saved: backups/{self._backup_slug(name)})")
+                print(f"(backup saved: backups/{backup_slug(name)})")
             except Exception as e:  # noqa: BLE001
                 print(f"Error: {e}")
             return False
@@ -2481,7 +2790,7 @@ class ConsoleApp:
             name = parts[1].strip()
             try:
                 self.restore_game(name)
-                print(f"(restored backup: backups/{self._backup_slug(name)})")
+                print(f"(restored backup: backups/{backup_slug(name)})")
 
                 # Mirror startup behavior after a restore.
                 self._load_session_state(show_history_stats=False)
@@ -2572,26 +2881,6 @@ class ConsoleApp:
         self._run_gm_interaction(user_text=user_text, debug_trace=debug_trace)
         return False
 
-    @staticmethod
-    def _backup_slug(name: str) -> str:
-        """Normalize user-provided backup names to a safe folder name."""
-
-        raw = (name or "").strip()
-        if not raw:
-            raise ValueError("Backup name is required")
-
-        out = []
-        for ch in raw:
-            if ch.isalnum() or ch in {"-", "_"}:
-                out.append(ch)
-            elif ch.isspace():
-                out.append("_")
-            # drop everything else (slashes, dots, etc.)
-        slug = "".join(out).strip("_")
-        if not slug:
-            raise ValueError("Backup name must contain letters/numbers")
-        return slug[:64]
-
     def backup_game(self, name: str) -> None:
         """Save a snapshot of the entire game/ folder under backups/<name>/game/."""
 
@@ -2600,7 +2889,7 @@ class ConsoleApp:
         if not game_root.exists():
             raise RuntimeError("game/ folder does not exist")
 
-        slug = self._backup_slug(name)
+        slug = backup_slug(name)
         backups_root = (workspace / "backups").resolve()
         dest_root = (backups_root / slug).resolve()
         dest_game = (dest_root / "game").resolve()
@@ -2630,7 +2919,7 @@ class ConsoleApp:
         """Restore game/ folder from backups/<name>/game/."""
 
         workspace = Path(__file__).resolve().parent
-        slug = self._backup_slug(name)
+        slug = backup_slug(name)
         backups_root = (workspace / "backups").resolve()
         src_root = (backups_root / slug).resolve()
         src_game = (src_root / "game").resolve()
@@ -2673,267 +2962,6 @@ class ConsoleApp:
         except Exception:
             pass
 
-    @staticmethod
-    def _looks_like_pseudo_tool_markup(text: str) -> bool:
-        t = (text or "").lower()
-        patterns = [
-            "<function_calls",
-            "</function_calls",
-            "<invoke",
-            "invoke name=",
-            "<functioninvoke",
-            "functioninvoke name=",
-            "<parameter",
-            "</parameter",
-            "parameterinvfunction_calls",
-            "invfunction_calls",
-            "<tool_call",
-            "</tool_call",
-            "<function=",
-            "</function>",
-            "<parameter=",
-            # Additional malformed variants seen in logs
-            "give_word_to",  # partial tool name in markup context
-            "<invoke name=\"give_word",
-            "<invoke name=\"start_scene",
-            "<invoke name=\"run_scene",
-            "<invoke name=\"gm_output",
-            "<invoke name=\"create_",
-            "<invoke name=\"update_",
-        ]
-        
-        # Check XML-style pseudo markup first
-        if any(p in t for p in patterns):
-            return True
-        
-        # Check for JSON-formatted pseudo tool calls
-        # Pattern: {"function": "tool_name", "parameters": {...}}
-        if '"function"' in t and '"parameters"' in t:
-            # Likely JSON tool attempt
-            import re
-            # Look for {"function": "known_tool_name"
-            tool_pattern = r'"function"\s*:\s*"(start_scene|run_scene|create_npc|update_character|create_location|update_location)'
-            if re.search(tool_pattern, t, re.IGNORECASE):
-                return True
-        
-        # Check for JSON data dumps that look like tool outputs/summaries
-        # Detect ```json blocks anywhere in text, or JSON objects with scene/tool-like fields
-        output_indicators = ['"narration"', '"turn_duration"', '"location"', '"characters"', '"state"', '"npcs"', '"acted"', '"_context_notice"']
-        count = sum(1 for ind in output_indicators if ind in t)
-        
-        # If text contains ```json anywhere, it's likely dumping JSON
-        if '```json' in t and count >= 2:
-            return True
-        
-        # If text has many scene/tool indicators, it's dumping internal state
-        if count >= 3:
-            return True
-        
-        return False
-
-    @staticmethod
-    def _is_invalid_gm_text_output(text: str) -> bool:
-        """Check if GM text output is invalid (pseudo tool markup or too verbose)."""
-        if ConsoleApp._looks_like_pseudo_tool_markup(text):
-            return True
-        
-        # Word count check — SA should communicate via tool calls, not text
-        stripped = (text or "").strip()
-        if stripped:
-            word_count = len(stripped.split())
-            if word_count > 50:
-                return True
-        
-        return False
-
-    @staticmethod
-    def _is_tool_error_message(text: str) -> bool:
-        s = str(text or "").strip().lower()
-        if not s:
-            return False
-        if s.startswith("error:"):
-            return True
-        return any(
-            p in s
-            for p in [
-                "not available in the current context",
-                "context changed during this invocation",
-                "is not a valid tool",
-                "turn already finalized",
-                "please fix your mistakes",
-                "not all characters ended",
-                "is not valid right now",
-            ]
-        )
-
-    @staticmethod
-    def _is_transient_assistant_error_message(text: str) -> bool:
-        s = str(text or "").strip().lower()
-        if not s.startswith("error:"):
-            return False
-        return any(
-            p in s
-            for p in [
-                "connection error",
-                "connect",
-                "timeout",
-                "timed out",
-                "refused",
-                "unreachable",
-                "temporarily unavailable",
-                "upstream",
-                "provider",
-                "bad gateway",
-            ]
-        )
-
-    @staticmethod
-    def _strip_tool_error_pairs(messages: List[Any]) -> List[Any]:
-        """Drop stale tool error messages and their corresponding AI tool calls."""
-
-        dropped_tool_call_ids: set[str] = set()
-        for m in messages:
-            try:
-                if getattr(m, "type", "") != "tool":
-                    continue
-                if not ConsoleApp._is_tool_error_message(getattr(m, "content", "")):
-                    continue
-                tc_id = str(getattr(m, "tool_call_id", "") or "").strip()
-                if tc_id:
-                    dropped_tool_call_ids.add(tc_id)
-            except Exception:
-                continue
-
-        if not dropped_tool_call_ids:
-            return list(messages)
-
-        cleaned: List[Any] = []
-        for m in messages:
-            try:
-                t = getattr(m, "type", "")
-
-                if t == "tool":
-                    tc_id = str(getattr(m, "tool_call_id", "") or "").strip()
-                    if tc_id in dropped_tool_call_ids:
-                        continue
-                    cleaned.append(m)
-                    continue
-
-                if t in {"ai", "assistant"}:
-                    content = str(getattr(m, "content", "") or "")
-                    tool_calls = getattr(m, "tool_calls", None)
-                    if not isinstance(tool_calls, list) or not tool_calls:
-                        ak = getattr(m, "additional_kwargs", None) or {}
-                        if isinstance(ak, dict):
-                            tc2 = ak.get("tool_calls")
-                            if isinstance(tc2, list):
-                                tool_calls = tc2
-                    if not isinstance(tool_calls, list):
-                        tool_calls = []
-
-                    if tool_calls:
-                        filtered_calls = [
-                            tc for tc in tool_calls
-                            if str((tc or {}).get("id", "") or "").strip() not in dropped_tool_call_ids
-                        ]
-                        if filtered_calls != tool_calls:
-                            if not filtered_calls and not content.strip():
-                                continue
-                            m = AIMessage(
-                                content=content,
-                                tool_calls=filtered_calls,
-                                additional_kwargs=getattr(m, "additional_kwargs", {}) or {},
-                            )
-                    cleaned.append(m)
-                    continue
-
-                cleaned.append(m)
-            except Exception:
-                cleaned.append(m)
-
-        return cleaned
-
-    @staticmethod
-    def _extract_pseudo_tool_markup_syntax(text: str) -> Tuple[str, Optional[str]]:
-        s = text or ""
-        lower = s.lower()
-
-        candidates = [
-            lower.find("<function_calls"),
-            lower.find("<functioninvoke"),
-            lower.find("<invoke"),
-        ]
-        starts = [i for i in candidates if i >= 0]
-        start = min(starts) if starts else -1
-        if start < 0:
-            return ("<function_calls> ... </function_calls>", None)
-
-        end = -1
-        # Prefer capturing a full <function_calls>...</function_calls> block when present.
-        end_fc = lower.find("</function_calls>", start)
-        if end_fc >= 0:
-            end = end_fc + len("</function_calls>")
-        else:
-            # Fallback: capture through a single invoke block.
-            end_inv = lower.find("</invoke>", start)
-            if end_inv >= 0:
-                end = end_inv + len("</invoke>")
-
-        if end < 0:
-            end = min(len(s), start + 1600)
-
-        snippet = s[start:end].strip()
-
-        tool_name: Optional[str] = None
-        m = re.search(r"(?:<invoke|<functioninvoke)\s+name=[\"']([^\"']+)[\"']", snippet, flags=re.IGNORECASE)
-        if m:
-            tool_name = str(m.group(1) or "").strip() or None
-
-        def _shorten(v: str) -> str:
-            return (v or "").strip()
-
-        # Keep structure but avoid dumping huge parameter bodies into the retry message.
-        snippet = re.sub(
-            r"(<parameter[^>]*>)([\s\S]*?)(</parameter>)",
-            lambda mm: mm.group(1) + _shorten(mm.group(2)) + mm.group(3),
-            snippet,
-            flags=re.IGNORECASE,
-        )
-
-        # IMPORTANT: escape '<' and '>' so the retry message doesn't itself contain
-        # pseudo tool markup patterns that models might copy/paste.
-        snippet = snippet.replace("<", "&lt;").replace(">", "&gt;")
-
-        return (snippet, tool_name)
-
-    @staticmethod
-    def _log_pseudo_tool_markup_event(text: str) -> None:
-        if not logs_enabled():
-            return
-        try:
-            p = Path("logs/malformed_tool_markup.jsonl")
-            p.parent.mkdir(parents=True, exist_ok=True)
-            # Keep logs game-focused by default; raw model text is optional.
-            include_snippet = (os.getenv("LLM_WORLD_LOG_PSEUDO_TOOL_SNIPPETS") or "").strip().lower() in {
-                "1",
-                "true",
-                "yes",
-                "y",
-                "on",
-            }
-            _snippet, tool_name = ConsoleApp._extract_pseudo_tool_markup_syntax(text or "")
-            record = {
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "event": "pseudo_tool_markup_detected",
-                **({"tool": tool_name} if tool_name else {}),
-                **({"snippet": (text or "")} if include_snippet else {}),
-            }
-            with p.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-                f.flush()
-        except Exception:
-            pass
-
     def load_gm_history(self) -> None:
         msgs = []
         if self.storage_assistant_history_path.exists():
@@ -2957,14 +2985,14 @@ class ConsoleApp:
                 if getattr(m, "type", "") in {"ai", "assistant"}:
                     c = str(getattr(m, "content", "") or "")
                     tcs = getattr(m, "tool_calls", None) or []
-                    if not tcs and self._is_transient_assistant_error_message(c):
+                    if not tcs and is_transient_assistant_error_message(c):
                         continue
                 filtered.append(m)
             except Exception:
                 filtered.append(m)
 
             # Remove stale retry/error tool chatter so SA keeps meaningful action history.
-            filtered = self._strip_tool_error_pairs(filtered)
+            filtered = strip_tool_error_pairs(filtered)
 
         # If persisted history is clearly off-topic/corrupted (e.g., spammy assistant text
         # with repeated tool errors and no user input), auto-clear it. The game state lives
@@ -3044,7 +3072,7 @@ class ConsoleApp:
                         tcs = getattr(m, "tool_calls", None) or []
                         if not c and not tcs:
                             continue
-                        if not tcs and self._is_transient_assistant_error_message(c):
+                        if not tcs and is_transient_assistant_error_message(c):
                             continue
 
                     cleaned.append(m)
@@ -3052,7 +3080,7 @@ class ConsoleApp:
                     cleaned.append(m)
 
             # Drop stale tool errors and orphaned failed tool-calls before persistence.
-            cleaned = self._strip_tool_error_pairs(cleaned)
+            cleaned = strip_tool_error_pairs(cleaned)
 
             # Persist a trimmed history, and also trim in-memory state so the next
             # invocation cannot exceed model context due to unbounded growth.
@@ -3556,3 +3584,7 @@ class ConsoleApp:
                 break
 
         return 0
+
+
+# Backward-compatible alias for code that imports ConsoleApp
+ConsoleApp = GameOrchestrator

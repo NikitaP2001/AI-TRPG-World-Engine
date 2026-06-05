@@ -221,6 +221,8 @@ def run_character_agent(
     current_scene_context: str,
     scene_location: str,
     world_time: str,
+    scene_npcs: Optional[List[str]] = None,
+    scene_players: Optional[List[str]] = None,
     gm_reality_notice: str = "",
     previous_intent: str = "",
     require_decision: bool = False,
@@ -270,12 +272,10 @@ def run_character_agent(
         names = {"character_decision"}
         if can_ask_gm_once:
             names.add("ask_game_master")
-        names.update({"relationship_update", "relationship_read"})
         return names
 
     def _build_bound_llm(*, allow_gm_question: bool):
-        from .reflection import relationship_update as _rel_up, relationship_read as _rel_read
-        allowed_tools = [character_decision, _rel_up, _rel_read]
+        allowed_tools = [character_decision]
         if allow_gm_question:
             allowed_tools.insert(0, ask_game_master)
 
@@ -347,11 +347,15 @@ def run_character_agent(
     except Exception:
         pass
 
-    # Load known relationships (lightweight name-attitude list for injection).
-    known_rels: List[Dict[str, str]] = []
+    # Check for stale relationships in current scene (lightweight injection).
+    stale_rels_note: Optional[str] = None
     try:
-        from .reflection import _get_known_relationships
-        known_rels = _get_known_relationships(character_name)
+        from .relationship_review import check_stale_relationships
+        stale_rels_note = check_stale_relationships(
+            character_name,
+            current_scene_npcs=scene_npcs,
+            current_scene_players=scene_players,
+        )
     except Exception:
         pass
 
@@ -373,9 +377,8 @@ def run_character_agent(
     if reflection_data:
         _memory_parts.append("## Self Reflection")
         _memory_parts.append(json.dumps(reflection_data, ensure_ascii=False, indent=2))
-    if known_rels:
-        _memory_parts.append("## Known Relationships")
-        _memory_parts.append(json.dumps(known_rels, ensure_ascii=False, indent=2))
+    if stale_rels_note:
+        _memory_parts.append(stale_rels_note)
     if diary_text:
         _memory_parts.append("## Your Diary")
         _memory_parts.append(diary_text)
@@ -446,16 +449,14 @@ def run_character_agent(
     _anchor_lines = ["Review your context before acting:  ## Your Character (your identity and traits)"]
     if reflection_data:
         _anchor_lines.append("  ## Self Reflection (your current goals, beliefs, emotional state)")
-    if known_rels:
-        _anchor_lines.append("  ## Known Relationships")
+    if stale_rels_note:
+        _anchor_lines.append("  ## Known Relationships in Scene")
     if diary_text:
         _anchor_lines.append("  ## Your Diary (your personal history and past experiences)")
     guidance_msg = HumanMessage(content=(
         "\n".join(_anchor_lines) + "\n\n"
-        "You must respond using following tools: character_decision | ask_game_master | relationship_update | relationship_read.\n"
+        "You must respond using following tools: character_decision | ask_game_master.\n"
         "In case you need information: call ask_game_master (see prompt section)\n"
-        "To record impressions about someone: call relationship_update\n"
-        "To recall past observations: call relationship_read\n"
         "To commit your intent: call character_decision (see prompt section)\n"
     ))
     

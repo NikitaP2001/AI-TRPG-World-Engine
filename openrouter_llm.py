@@ -77,6 +77,8 @@ def build_openrouter_chat_llm(
                 if not s.startswith("-"):
                     s = "-" + s
                 title = title + s
+        # httpx.Headers enforces ASCII — replace any non-ASCII chars
+        title = "".join(ch if 32 <= ord(ch) < 127 else "_" for ch in title)
         default_headers = {
             "X-Title": title,
         }

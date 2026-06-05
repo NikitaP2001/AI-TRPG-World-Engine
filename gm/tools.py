@@ -20,8 +20,6 @@ __all__ = [
     "is_context_changed",
     "is_turn_locked",
     "signal_context_changed",
-    "is_scene_request_pending",
-    "clear_scene_request",
     # Tool callables
     "create_location",
     "get_location",
@@ -38,7 +36,7 @@ __all__ = [
     "update_character",
     "add_character",
     "delete_character_path",
-    "run_scene",
+    "bookkeeping_done",
 ]
 
 
@@ -54,8 +52,6 @@ _TURN_LOCKED: bool = False
 # This signals invoke_once to end the current invocation so a fresh one can start
 # with the correct tool bindings.
 _CONTEXT_CHANGED: bool = False
-_SCENE_REQUESTED: bool = False
-
 
 def _override_state_path() -> str:
     try:
@@ -118,7 +114,7 @@ def gm_allowed_tools() -> List[str]:
     """Return the full SA tool list without scene-state gating."""
 
     return sorted([
-        "run_scene",
+        "bookkeeping_done",
         "get_location",
         "get_npc",
         "get_character_detail",
@@ -176,15 +172,6 @@ def _signal_context_changed() -> None:
 
 # Public alias for external use (e.g., auto character execution)
 signal_context_changed = _signal_context_changed
-
-
-def is_scene_request_pending() -> bool:
-    return bool(_SCENE_REQUESTED)
-
-
-def clear_scene_request() -> None:
-    global _SCENE_REQUESTED
-    _SCENE_REQUESTED = False
 
 
 def _require_turn_unlocked() -> None:
@@ -325,7 +312,7 @@ def update_location(name: str, json_pointer: str, value_json: str) -> str:
 
 @tool
 def delete_location_path(name: str, json_pointer: str) -> str:
-    """Delete a field from a location record using JSON Pointer."""
+    """Delete single field from a location record using JSON Pointer."""
 
     err = _guard_tool("delete_location_path", require_unlocked=True)
     if err:
@@ -374,7 +361,8 @@ def delete_location(name: str) -> str:
 @tool
 def create_npc(name: str, location: str, current_state: str, description: str) -> str:
     """Create an NPC and store it in npc.json (GM-controlled).
-
+    NPC — is not only human or characters, but any being capable at least in most simple movement and decision making, save them all.  For example robot, minion, skeleton, someone's fav pet.
+    Merge NPC for optimization — for example 2 identical goblin are 1 goblins entry with amount fields = 2.
     Errors if the NPC already exists; use `update_npc` to modify an existing NPC.
     """
 
@@ -445,8 +433,6 @@ def delete_npc_path(name: str, json_pointer: str) -> str:
         return err
     _WORLD.ensure_initialized()
 
-    if ptr == "/location":
-        return _tool_error("/location is runtime-managed; it cannot be deleted via GM tools")
     ptr = str(json_pointer or "").strip()
     if not ptr:
         return _tool_error("json_pointer is required")
@@ -454,6 +440,8 @@ def delete_npc_path(name: str, json_pointer: str) -> str:
         return _tool_error("Cannot delete document root")
     if ptr == "/name":
         return _tool_error("/name cannot be deleted")
+    if ptr == "/location":
+        return _tool_error("/location is runtime-managed; it cannot be deleted via GM tools")
     if ptr == "/last_acted":
         return _tool_error("/last_acted is runtime-managed; it cannot be deleted via GM tools")
 
@@ -603,41 +591,20 @@ def delete_character_path(name: str, json_pointer: str) -> str:
 
 
 @tool
-def run_scene() -> str:
-    """Request scene progression.
+def bookkeeping_done(summary: str = "") -> str:
+    """Signal that bookkeeping is complete.
 
-    Actual scene selection/description/start is handled by Python orchestration
-    immediately after this tool call.
+    Call this when you have finished all storage maintenance for this invocation.
+    The summary is for logging purposes and is not stored as game state.
+
+    Args:
+        summary: Optional brief summary of what was done (for trace logging).
     """
-
-    try:
-        _require_turn_unlocked()
-    except Exception as e:  # noqa: BLE001
-        return _tool_error(str(e))
-    _WORLD.ensure_initialized()
-
-    try:
-        _require_tool_allowed("run_scene", extra_hint="Run scene only when there is no active scene.")
-    except Exception as e:  # noqa: BLE001
-        return _tool_error(str(e))
-
-    global _SCENE_REQUESTED
-
-    try:
-        existing = _WORLD.get_scene()
-    except Exception:
-        existing = {}
-
-    if isinstance(existing, dict) and str(existing.get("state") or "").strip() == "active":
-        return _tool_error("A scene is already active")
-
-    _SCENE_REQUESTED = True
     _signal_context_changed()
-    return "Scene requested. Orchestration will pick, describe, and start the scene immediately."
-
-
-# gm_output_turn has been removed. Turn finalization is now handled directly
-# in console_app.py by invoking the Game Master with TURN_NARRATION task.
+    s = str(summary or "").strip()
+    if s:
+        return f"Bookkeeping complete: {s}"
+    return "Bookkeeping complete."
 
 
 GM_TOOLS = [
@@ -655,7 +622,7 @@ GM_TOOLS = [
     update_character,
     add_character,
     delete_character_path,
-    run_scene,
+    bookkeeping_done,
 ]
 
 

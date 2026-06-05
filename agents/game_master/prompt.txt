@@ -134,7 +134,7 @@ Players are planning forward-looking form: they state what their aim to do and w
 
 ## Creating a scene
 To pick matching location and player for scane you:
-1. Pick single player you want to give attention in this scene.
+1. Pick single player you want to give attention in this scene. Then pick all non player sentinent beings present there - npc`s.
 2. Choose the location name player will be on since his last scene. If location was already mentioned - use the same location name.
 3. Pick other players, which and ONLY which are able to percieve this location now. Leave reast OUT of scene.
 4. Pick NPC list (decided fully by you).
