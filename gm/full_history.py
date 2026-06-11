@@ -46,38 +46,6 @@ def _extract_tool_name_and_args(tc: Dict[str, Any]) -> Dict[str, Any] | None:
     return None
 
 
-def _compact_storage_assistant_dicts(dicts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Drop SA persistence-only metadata (tool ids/types) while keeping tool name+args."""
-
-    out: List[Dict[str, Any]] = []
-    for d in dicts:
-        if not isinstance(d, dict):
-            continue
-        dd = dict(d)
-        t = str(dd.get("type") or "").strip().lower()
-
-        if t in {"ai", "assistant"}:
-            raw_calls = dd.get("tool_calls")
-            if isinstance(raw_calls, list):
-                compact_calls: List[Dict[str, Any]] = []
-                for tc in raw_calls:
-                    compact = _extract_tool_name_and_args(tc if isinstance(tc, dict) else {})
-                    if compact is not None:
-                        compact_calls.append(compact)
-                if compact_calls:
-                    dd["tool_calls"] = compact_calls
-                else:
-                    dd.pop("tool_calls", None)
-
-        elif t == "tool":
-            # Keep tool result + tool function name; drop call-linking metadata.
-            dd.pop("tool_call_id", None)
-
-        out.append(dd)
-
-    return out
-
-
 def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -248,11 +216,5 @@ def save_full_gm_messages(path: Path, messages: List[BaseMessage]) -> None:
     # Avoid double-trimming here, which can lead to surprising history drops when
     # environment/config differs between call sites.
     dicts = messages_to_dicts(messages)
-
-    # Keep Storage Assistant history compact and readable in JSON:
-    # - AI tool calls: only function name + args
-    # - Tool results: no tool_call_id metadata
-    if str(path.name).startswith("storage_assistant_messages"):
-        dicts = _compact_storage_assistant_dicts(dicts)
 
     _write_json(path, dicts)

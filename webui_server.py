@@ -118,8 +118,37 @@ def _stop_local_sa_runtime(proc: subprocess.Popen | None) -> None:
             pass
 
 
+def _check_port(host: str, port: int) -> None:
+    """Warn if port is already in use by another process."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+            # Port is open — check who owns it
+            import subprocess as _sp
+            try:
+                out = _sp.run(
+                    ["netstat", "-ano"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                for line in out.stdout.splitlines():
+                    if f":{port}" in line and "LISTENING" in line:
+                        parts = line.strip().split()
+                        pid = parts[-1] if parts else "?"
+                        print(
+                            f"WARNING: Port {port} is already in use "
+                            f"(PID {pid}). Try a different port:\n"
+                            f"  $env:LLM_WORLD_WEBUI_PORT={port + 1}; "
+                            f"python .\\webui_server.py"
+                        )
+                        return
+            except Exception:
+                print(f"WARNING: Port {port} is already in use.")
+    except Exception:
+        pass  # Port is free
+
+
 def main() -> None:
     port = int(os.environ.get("LLM_WORLD_WEBUI_PORT", "8000"))
+    _check_port("127.0.0.1", port)
     # reload=False for cleaner Ctrl+C handling on Windows
     # Use LLM_WORLD_WEBUI_RELOAD=1 env var if you need hot reload during development
     reload = os.environ.get("LLM_WORLD_WEBUI_RELOAD", "").lower() in ("1", "true", "yes")

@@ -12,6 +12,8 @@ Trigger types:
   WorldTime        — at an exact world datetime
   AfterJob         — once after another job completes
 
+Moved from gm/scheduler.py — lives here because jobs span all agents
+(GM, SA, character), not just the GM.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 # ---------------------------------------------------------------------------
 # Trigger types
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class TurnCount:

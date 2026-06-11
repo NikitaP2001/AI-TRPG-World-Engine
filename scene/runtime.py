@@ -44,6 +44,13 @@ class Scene:
         # Validate location exists.
         _ = self.world.get_location(location)
 
+        # Require a non-empty scene description.
+        desc = str(scene_description or "").strip()
+        if not desc:
+            raise ValueError(
+                "scene_description is required — cannot start a scene without describing it."
+            )
+
         existing = self.world.get_scene()
         if isinstance(existing, dict) and existing.get("state") == "active":
             # Idempotency: if the exact same scene is already active, return it.
@@ -167,6 +174,54 @@ class Scene:
         if npc_name not in npcs:
             npcs.append(npc_name)
         scene["npcs"] = npcs
+        self.world.set_scene(scene)
+        return scene
+
+    def remove_npc_from_scene(self, npc_name: str) -> Dict[str, Any]:
+        """Remove an NPC from the active scene."""
+        scene = self.require_active()
+        npc_name = str(npc_name or "").strip()
+        if not npc_name:
+            raise ValueError("npc_name is required")
+        npcs = scene.get("npcs")
+        if isinstance(npcs, list) and npc_name in npcs:
+            npcs = [n for n in npcs if n != npc_name]
+            scene["npcs"] = npcs
+            self.world.set_scene(scene)
+        return scene
+
+    def add_character_to_scene(self, character_name: str) -> Dict[str, Any]:
+        """Add a player character to the active scene."""
+        scene = self.require_active()
+        name = str(character_name or "").strip()
+        if not name:
+            raise ValueError("character_name is required")
+        chars = scene.get("characters") or {}
+        if name not in chars:
+            chars[name] = {"acted": False, "last_decision": "", "last_thoughts": ""}
+        scene["characters"] = chars
+        # Rebuild initiative order
+        order = scene.get("initiative_order") or []
+        if name not in order:
+            order.append(name)
+            scene["initiative_order"] = order
+        self.world.set_scene(scene)
+        return scene
+
+    def remove_character_from_scene(self, character_name: str) -> Dict[str, Any]:
+        """Remove a player character from the active scene."""
+        scene = self.require_active()
+        name = str(character_name or "").strip()
+        if not name:
+            raise ValueError("character_name is required")
+        chars = scene.get("characters") or {}
+        if name in chars:
+            del chars[name]
+            scene["characters"] = chars
+        order = scene.get("initiative_order") or []
+        if name in order:
+            order = [n for n in order if n != name]
+            scene["initiative_order"] = order
         self.world.set_scene(scene)
         return scene
 

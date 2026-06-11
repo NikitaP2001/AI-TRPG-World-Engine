@@ -14,26 +14,27 @@ from langchain_openai import ChatOpenAI
 from memory_store import append_message, approx_token_count, limits_from_env, load_history
 from openrouter_langchain_logging import logs_enabled, enable_direct_text_abort, disable_direct_text_abort
 from openrouter_llm import build_openrouter_chat_llm, openrouter_logging_callbacks, read_prompt_text
+from world.story import PinnedBlockCache
+from character.reflection import build_character_arc_block, build_character_paragraph_block, _character_dir
 
 from .memory import update_turn_memory
 
 
 _HISTORY_NOTICE_PRINTED: set[str] = set()
+_PINNED_CACHES: Dict[str, PinnedBlockCache] = {}
 
-# Global reference to Game Master for ask_game_master tool
-_GAME_MASTER: Optional[Any] = None
-_WORLD: Optional[Any] = None
+# Global reference to Scene Manager for ask_scene_manager tool
+_SCENE_MANAGER: Optional[Any] = None
 _CHARACTER_NAME: Optional[str] = None
 
 
-def set_game_master_for_characters(game_master: Any, world: Any) -> None:
-    """Set the Game Master reference for character Q&A.
+def set_scene_manager_for_characters(scene_manager: Any) -> None:
+    """Set the Scene Manager reference for character Q&A.
     
     Must be called before running character agents.
     """
-    global _GAME_MASTER, _WORLD
-    _GAME_MASTER = game_master
-    _WORLD = world
+    global _SCENE_MANAGER
+    _SCENE_MANAGER = scene_manager
 
 
 @dataclass
@@ -122,21 +123,23 @@ def _save_character_prompt_snapshot(
 
 
 @tool
-def ask_game_master(questions: str) -> str:
-    """Ask the Game Master questions about the scene or world.
-    
+def ask_scene_manager(questions: str) -> str:
+    """Ask the Scene Manager questions about the scene or world.
+    You may ask questions about the surrounding, world, or things which character may be interested in.
+    - You can ask from 1 up to 3 questions in one call. No more than two calls per turn.
+    - Submit complex actions or intents prohibited, only what your character already may know or find within a second.
     Use this when you need information not present in your scene description.
-    The GM will answer based on the current world state.
+    The Scene Manager will answer based on world data or escalate to the Game Master if needed.
     Args:
-        questions: Your questions for the GM (can be multiple, one per line),
+        questions: Your questions for the SM (can be multiple, one per line),
         no more than 3 questions at a time.
     Returns:
-        GM's answers to your questions
+        Answers to your questions
     """
-    global _GAME_MASTER, _WORLD, _CHARACTER_NAME
+    global _SCENE_MANAGER, _CHARACTER_NAME
     
-    if _GAME_MASTER is None or _WORLD is None:
-        return "Error: Game Master not available for questions"
+    if _SCENE_MANAGER is None:
+        return "Error: Scene Manager not available for questions"
     
     if _CHARACTER_NAME is None:
         return "Error: Character name not set"
@@ -146,44 +149,26 @@ def ask_game_master(questions: str) -> str:
         return "Error: questions cannot be empty"
     
     if logs_enabled():
-        print(f"[trace] {_CHARACTER_NAME} asking GM: {questions_text}")
-    
-    # Import here to avoid circular dependencies
-    from gm.game_master import build_game_master_qa_context
+        print(f"[trace] {_CHARACTER_NAME} asking SM: {questions_text}")
     
     try:
-        # Build payload for Game Master
-        payload = {
-            "character_name": _CHARACTER_NAME,
-            "questions": questions_text,
-        }
-        
-        # Slim scene-only context: arc/paragraph history is already in GM's
-        # persistent message history, so we only inject the current scene state.
-        ctx = build_game_master_qa_context(_WORLD)
-        
-        # Invoke Game Master with ANSWER_QUESTION task — ephemeral so this
-        # Q&A is never written to GM history (avoids context bloat from
-        # per-character questions accumulating across turns).
-        answers = _GAME_MASTER.run_task(
-            task="ANSWER_QUESTION",
-            payload=payload,
-            context_text=ctx,
-            ephemeral=True,
-        ).strip()
+        answers = _SCENE_MANAGER.resolve_character_question(
+            character_name=_CHARACTER_NAME,
+            questions=questions_text,
+        )
         
         if not answers:
-            answers = "The GM did not provide an answer."
+            answers = "No answer available right now."
         
         if logs_enabled():
-            print(f"[trace] GM answered {_CHARACTER_NAME}: {answers}")
+            print(f"[trace] SM answered {_CHARACTER_NAME}: {answers[:200]}")
         
         return answers
         
     except Exception as e:
         if logs_enabled():
-            print(f"[trace] ask_game_master error for {_CHARACTER_NAME}: {e}")
-        return f"Error: Could not get GM answer: {e}"
+            print(f"[trace] ask_scene_manager error for {_CHARACTER_NAME}: {e}")
+        return f"Error: Could not get answer: {e}"
 
 
 @tool
@@ -193,8 +178,34 @@ def character_decision(
     compromise_intent: str
 ) -> str:
     """Final output - commit to an intent.
-    
-    See prompt.txt section "### character_decision tool (REQUIRED OUTPUT)" for full details.
+This is your final output for each turn following ## Narrative structure rules. 
+You MUST call this tool to commit to an character decision for this turn.
+**Arguments:**
+- `psyche_core` (MAX 100 WORDS): JSON string capturing the primary internal vector of the subject. 
+    This is the baseline state before cognitive filtering or contextual adaptation.
+    Must include:
+    * affective_impulse: The dominant internal tension, drive, or state of inertia generated 
+        by the subject's baseline constitution in response to the current state of the environment.
+    * phantasm: The structural formula defining the subject's cognitive orientation toward external entities 
+        (e.g., as autonomous subjects, passive instruments, or operational obstacles).
+    Omit key only if the substrate is completely inert.
+        
+- `ego_rationalization` (MAX 100 WORDS): The processing and filtering interface that aligns 
+    the primary vector ('psyche_core') with the systemic constraints of the current environment. 
+    Must include:
+    * internal_talk: The internal operational calculus, tactical reasoning, or normative processing.
+    * defense_mechanism: The cognitive loop that synthesizes and maintains internal coherence 
+        in relation to the subject's own historical outputs, ensuring structural continuity.
+        
+- compromise_intent (MAX 150 WORDS): The final, objective, and compressed behavioral output. 
+    This is the pragmatic vector of action emitted into the environment, representing the exact 
+    boundary intersection between internal drive ('psyche_core') and systemic constraint ('ego_rationalization').
+**Important:**
+- if some relevant other character reaction was not described in previous turn - just wait or cover possible scenarious conditionally.
+- The amount of words you provide in arguments does not depend on time frame the intent will take
+- If text gets watery, widen the time frame; if intent gets compressed, narrow the time frame.
+- Stay within word limits or your output will be rejected.
+- Do not announce explicit intents which will be out of scope of current scene/visible surrounding
     """
 
     intent_text = str(compromise_intent or "").strip()
@@ -271,13 +282,13 @@ def run_character_agent(
     def _current_allowed_tool_names() -> set[str]:
         names = {"character_decision"}
         if can_ask_gm_once:
-            names.add("ask_game_master")
+            names.add("ask_scene_manager")
         return names
 
     def _build_bound_llm(*, allow_gm_question: bool):
         allowed_tools = [character_decision]
         if allow_gm_question:
-            allowed_tools.insert(0, ask_game_master)
+            allowed_tools.insert(0, ask_scene_manager)
 
         # Force a tool call so models don't spend the output budget on free-form prose.
         # This also makes small max_tokens caps more reliable.
@@ -451,18 +462,38 @@ def run_character_agent(
         _anchor_lines.append("  ## Self Reflection (your current goals, beliefs, emotional state)")
     if stale_rels_note:
         _anchor_lines.append("  ## Known Relationships in Scene")
+    # Build pinned summaries from diary via PinnedBlockCache (only rebuilds on trim)
+    pinned_msgs: List[SystemMessage] = []
+    if persist_history:
+        try:
+            cache = _PINNED_CACHES.get(character_name)
+            if cache is None:
+                cache = PinnedBlockCache(history_path)
+                _PINNED_CACHES[character_name] = cache
+            diary_path = _character_dir(character_name) / "diary.json"
+            if diary_path.exists():
+                block = cache.get("arc", diary_path, build_character_arc_block)
+                if block:
+                    pinned_msgs.append(SystemMessage(content=f"[arc_summaries]\n{block}"))
+                block = cache.get("paragraph", diary_path, build_character_paragraph_block)
+                if block:
+                    pinned_msgs.append(SystemMessage(content=f"[paragraph_summaries]\n{block}"))
+        except Exception:
+            pass
+
     if diary_text:
         _anchor_lines.append("  ## Your Diary (your personal history and past experiences)")
     guidance_msg = HumanMessage(content=(
         "\n".join(_anchor_lines) + "\n\n"
-        "You must respond using following tools: character_decision | ask_game_master.\n"
-        "In case you need information: call ask_game_master (see prompt section)\n"
+        "You must respond using following tools: character_decision | ask_scene_manager.\n"
+        "In case you need information: call ask_scene_manager (see prompt section)\n"
         "To commit your intent: call character_decision (see prompt section)\n"
     ))
     
     state = {
         "messages": [
             SystemMessage(content=prompt_text),  # Static only, no injections
+            *pinned_msgs,  # Pinned arc/paragraph summaries from diary cache
             *history_msgs,  # Includes identity if present
             *(
                 [HumanMessage(content=memory_block)]
@@ -687,8 +718,8 @@ def run_character_agent(
             args = {}
 
         try:
-            if tool_name == "ask_game_master":
-                # One GM Q&A allowed per turn: remove ask_game_master from the
+            if tool_name == "ask_scene_manager":
+                # One SM Q&A allowed per turn: remove ask_scene_manager from the
                 # character context immediately after first use.
                 can_ask_gm_once = False
                 bound_llm = _build_bound_llm(allow_gm_question=False)
@@ -696,7 +727,7 @@ def run_character_agent(
                 # Character asks GM a question - get answer and continue ReAct loop
                 args.setdefault("questions", "")
                 
-                tool_content = ask_game_master.invoke(args, config={"callbacks": callbacks})
+                tool_content = ask_scene_manager.invoke(args, config={"callbacks": callbacks})
                 ans = str(tool_content or "").strip()
                 if ans and not ans.lower().startswith("error:"):
                     gm_answers.append(ans)
@@ -796,12 +827,12 @@ def run_character_agent(
                 print(f"[trace] character tool execution failed ({character_name}): {tool_name}: {e}; retrying")
             # When character_decision fails (e.g. bad duration), force
             # the model to retry that exact tool instead of falling back
-            # to ask_game_master.
+            # to ask_scene_manager.
             if tool_name == "character_decision":
                 err_text = str(e or "")
                 guidance = (
                     "Fix the arguments and call character_decision again. "
-                    "Do NOT call ask_game_master — you already have the information you need."
+                    "Do NOT call ask_scene_manager — you already have the information you need."
                 )
                 retry_msg = HumanMessage(content="\n".join([
                     INTERNAL_RETRY_MARKER,

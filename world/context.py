@@ -758,3 +758,60 @@ def build_game_master_context_block(world: Any) -> str:
     _append_section(parts, "### Previous arc entities", prev_arc_entities_section)
 
     return "\n\n".join(parts) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Unified character info injection (used by GM, SM, SA, character agent)
+# ---------------------------------------------------------------------------
+
+def is_character_active_in_scene(world: Any, name: str) -> bool:
+    """Check if character is alive and present in the currently active scene."""
+    try:
+        scene = world.get_scene()
+        if not (isinstance(scene, dict) and scene.get("state") == "active"):
+            return False
+        chars = scene.get("characters")
+        if not isinstance(chars, dict):
+            return False
+        return name in chars
+    except Exception:
+        return False
+
+
+def build_character_info_block(char_dir: Path) -> Optional[str]:
+    """Build a [character_info] block from all 4 files in a character directory.
+
+    Static (description.json) + dynamic (state.json, skills.json, equipment.json).
+    Designed for PinnedBlockCache: pass char_dir as source_path.
+    """
+    parts: List[str] = []
+
+    # Static: description.json
+    desc_path = char_dir / "description.json"
+    try:
+        desc = json.loads(desc_path.read_text(encoding="utf-8"))
+        parts.append(
+            "## Description\n"
+            + json.dumps(desc, ensure_ascii=False, indent=2)
+        )
+    except Exception:
+        pass
+
+    # Dynamic: state.json, skills.json, equipment.json
+    for section, filename in [
+        ("State", "state.json"),
+        ("Skills", "skills.json"),
+        ("Equipment", "equipment.json"),
+    ]:
+        fpath = char_dir / filename
+        try:
+            data = json.loads(fpath.read_text(encoding="utf-8"))
+            if data:
+                parts.append(
+                    f"### {section}\n"
+                    + json.dumps(data, ensure_ascii=False, indent=2)
+                )
+        except Exception:
+            pass
+
+    return "\n\n".join(parts) if parts else None

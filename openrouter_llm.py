@@ -131,6 +131,7 @@ def openrouter_logging_callbacks(
     runs_log_path: str = "logs/runs.jsonl",
     tools_log_path: str = "logs/tool_calls.jsonl",
     model_outputs_log_path: str = "logs/model_outputs.jsonl",
+    stream: bool = True,
 ) -> List[OpenRouterLoggingCallback]:
     from openrouter_langchain_logging import LiveStreamCallback
 
@@ -147,12 +148,14 @@ def openrouter_logging_callbacks(
     tools_log_path = _resolve_log_path(tools_log_path)
     model_outputs_log_path = _resolve_log_path(model_outputs_log_path)
 
-    return [
+    cbs = [
         OpenRouterLoggingCallback(
             scope=scope,
             runs_log_path=runs_log_path,
             tools_log_path=tools_log_path,
             model_outputs_log_path=model_outputs_log_path,
         ),
-        LiveStreamCallback(scope=scope, label=label),
     ]
+    if stream:
+        cbs.append(LiveStreamCallback(scope=scope, label=label))
+    return cbs

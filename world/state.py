@@ -16,6 +16,7 @@ from .io import (
     _read_json,
     _write_json,
     ensure_file_under_storage_limit,
+    StorageLimitExceeded,
 )
 from .migrations import (
     ensure_character_description_fields,
@@ -25,6 +26,32 @@ from .migrations import (
     migrate_character_last_acted_to_metadata,
 )
 from .story import append_turn_to_story as _append_turn_to_story
+
+
+# ---------------------------------------------------------------------------
+# Character storage limits (static + dynamic LRU sections)
+# ---------------------------------------------------------------------------
+STATE_LIMIT_BYTES = 2 * 1024
+SKILLS_LIMIT_BYTES = 4 * 1024
+SKILLS_CORE_LIMIT_BYTES = 2 * 1024
+EQUIPMENT_LIMIT_BYTES = 2 * 1024
+EQUIPMENT_SIG_LIMIT_BYTES = 1 * 1024
+
+
+def _lru_evict(items: List[Dict[str, Any]], max_bytes: int) -> List[Dict[str, Any]]:
+    """Evict lowest-priority, oldest items until serialized size is under max_bytes."""
+    while True:
+        raw = json.dumps(items, ensure_ascii=False)
+        if len(raw.encode("utf-8")) <= max_bytes:
+            break
+        candidates = [i for i in items if i.get("priority", 1) < 3]
+        if not candidates:
+            break
+        # Sort by (priority ascending, last_used_tick ascending) → remove worst
+        candidates.sort(key=lambda x: (x.get("priority", 1), x.get("last_used_tick", 0)))
+        victim = candidates[0]
+        items = [i for i in items if i is not victim]
+    return items
 
 
 @dataclass
@@ -79,13 +106,6 @@ class World:
         self._workspace = workspace
         self._game_root = (workspace / "game").resolve()
         self._paths = WorldPaths(root=(self._game_root / "world").resolve())
-        # Optional callable(world_context, ongoing_paragraph) -> {"name": str, "summary": str}
-        self._summarizer: Optional[Any] = None
-
-    def set_summarizer(self, summarizer: Any) -> None:
-        """Set the paragraph summarizer callable (typically backed by the Game Master)."""
-        self._summarizer = summarizer
-
     @property
     def game_root(self) -> Path:
         return self._game_root
@@ -127,6 +147,16 @@ class World:
 
         # Ensure scene schema fields exist (state, acted, etc.) and migrate legacy fields.
         ensure_scene_schema_v2(scene_json=self._paths.scene_json)
+
+        # Strip non-core fields from description.json upfront (equipment, skills,
+        # status, appearance, location).  Saved to _stripped.json for storage
+        # notice fallback.  ONLY FOR FIRST INIT: capture the real values before
+        # ensure_description_fields adds empty defaults.
+        try:
+            for name in self.list_character_names():
+                self._strip_noncore_fields(name)
+        except Exception:
+            pass
 
         # Ensure characters have required fields in their description.json.
         self._ensure_character_description_fields()
@@ -299,6 +329,15 @@ class World:
     def _character_description_path(self, name: str) -> Path:
         return self._character_dir(name) / "description.json"
 
+    def _character_state_path(self, name: str) -> Path:
+        return self._character_dir(name) / "state.json"
+
+    def _character_skills_path(self, name: str) -> Path:
+        return self._character_dir(name) / "skills.json"
+
+    def _character_equipment_path(self, name: str) -> Path:
+        return self._character_dir(name) / "equipment.json"
+
     def _character_metadata_path(self, name: str) -> Path:
         return self._character_dir(name) / "metadata.json"
 
@@ -322,6 +361,17 @@ class World:
         for name in self.list_character_names():
             desc = self.get_character_description(name)
             location = (desc.get("location") or "").strip() if isinstance(desc, dict) else ""
+            # Fallback: location may have been stripped into _stripped.json
+            if not location:
+                try:
+                    stripped_path = self._character_dir(name) / "_stripped.json"
+                    if stripped_path.exists():
+                        stripped = _read_json(stripped_path)
+                        loc = stripped.get("location", "")
+                        if loc:
+                            location = str(loc).strip()
+                except Exception:
+                    pass
             try:
                 meta = self.get_character_metadata(name)
                 last_acted = str(meta.get("last_acted") or "never")
@@ -388,7 +438,6 @@ class World:
             location=location,
             characters=characters,
             npcs=npcs,
-            summarizer=self._summarizer,
         )
 
     def _ensure_location_sublocations_field(self) -> None:
@@ -789,6 +838,155 @@ class World:
             pass
 
         return data
+
+    # ------------------------------------------------------------------
+    # Character state.json (GURPS runtime: hp, fp, hunger, etc.)
+    # ------------------------------------------------------------------
+
+    def get_character_state(self, name: str) -> Dict[str, Any]:
+        """Return state.json or {} if not yet initialized."""
+        p = self._character_state_path(name)
+        try:
+            return _read_json(p) if p.exists() else {}
+        except Exception:
+            return {}
+
+    def set_character_state(self, name: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Write state.json with 2KB limit. Strips 'status' and 'appearance' from description on first creation."""
+        p = self._character_state_path(name)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        serialized = json.dumps(data, ensure_ascii=False)
+        size = len(serialized.encode("utf-8"))
+        if size > STATE_LIMIT_BYTES:
+            raise StorageLimitExceeded(
+                f"Character state exceeds 2KB limit ({size} bytes)"
+            )
+        _write_json(p, data)
+        self._strip_description_field(name, "status")
+        self._strip_description_field(name, "appearance")
+        self._strip_description_field(name, "equipment")
+        self._strip_description_field(name, "location")
+        return data
+
+    # ------------------------------------------------------------------
+    # Character skills.json (GURPS abilities: core + LRU cache)
+    # ------------------------------------------------------------------
+
+    def get_character_skills(self, name: str) -> Dict[str, Any]:
+        """Return skills.json or {} if not yet initialized."""
+        p = self._character_skills_path(name)
+        try:
+            return _read_json(p) if p.exists() else {}
+        except Exception:
+            return {}
+
+    def set_character_skills(self, name: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Write skills.json with 4KB limit (core block 2KB + cached_skills 2KB LRU).
+        Strips 'skills' from description on first creation."""
+        p = self._character_skills_path(name)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        # Build core dict: stats + narrative_tier + origin + passive_abilities + lore_interpretation_rule
+        core_block = {
+            "stats": data.get("stats", {}),
+            "narrative_tier": data.get("narrative_tier", "mortal"),
+            "origin": data.get("origin", ""),
+            "passive_abilities": data.get("passive_abilities", []),
+            "lore_interpretation_rule": data.get("lore_interpretation_rule", ""),
+        }
+        core_raw = json.dumps(core_block, ensure_ascii=False)
+        if len(core_raw.encode("utf-8")) > SKILLS_CORE_LIMIT_BYTES:
+            raise StorageLimitExceeded(
+                f"Skills core block exceeds 2KB limit ({len(core_raw.encode('utf-8'))} bytes)"
+            )
+        # LRU evict cached_skills section
+        cached = data.get("cached_skills", [])
+        cached = _lru_evict(cached, SKILLS_LIMIT_BYTES - SKILLS_CORE_LIMIT_BYTES)
+        data["cached_skills"] = cached
+        # Build full document
+        full = {**core_block, "cached_skills": cached}
+        serialized = json.dumps(full, ensure_ascii=False)
+        if len(serialized.encode("utf-8")) > SKILLS_LIMIT_BYTES:
+            raise StorageLimitExceeded(
+                f"Skills exceed 4KB limit ({len(serialized.encode('utf-8'))} bytes)"
+            )
+        _write_json(p, full)
+        self._strip_description_field(name, "skills")
+        return full
+
+    # ------------------------------------------------------------------
+    # Character equipment.json (gear, items, money)
+    # ------------------------------------------------------------------
+
+    def get_character_equipment(self, name: str) -> Dict[str, Any]:
+        """Return equipment.json or {} if not yet initialized."""
+        p = self._character_equipment_path(name)
+        try:
+            return _read_json(p) if p.exists() else {}
+        except Exception:
+            return {}
+
+    def set_character_equipment(self, name: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Write equipment.json with 2KB limit (1KB signature + 1KB LRU inventory).
+        Strips 'equipment' from description on first creation."""
+        p = self._character_equipment_path(name)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        # Enforce signature section limit
+        sig = data.get("signature", [])
+        sig_raw = json.dumps(sig, ensure_ascii=False)
+        if len(sig_raw.encode("utf-8")) > EQUIPMENT_SIG_LIMIT_BYTES:
+            raise StorageLimitExceeded(
+                f"Signature equipment exceeds 1KB limit ({len(sig_raw.encode('utf-8'))} bytes)"
+            )
+        # LRU evict inventory section
+        inv = data.get("inventory", [])
+        inv = _lru_evict(inv, EQUIPMENT_LIMIT_BYTES - EQUIPMENT_SIG_LIMIT_BYTES)
+        data["inventory"] = inv
+        # Preserve currency and lore_interpretation_rule
+        currency = data.get("currency", {})
+        lore = str(data.get("lore_interpretation_rule", "") or "").strip()
+        full = {"signature": sig, "inventory": inv, "currency": currency}
+        if lore:
+            full["lore_interpretation_rule"] = lore
+        # Enforce total limit
+        serialized = json.dumps(full, ensure_ascii=False)
+        if len(serialized.encode("utf-8")) > EQUIPMENT_LIMIT_BYTES:
+            raise StorageLimitExceeded(
+                f"Equipment exceeds 2KB limit ({len(serialized.encode('utf-8'))} bytes)"
+            )
+        _write_json(p, full)
+        self._strip_description_field(name, "equipment")
+        return full
+
+    # ------------------------------------------------------------------
+    # Strip helper: removes a field from description.json when storage is split out
+    # ------------------------------------------------------------------
+
+    def _strip_description_field(self, name: str, field: str) -> None:
+        """Remove *field* from description.json (idempotent — safe to call repeatedly).
+        Saves removed data to _stripped.json for storage notice fallback."""
+        desc_path = self._character_description_path(name)
+        if not desc_path.exists():
+            return
+        try:
+            desc = _read_json(desc_path)
+            if field in desc:
+                removed = desc.pop(field)
+                _write_json(desc_path, desc)
+                # Save to _stripped.json for fallback (skip empty values)
+                if removed:
+                    stripped_path = self._character_dir(name) / "_stripped.json"
+                    stripped = _read_json(stripped_path) if stripped_path.exists() else {}
+                    stripped[field] = removed
+                    _write_json(stripped_path, stripped)
+        except Exception:
+            pass
+
+    def _strip_noncore_fields(self, name: str) -> None:
+        """Strip all non-core fields from description.json upfront.
+        Saved to _stripped.json for storage notice fallback.
+        Idempotent — safe to call repeatedly."""
+        for field in ("equipment", "skills", "status", "appearance", "location"):
+            self._strip_description_field(name, field)
 
     def update_character_json(self, *, name: str, pointer: str, value: str) -> Dict[str, Any]:
         p = self._character_description_path(name)

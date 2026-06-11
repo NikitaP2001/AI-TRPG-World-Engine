@@ -11,7 +11,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
-from .history_injector import HistoryInjector
+from engine.history_injector import HistoryInjector
 
 
 # ---------------------------------------------------------------------------

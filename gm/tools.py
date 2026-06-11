@@ -1,21 +1,37 @@
 from __future__ import annotations
 
-import json
-import os
 from typing import Any, Dict, List, Optional
 
 from langchain_core.tools import tool
 
 from character.agent import run_character_agent
-from scene import Scene
-from world import World, WorldDuration
+from world import WorldDuration
 from openrouter_langchain_logging import logs_enabled
+
+# Shared tool infrastructure — singletons, guards, state
+from engine.tool_base import (
+    _WORLD,
+    _SCENE,
+    _TURN_LOCKED,
+    _CONTEXT_CHANGED,
+    reset_turn_lock,
+    is_context_changed,
+    is_turn_locked,
+    signal_context_changed,
+    _signal_context_changed,
+    _require_turn_unlocked,
+    _json,
+    _tool_error,
+    _guard_tool,
+    _override_state_path,
+    _override_load,
+    _override_save,
+    _override_disarm,
+    _active_scene_dict,
+)
 
 
 __all__ = [
-    "GM_TOOLS",
-    "gm_allowed_tools",
-    "gm_tools_for_current_context",
     "reset_turn_lock",
     "is_context_changed",
     "is_turn_locked",
@@ -32,155 +48,23 @@ __all__ = [
     "delete_npc_path",
     "delete_npc",
     "get_character_detail",
+    "update_character_state",
+    "update_character_skills",
+    "update_character_equipment",
     "read_character_diary",
-    "update_character",
-    "add_character",
-    "delete_character_path",
-    "bookkeeping_done",
 ]
 
 
-_WORLD = World()
-_SCENE = Scene(world=_WORLD)
-
-# Guardrail: after `gm_output_turn` finalizes a turn, we reject further
-# turn-advancing / mutating tool calls within the same ReAct invocation.
-# This prevents the GM from chaining multiple turns in one graph run.
-_TURN_LOCKED: bool = False
-
-# Set when a tool call changes the allowed tools (e.g., all characters ended).
-# This signals invoke_once to end the current invocation so a fresh one can start
-# with the correct tool bindings.
-_CONTEXT_CHANGED: bool = False
-
-def _override_state_path() -> str:
-    try:
-        # Stored under game/user_inputs so the web UI can coordinate.
-        return str((_WORLD.game_root / "user_inputs" / "override_state.json").resolve())
-    except Exception:
-        return ""
+# Tracks which characters were already read via get_character_detail in the current invocation.
+_read_characters: set = set()
 
 
-def _override_load() -> Dict[str, Any]:
-    path = _override_state_path()
-    if not path:
-        return {"armed_character": "", "pending_prompt": None, "pending_decision": None}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            return data
-    except FileNotFoundError:
-        pass
-    except Exception:
-        pass
-    return {"armed_character": "", "pending_prompt": None, "pending_decision": None}
+def reset_read_tracker() -> None:
+    global _read_characters
+    _read_characters = set()
 
 
-def _override_save(data: Dict[str, Any]) -> None:
-    path = _override_state_path()
-    if not path:
-        return
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-        os.replace(tmp, path)
-    except Exception:
-        # Never let override plumbing break the game.
-        return
 
-
-def _override_disarm() -> None:
-    data = _override_load()
-    data["armed_character"] = ""
-    data["pending_prompt"] = None
-    data["pending_decision"] = None
-    _override_save(data)
-
-
-def _active_scene_dict() -> Dict[str, Any]:
-    try:
-        _WORLD.ensure_initialized()
-        scene = _WORLD.get_scene()
-        return scene if isinstance(scene, dict) else {}
-    except Exception:
-        return {}
-
-
-def gm_allowed_tools() -> List[str]:
-    """Return the full SA tool list without scene-state gating."""
-
-    return sorted([
-        "bookkeeping_done",
-        "get_location",
-        "get_npc",
-        "get_character_detail",
-        "read_character_diary",
-        "update_location",
-        "delete_location_path",
-        "update_npc",
-        "delete_npc_path",
-        "delete_npc",
-        "update_character",
-        "delete_character_path",
-        "create_npc",
-        "create_location",
-    ])
-
-
-def _require_tool_allowed(tool_name: str, *, extra_hint: str = "") -> None:
-    allowed = set(gm_allowed_tools())
-    if tool_name not in allowed:
-        hint = (" " + extra_hint.strip()) if extra_hint.strip() else ""
-        allowed_list = ", ".join(sorted(allowed))
-        raise ValueError(
-            f"Tool '{tool_name}' is not available in the current context.{hint} "
-            f"Currently allowed tools: {allowed_list}. "
-            "Call one of these tools instead."
-        )
-
-
-def reset_turn_lock() -> None:
-    global _TURN_LOCKED, _CONTEXT_CHANGED
-    _TURN_LOCKED = False
-    _CONTEXT_CHANGED = False
-
-
-def is_context_changed() -> bool:
-    """Return True if a tool changed the allowed tools since the last reset."""
-    return _CONTEXT_CHANGED
-
-
-def is_turn_locked() -> bool:
-    """Return True if gm_output_turn was called and the turn is finalized."""
-    return _TURN_LOCKED
-
-
-def _signal_context_changed() -> None:
-    """Signal that the tool context changed.
-    
-    Sets a flag that invoke_once checks. When set, invoke_once will exit early
-    after the current graph invocation completes, allowing a fresh invocation
-    with updated tool bindings.
-    """
-    global _CONTEXT_CHANGED
-    _CONTEXT_CHANGED = True
-
-
-# Public alias for external use (e.g., auto character execution)
-signal_context_changed = _signal_context_changed
-
-
-def _require_turn_unlocked() -> None:
-    if _TURN_LOCKED:
-        raise ValueError("Turn already finalized; wait for next user message")
-
-
-def _json(obj: Any) -> str:
-    return json.dumps(obj, ensure_ascii=False, indent=2)
 
 
 def _auto_character_input(scene: Dict[str, Any], character_name: str) -> str:
@@ -216,42 +100,20 @@ def _auto_character_input(scene: Dict[str, Any], character_name: str) -> str:
     return "\n\n".join([p for p in parts if p.strip()]).strip()
 
 
-def _tool_error(message: str) -> str:
-    return f"ERROR: {str(message or '').strip()}".strip()
-
-
 def _guard_tool(
     tool_name: str,
     *,
     require_unlocked: bool = False,
     extra_hint: str = "",
 ) -> Optional[str]:
-    """Return an error string if the tool call should be rejected.
-    
-    Also checks if context has changed (e.g., a prior tool like run_scene changed
-    the allowed tool set) and RAISES an exception to immediately stop execution.
-    """
-
-    # If context has already changed, raise an exception to stop all tool execution.
-    # This prevents parallel tool calls from continuing when context changed.
-    if _CONTEXT_CHANGED:
-        raise ValueError(
-            f"Context changed during this invocation. Tool '{tool_name}' cannot run. "
-            f"Wait for the next invocation where tools will be re-bound."
-        )
-
-    try:
-        _require_tool_allowed(tool_name, extra_hint=extra_hint)
-    except Exception as e:  # noqa: BLE001
-        return _tool_error(str(e))
-
-    if require_unlocked:
-        try:
-            _require_turn_unlocked()
-        except Exception as e:  # noqa: BLE001
-            return _tool_error(str(e))
-
-    return None
+    """GM-specific guard — checks turn lock only (tools are bound by the caller)."""
+    from engine.tool_base import _guard_tool as _base_guard
+    return _base_guard(
+        tool_name,
+        allowed_tools_fn=None,
+        require_unlocked=require_unlocked,
+        extra_hint=extra_hint,
+    )
 
 
 @tool
@@ -361,8 +223,8 @@ def delete_location(name: str) -> str:
 @tool
 def create_npc(name: str, location: str, current_state: str, description: str) -> str:
     """Create an NPC and store it in npc.json (GM-controlled).
-    NPC — is not only human or characters, but any being capable at least in most simple movement and decision making, save them all.  For example robot, minion, skeleton, someone's fav pet.
-    Merge NPC for optimization — for example 2 identical goblin are 1 goblins entry with amount fields = 2.
+    NPC — any being capable of at least simple movement and decision making.
+    Merge identical NPCs into a single entry with an amount field.
     Errors if the NPC already exists; use `update_npc` to modify an existing NPC.
     """
 
@@ -474,13 +336,231 @@ def delete_npc(name: str) -> str:
 
 @tool
 def get_character_detail(name: str) -> str:
-    """Fetch a character's full description.json."""
+    """Fetch ALL character data: description + state + skills + equipment."""
 
     err = _guard_tool("get_character_detail")
     if err:
         return err
     _WORLD.ensure_initialized()
-    return _json(_WORLD.get_character_description(name))
+    nm = str(name or "").strip()
+    if not nm:
+        return _tool_error("name is required")
+    if nm in _read_characters:
+        return f"Already read — character '{nm}' details were already fetched this call."
+    _read_characters.add(nm)
+    merged = {}
+    try:
+        desc = _WORLD.get_character_description(name)
+        if desc:
+            merged["description"] = desc
+    except Exception:
+        pass
+    try:
+        state = _WORLD.get_character_state(name)
+        if state:
+            merged["state"] = state
+    except Exception:
+        pass
+    try:
+        skills = _WORLD.get_character_skills(name)
+        if skills:
+            merged["skills"] = skills
+    except Exception:
+        pass
+    try:
+        equip = _WORLD.get_character_equipment(name)
+        if equip:
+            merged["equipment"] = equip
+    except Exception:
+        pass
+    return _json(merged)
+
+
+
+
+
+@tool
+def update_character_state(name: str, json_pointer: str, value_json: str) -> str:
+    """Update character state.json.
+
+    Two modes — choose one:
+
+    A) Full replace — provide the COMPLETE state dict in one call.
+       Set json_pointer="/", value_json='{"hp":12,"max_hp":20,"fp":10,
+       "max_fp":14,"er":5,"max_er":10,"will":10,"sanity":10,
+       "max_sanity":10,"hunger":0,"thirst":0,"fatigue":0,
+       "appearance":"...","conditions":[],"injuries":[]}'
+
+    B) Single field — set json_pointer to a path like "/hp",
+       value_json="12". Other fields are preserved.
+
+    If state.json does not exist yet, use mode A (full replace) to create it.
+    """
+
+    err = _guard_tool("update_character_state", require_unlocked=True)
+    if err:
+        return err
+    _WORLD.ensure_initialized()
+    state = _WORLD.get_character_state(name)
+    ptr = str(json_pointer or "").strip()
+    if not ptr:
+        return _tool_error("Invalid json_pointer")
+    try:
+        parsed = json.loads(value_json) if isinstance(value_json, str) else value_json
+    except Exception as e:
+        return _tool_error(f"Invalid value_json: {e}")
+    if not state and ptr != "/":
+        return _tool_error(
+            f"Character '{name}' has no state.json yet. "
+            "Use mode A (json_pointer=\"/\") with a complete state dict to create it."
+        )
+    if ptr == "/":
+        if isinstance(parsed, dict):
+            state = parsed
+        else:
+            return _tool_error("Full replace mode expects a JSON object (dict)")
+    else:
+        from world.json_pointer import set_at_pointer
+        set_at_pointer(state, ptr, parsed, create_missing=False)
+    _WORLD.set_character_state(name, state)
+    # Don't strip description fields again — already done on first creation
+    p = _WORLD._character_state_path(name)
+    from world.io import _write_json
+    _write_json(p, state)
+    return _json(state)
+
+
+@tool
+def update_character_skills(name: str, skills_json: str) -> str:
+    """Update character skills.json. Structure:
+    {"stats": {...}, "narrative_tier": "...", "origin": "...",
+     "passive_abilities": [...], "lore_interpretation_rule": "...",
+     "cached_skills": [...]}
+    Send only the fields you want to change; omitted fields are preserved.
+    """
+
+    err = _guard_tool("update_character_skills", require_unlocked=True)
+    if err:
+        return err
+    _WORLD.ensure_initialized()
+    try:
+        data = json.loads(skills_json)
+    except Exception as e:
+        return _tool_error(f"Invalid JSON: {e}")
+    if not isinstance(data, dict):
+        return _tool_error("skills_json must be a JSON object")
+
+    existing = _WORLD.get_character_skills(name)
+    if not existing:
+        # No existing file — model must provide all fields at once
+        required = {"stats", "narrative_tier", "origin"}
+        missing = required - set(data.keys())
+        if missing:
+            return _tool_error(
+                f"Character '{name}' has no skills.json yet. "
+                "Send ALL fields in one call: stats, narrative_tier, origin, "
+                "passive_abilities, lore_interpretation_rule, cached_skills."
+            )
+        skills = {
+            "stats": data.get("stats", {}),
+            "narrative_tier": str(data.get("narrative_tier", "mortal") or "mortal").strip(),
+            "origin": str(data.get("origin", "") or "").strip(),
+            "passive_abilities": data.get("passive_abilities", []) if isinstance(data.get("passive_abilities"), list) else [],
+            "lore_interpretation_rule": str(data.get("lore_interpretation_rule", "") or "").strip(),
+            "cached_skills": data.get("cached_skills", []) if isinstance(data.get("cached_skills"), list) else [],
+        }
+    else:
+        # Merge: replace scalar fields, merge passives, append cached
+        skills = dict(existing)
+        if "stats" in data:
+            skills["stats"] = data["stats"]
+        if "narrative_tier" in data:
+            skills["narrative_tier"] = str(data["narrative_tier"]).strip()
+        if "origin" in data:
+            skills["origin"] = str(data["origin"]).strip()
+        if "lore_interpretation_rule" in data:
+            skills["lore_interpretation_rule"] = str(data["lore_interpretation_rule"]).strip()
+        # Merge passives: replace same-name, append new
+        new_passives = data.get("passive_abilities", [])
+        if isinstance(new_passives, list):
+            existing_passives = list(skills.get("passive_abilities", []))
+            for np in new_passives:
+                if not isinstance(np, dict):
+                    continue
+                nname = np.get("name", "")
+                found = False
+                for ep in existing_passives:
+                    if isinstance(ep, dict) and ep.get("name") == nname:
+                        ep.update(np)
+                        found = True
+                        break
+                if not found:
+                    existing_passives.append(np)
+            skills["passive_abilities"] = existing_passives
+        # Append to cached_skills
+        new_cached = data.get("cached_skills", [])
+        if isinstance(new_cached, list):
+            existing_cached = list(skills.get("cached_skills", []))
+            for nc in new_cached:
+                if not isinstance(nc, dict):
+                    continue
+                nname = nc.get("name", "")
+                found = False
+                for ec in existing_cached:
+                    if isinstance(ec, dict) and ec.get("name") == nname:
+                        ec.update(nc)
+                        found = True
+                        break
+                if not found:
+                    existing_cached.append(nc)
+            skills["cached_skills"] = existing_cached
+
+    _WORLD.set_character_skills(name, skills)
+    return _json(skills)
+
+
+@tool
+def update_character_equipment(name: str, equipment_json: str) -> str:
+    """Update character equipment.json. Structure:
+    {"signature": [...], "inventory": [...], "currency": {...},
+     "lore_interpretation_rule": "..."}
+    Send only the fields you want to change; omitted fields are preserved.
+    """
+
+    err = _guard_tool("update_character_equipment", require_unlocked=True)
+    if err:
+        return err
+    _WORLD.ensure_initialized()
+    try:
+        equip = json.loads(equipment_json)
+    except Exception as e:
+        return _tool_error(f"Invalid JSON: {e}")
+    if not isinstance(equip, dict):
+        return _tool_error("equipment_json must be a JSON object")
+    # Merge with existing (partial update support)
+    existing = _WORLD.get_character_equipment(name)
+    if existing:
+        sig = equip.get("signature", []) if isinstance(equip.get("signature"), list) else existing.get("signature", [])
+        inv = equip.get("inventory", []) if isinstance(equip.get("inventory"), list) else existing.get("inventory", [])
+        currency = equip.get("currency", {}) if isinstance(equip.get("currency"), dict) else existing.get("currency", {})
+        lore = str(equip.get("lore_interpretation_rule", "") or existing.get("lore_interpretation_rule", "") or "").strip()
+    else:
+        # No existing file — model must provide all fields at once
+        has_all = {"signature", "inventory", "currency"}.issubset(equip.keys())
+        if not has_all:
+            return _tool_error(
+                f"Character '{name}' has no equipment.json yet. "
+                "Send ALL fields in one call: signature, inventory, currency."
+            )
+        sig = equip.get("signature", []) if isinstance(equip.get("signature"), list) else []
+        inv = equip.get("inventory", []) if isinstance(equip.get("inventory"), list) else []
+        currency = equip.get("currency", {}) if isinstance(equip.get("currency"), dict) else {}
+        lore = str(equip.get("lore_interpretation_rule", "") or "").strip()
+    normalized = {"signature": sig, "inventory": inv, "currency": currency}
+    if lore:
+        normalized["lore_interpretation_rule"] = lore
+    _WORLD.set_character_equipment(name, normalized)
+    return _json(normalized)
 
 
 @tool
@@ -508,124 +588,4 @@ def read_character_diary(name: str) -> str:
     return _json({"arc_summaries": arc_summaries, "paragraphs": paragraphs})
 
 
-@tool
-def update_character(name: str, json_pointer: str, value_json: str) -> str:
-    """Upsert a JSON field in a character description using JSON Pointer (creates missing containers)."""
 
-    err = _guard_tool("update_character", require_unlocked=True)
-    if err:
-        return err
-    _WORLD.ensure_initialized()
-
-    ptr = str(json_pointer or "").strip()
-    if ptr == "/last_acted":
-        return _tool_error("/last_acted is runtime-managed; it cannot be set via GM tools")
-    if ptr == "/location":
-        return _tool_error("/location is runtime-managed; it is synced from the scene when a turn ends")
-
-    try:
-        data = _WORLD.add_character_json(name=name, pointer=json_pointer, value=value_json)
-    except Exception as e:  # noqa: BLE001
-        return _tool_error(str(e))
-    return _json(data)
-
-
-@tool
-def add_character(name: str, json_pointer: str, value_json: str) -> str:
-    """Add/create a JSON field in a character description using JSON Pointer (creates missing containers)."""
-
-    err = _guard_tool("add_character", require_unlocked=True)
-    if err:
-        return err
-    _WORLD.ensure_initialized()
-
-    ptr = str(json_pointer or "").strip()
-    if ptr == "/last_acted":
-        return _tool_error("/last_acted is runtime-managed; it cannot be set via GM tools")
-    if ptr == "/location":
-        return _tool_error("/location is runtime-managed; it is synced from the scene when a turn ends")
-
-    err = _guard_tool("add_character", require_unlocked=True)
-    if err:
-        return err
-    _WORLD.ensure_initialized()
-
-    if str(json_pointer or "").strip() == "/last_acted":
-        return _tool_error("/last_acted is runtime-managed; it cannot be set via GM tools")
-
-    try:
-        data = _WORLD.add_character_json(name=name, pointer=json_pointer, value=value_json)
-    except Exception as e:  # noqa: BLE001
-        return _tool_error(str(e))
-    return _json(data)
-
-
-@tool
-def delete_character_path(name: str, json_pointer: str) -> str:
-    """Delete a field from a character description using JSON Pointer.
-
-    Use this to remove outdated or wrong data cleanly instead of overwriting
-    with empty strings.
-    """
-
-    err = _guard_tool("delete_character_path", require_unlocked=True)
-    if err:
-        return err
-    _WORLD.ensure_initialized()
-
-    ptr = str(json_pointer or "").strip()
-    if not ptr:
-        return _tool_error("json_pointer is required")
-    if ptr == "/":
-        return _tool_error("Cannot delete document root")
-    if ptr == "/last_acted":
-        return _tool_error("/last_acted is runtime-managed; it cannot be deleted via GM tools")
-    if ptr == "/location":
-        return _tool_error("/location is runtime-managed; it cannot be deleted via GM tools")
-
-    if logs_enabled():
-        print(f"[trace] delete_character_path: {name} {ptr}")
-
-    data = _WORLD.delete_character_json(name=name, pointer=ptr)
-    return _json(data)
-
-
-@tool
-def bookkeeping_done(summary: str = "") -> str:
-    """Signal that bookkeeping is complete.
-
-    Call this when you have finished all storage maintenance for this invocation.
-    The summary is for logging purposes and is not stored as game state.
-
-    Args:
-        summary: Optional brief summary of what was done (for trace logging).
-    """
-    _signal_context_changed()
-    s = str(summary or "").strip()
-    if s:
-        return f"Bookkeeping complete: {s}"
-    return "Bookkeeping complete."
-
-
-GM_TOOLS = [
-    create_location,
-    get_location,
-    update_location,
-    delete_location_path,
-    delete_location,
-    create_npc,
-    update_npc,
-    delete_npc_path,
-    delete_npc,
-    get_character_detail,
-    read_character_diary,
-    update_character,
-    add_character,
-    delete_character_path,
-    bookkeeping_done,
-]
-
-
-def gm_tools_for_current_context() -> List[Any]:
-    """Return full SA tool bindings (no scene-state filtering)."""
-    return list(GM_TOOLS)

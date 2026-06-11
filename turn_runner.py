@@ -27,22 +27,13 @@ def run_turn(app: "GameOrchestrator", user_msg: Optional[HumanMessage]) -> None:
     app.world.ensure_initialized()
     app._clear_turn_temp_dir()
     reset_turn_lock()
-    app._ensure_sa_bootstrap()
-
-    if app._maybe_run_world_seed():
+    if not app._maybe_create_world_setting():
+        # World setting required before first turn can proceed
         return
 
-    # Hard guard: do not progress simulation while world time is still placeholder.
-    try:
-        if app.world.get_world_time().to_string() == "Y0000-01-01 00:00:00":
-            if logs_enabled():
-                print("[trace] run_turn: world time still default; waiting for valid world_seed time")
-            return
-    except Exception:
-        pass
-
-    # Auto-start next scene if needed (no SA involvement).
-    if app._auto_start_next_scene():
+    # Bootstrap next scene if none active — uses SM.determine_next_scene()
+    # which returns ALL characters at the target location.
+    if app._bootstrap_next_scene():
         return
 
     # Try to finalize a turn if all characters have acted.

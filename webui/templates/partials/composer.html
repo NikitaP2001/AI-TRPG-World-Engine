@@ -84,18 +84,20 @@
   {% else %}
     <div class="composer-actions">
       <button type="submit" :disabled="turnInProgress">Continue</button>
-      <button 
-        type="button" 
-        :disabled="turnInProgress"
-        hx-post="/cmd/continue_until_paragraph"
-        hx-include="closest form"
-        hx-target="#composer"
-        hx-swap="innerHTML"
-        hx-disabled-elt="#composer button, #composer select, #composer textarea, #composer input">
-        Continue → ¶
-      </button>
+      <label class="auto-scene-toggle" style="display:inline-flex; align-items:center; gap:6px; cursor:pointer; font-size:0.9em;">
+        <input 
+          type="checkbox" 
+          name="stop_on_next_scene"
+          {% if auto_scene_pause %}checked{% endif %}
+          hx-post="/cmd/toggle_auto_scene_pause"
+          hx-target="#composer"
+          hx-swap="innerHTML"
+          hx-disabled-elt="this"
+        />
+        Stop on next scene
+      </label>
     </div>
-    <div class="muted">If a character is selected, the turn will pause when they are prompted. "Continue → ¶" runs until paragraph complete.</div>
+    <div class="muted">If a character is selected, the turn will pause when they are prompted.</div>
   {% endif %}
 </form>
 

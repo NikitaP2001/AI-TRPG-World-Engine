@@ -300,14 +300,15 @@ class LiveStreamCallback(BaseCallbackHandler):
     Pattern detection is now handled entirely by StreamWatchdog (separate thread).
     """
 
-    def __init__(self, *, scope: str, label: Optional[str] = None, detect_invalid: bool = True) -> None:
+    def __init__(self, *, scope: str, label: Optional[str] = None, detect_invalid: bool = True, silent: bool = False) -> None:
         super().__init__()
         self.scope = str(scope or "").strip() or "unknown"
         self.label = str(label or "").strip() or None
+        self._silent = silent
         self._saw_tokens: bool = False
         self._last_token_ended_with_newline: bool = True
         self._console_newline_run: int = 0
-        self._detect_invalid = detect_invalid and (self.scope in {"gm", "storage_assistant"})
+        self._detect_invalid = detect_invalid and (self.scope in {"gm"}) and not silent
         self._accumulated_text: str = ""
         self._accumulated_text_lock = threading.Lock()
         self._in_tool_call: bool = False  # Track if we're inside a tool call
@@ -363,6 +364,8 @@ class LiveStreamCallback(BaseCallbackHandler):
         return f"[{self.scope}] "
 
     def _append(self, text: str) -> None:
+        if self._silent:
+            return
         try:
             p = stream_path()
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -427,7 +430,9 @@ class LiveStreamCallback(BaseCallbackHandler):
         except ImportError:
             self._context_was_changed_before_tool = False
         
-        self._append(f"\n{self._prefix()}<tool_start {tool}>\n")
+        # Include invocation method name for GM tool calls
+        via = f" via {self.label}" if self.label and self.scope == "game_master" else ""
+        self._append(f"\n{self._prefix()}<tool_start {tool}{via}>\n")
 
     def on_tool_end(self, output: Any, **kwargs: Any) -> None:
         with self._in_tool_call_lock:
@@ -528,7 +533,7 @@ class LiveStreamCallback(BaseCallbackHandler):
 
 
 def _is_game_scope(scope: str) -> bool:
-    return str(scope or "").strip().lower() in {"gm", "character", "storage_assistant"}
+    return str(scope or "").strip().lower() in {"gm", "character"}
 
 
 def reset_logs_if_enabled(
@@ -591,7 +596,7 @@ def _message_role(m: BaseMessage) -> str:
 
 
 def _is_prompt_usage_scope(scope: str) -> bool:
-    return str(scope or "").strip().lower() in {"storage_assistant", "game_master", "character"}
+    return str(scope or "").strip().lower() in {"game_master", "character"}
 
 
 def _estimate_prompt_history_split(messages: List[List[BaseMessage]]) -> Dict[str, int]:
@@ -705,7 +710,7 @@ def _tool_label(tool_name: str, parsed_input: Any, input_str: str) -> Optional[s
             return f"{n} {ptr}"
         return n or ptr
 
-    if tool_name in {"start_scene", "bookkeeping_done"}:
+    if tool_name in {"start_scene"}:
         loc = _get_str("location")
         chars = data.get("character_names")
         chars_s = None

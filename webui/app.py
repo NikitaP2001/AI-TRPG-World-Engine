@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -69,6 +69,20 @@ app.mount(
 )
 
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
+
+# ── Planet viewer textures ──
+_TEXTURES_DIR = os.path.join(REPO_ROOT, "data", "planet_test", "textures")
+if os.path.isdir(_TEXTURES_DIR):
+    app.mount(
+        "/static/textures",
+        StaticFiles(directory=_TEXTURES_DIR),
+        name="planet_textures",
+    )
+
+
+@app.get("/planet")
+def planet_viewer():
+    return FileResponse(os.path.join(REPO_ROOT, "webui", "static", "webgl", "index.html"))
 
 
 def _highlight_quotes_html(text: object) -> str:
@@ -194,6 +208,10 @@ def _render_composer(
             selected_character = overrides.armed_character()
         except Exception:
             selected_character = ""
+    try:
+        auto_pause = ConsoleApp._auto_scene_pause
+    except Exception:
+        auto_pause = True
     return templates.TemplateResponse(
         request,
         "partials/composer.html",
@@ -204,6 +222,7 @@ def _render_composer(
             "message": message,
             "gm_question": gm_question,
             "gm_answer": gm_answer,
+            "auto_scene_pause": auto_pause,
         },
     )
 
@@ -554,6 +573,20 @@ def cmd_continue_with_decision(
         return _render_composer(request=request, selected_character="", message=msg)
     finally:
         _TURN_COMMAND_LOCK.release()
+
+
+@app.post("/cmd/toggle_auto_scene_pause", response_class=HTMLResponse)
+def cmd_toggle_auto_scene_pause(request: Request):
+    """Toggle the auto-scene-pause flag."""
+    try:
+        ConsoleApp._auto_scene_pause = not ConsoleApp._auto_scene_pause
+        state = "on" if ConsoleApp._auto_scene_pause else "off"
+    except Exception:
+        state = "?"
+    return _render_composer(
+        request=request,
+        message=f"Stop on next scene: {state}",
+    )
 
 
 @app.post("/cmd/override_ask_gm", response_class=HTMLResponse)

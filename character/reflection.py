@@ -17,12 +17,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 
 from memory_store import load_history
 from openrouter_langchain_logging import logs_enabled, enable_direct_text_abort, disable_direct_text_abort
 from openrouter_llm import build_openrouter_chat_llm, openrouter_logging_callbacks, read_prompt_text
+from engine.summarizer import SummaryRunner
 from world.io import _read_json as _locked_read_json, _write_json as _locked_write_json
 
 
@@ -931,6 +932,44 @@ def load_diary(character_name: str) -> Dict[str, Any]:
     return data
 
 
+def build_character_arc_block(diary_path: Path) -> Optional[str]:
+    """Build pinned [arc_summaries] block for a character from their diary.json."""
+    try:
+        data = json.loads(diary_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    arc_list = data.get("arc_summaries") or []
+    if not arc_list:
+        return None
+    lines: List[str] = []
+    for i, arc in enumerate(arc_list, 1):
+        s = str(arc.get("summary") or "").strip()
+        if s:
+            lines.append(f"**Arc {i}:**\n{s[:500]}")
+    return "\n\n".join(lines) if lines else None
+
+
+def build_character_paragraph_block(diary_path: Path) -> Optional[str]:
+    """Build pinned [paragraph_summaries] block for a character from their diary.json."""
+    try:
+        data = json.loads(diary_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    paras = data.get("paragraphs") or []
+    if not paras:
+        return None
+    lines: List[str] = []
+    for p in paras:
+        s = str(p.get("summary") or "").strip()
+        if s:
+            lines.append(f"- {s[:300]}")
+    return "\n".join(lines) if lines else None
+
+
 def _save_diary(character_name: str, diary: Dict[str, Any]) -> None:
     _write_json(_diary_path(character_name), diary)
 
@@ -1066,94 +1105,61 @@ def _run_diary_summary(*, character_name: str, messages_path: Path) -> None:
         "Write from your own perspective. Focus on what matters to YOU — not "
         "everything that happened, but what you want to keep in memory.\n\n"
         f"Your diary so far:\n{diary_context}\n\n"
-        "Call the `write_diary_entry` tool with your summary."
+        "Respond with JSON: {\"summary\": \"your diary entry\"}."
     )
 
     core_prompt = read_prompt_text("agents/character_agent/prompt.txt").replace(
         "{name}", str(character_name or "")
     )
 
-    messages = [
-        SystemMessage(content=core_prompt),
-        *_history_to_messages(history_tail),
-        HumanMessage(content=task_text),
-    ]
-
     safe_name = _safe_name_for_logging(character_name)
-    llm = build_openrouter_chat_llm(
+    runner = SummaryRunner(
+        meta=None,
+        history_path=messages_path,
+        prompt_text=core_prompt,
         temperature=0.7,
-        streaming=True,
-        max_tokens=800,
-        title_suffix=f"-diary-{safe_name}",
+        scope="diary",
     )
-    callbacks = openrouter_logging_callbacks(scope="diary", label=safe_name)
 
-    try:
-        bound_llm = llm.bind_tools(
-            [write_diary_entry],
-            tool_choice={"type": "function", "function": {"name": "write_diary_entry"}},
-        ).with_config({"callbacks": callbacks})
-    except TypeError:
-        bound_llm = llm.bind_tools([write_diary_entry]).with_config({"callbacks": callbacks})
-
+    extra_history: List[BaseMessage] = []
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
         try:
             enable_direct_text_abort(max_words=15)
             try:
-                ai_msg = bound_llm.invoke(messages)
+                result = runner.run_summary(
+                    task_prompt=task_text,
+                    title_suffix=f"-diary-{safe_name}",
+                    max_tokens=800,
+                    label=safe_name,
+                    extra_history=extra_history,
+                )
             except KeyboardInterrupt:
                 if logs_enabled():
                     print(f"[trace] diary {character_name}: direct text abort — retrying")
-                messages.append(HumanMessage(
-                    content="ERROR: You produced raw text instead of calling write_diary_entry. "
-                    "Call the write_diary_entry tool NOW with your diary summary."
+                extra_history.append(HumanMessage(
+                    content="ERROR: You produced raw text instead of JSON. "
+                    "Respond with JSON: {\"summary\": \"your diary entry\"}."
                 ))
                 continue
             finally:
                 disable_direct_text_abort()
 
-            tool_calls = getattr(ai_msg, "tool_calls", None)
-            if not tool_calls:
-                additional = getattr(ai_msg, "additional_kwargs", {}) or {}
-                tool_calls = additional.get("tool_calls", [])
-
-            if not tool_calls:
+            if not result:
                 if logs_enabled():
-                    print(f"[trace] diary attempt {attempt}: no tool call, retrying")
-                messages.append(HumanMessage(
-                    content="CRITICAL: Call write_diary_entry tool NOW with your diary summary."
+                    print(f"[trace] diary attempt {attempt}: no result, retrying")
+                extra_history.append(HumanMessage(
+                    content="CRITICAL: Respond with valid JSON: {\"summary\": \"your diary entry\"}."
                 ))
                 continue
 
-            tc = tool_calls[0]
-            args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})
-            if isinstance(args, str) and args.strip():
-                try:
-                    args = json.loads(args)
-                except Exception:
-                    if logs_enabled():
-                        print(f"[trace] diary {character_name}: failed to parse args string, retrying")
-                    messages.append(HumanMessage(
-                        content="ERROR: write_diary_entry arguments malformed. Provide valid JSON."
-                    ))
-                    continue
-            if not isinstance(args, dict):
-                if logs_enabled():
-                    print(f"[trace] diary {character_name}: non-dict args, retrying")
-                messages.append(HumanMessage(
-                    content="ERROR: write_diary_entry arguments malformed. Provide valid JSON."
-                ))
-                continue
-
-            result_str = write_diary_entry.invoke(args, config={"callbacks": callbacks})
-            result = json.loads(result_str)
-            summary_text = str(result.get("summary") or "").strip()
-
+            _name, summary_text = result
             if not summary_text:
                 if logs_enabled():
                     print(f"[trace] diary attempt {attempt}: empty summary, retrying")
-                messages.append(HumanMessage(content="Your diary entry was empty. Write something meaningful."))
+                extra_history.append(HumanMessage(
+                    content="Your diary entry was empty. Write something meaningful."
+                ))
                 continue
 
             # Append new paragraph
