@@ -96,6 +96,16 @@ CREATE TABLE IF NOT EXISTS features (
 
 CREATE INDEX IF NOT EXISTS idx_features_type   ON features(type);
 CREATE INDEX IF NOT EXISTS idx_features_active ON features(is_active);
+
+CREATE TABLE IF NOT EXISTS fauna_populations (
+    h3_id        TEXT NOT NULL,
+    species_id   TEXT NOT NULL,
+    density      REAL DEFAULT 0.0,
+    updated_at_tick INTEGER DEFAULT 0,
+    PRIMARY KEY (h3_id, species_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fauna_species ON fauna_populations(species_id);
 """
 
 # ======================================================================
@@ -247,7 +257,7 @@ class WorldDB:
                 soil_ph, cation_exchange, interception_coefficient,
                 slope_dir, elevation_variance
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )""",
             [self._cell_to_row(c) for c in cells],
         )
@@ -391,6 +401,58 @@ class WorldDB:
         if self._feature_store_cache is None:
             self._feature_store_cache = self.load_features()
         return self._feature_store_cache
+
+    # ── Fauna Populations ────────────────────────────────────────────
+
+    def save_fauna_populations(self, rows: List[Dict[str, Any]]) -> None:
+        """Bulk upsert fauna population rows."""
+        if not rows:
+            return
+        cur = self.conn.cursor()
+        cur.executemany(
+            """INSERT OR REPLACE INTO fauna_populations
+               (h3_id, species_id, density, updated_at_tick)
+               VALUES (?, ?, ?, ?)""",
+            [
+                (r["h3_id"], r["species_id"], float(r.get("density", 0.0)),
+                 int(r.get("updated_at_tick", 0)))
+                for r in rows
+            ],
+        )
+        self.conn.commit()
+
+    def load_fauna_populations(self, species_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Load fauna population rows.
+
+        Args:
+            species_id: If provided, filter to one species. None = all.
+
+        Returns:
+            List of dicts with h3_id, species_id, density, updated_at_tick.
+        """
+        import h3 as _h3
+        if species_id:
+            cur = self.conn.execute(
+                "SELECT * FROM fauna_populations WHERE species_id=? AND density>0",
+                (species_id,),
+            )
+        else:
+            cur = self.conn.execute(
+                "SELECT * FROM fauna_populations WHERE density>0"
+            )
+        rows = []
+        for r in cur.fetchall():
+            d = dict(r)
+            # Resolve lat/lon from h3_id for emergence/display
+            try:
+                latlng = _h3.cell_to_latlng(d["h3_id"])
+                d["lat"] = latlng[0]
+                d["lon"] = latlng[1]
+            except Exception:
+                d["lat"] = 0.0
+                d["lon"] = 0.0
+            rows.append(d)
+        return rows
 
     # ── Convenience ─────────────────────────────────────────────────
 

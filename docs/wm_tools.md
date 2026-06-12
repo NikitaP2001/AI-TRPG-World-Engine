@@ -535,25 +535,164 @@ registration-time derivation from `tech_level`) dynamic — a faction that resea
 
 ---
 
+### R17 — The World Generation Bootstrap Problem
+
+Every tool described so far assumes the world's geography already exists —
+`alter_feature` modifies features, `define_faction` registers territory within
+existing terrain, `query_world_state` reads generated content. None of this describes
+how the WM goes from `set_world_orientation`'s grid parameters to a concrete,
+geographically coherent world the campaign can begin in.
+
+**Generation is constraint satisfaction, not a black box the WM waits on.** The WM
+authors *what the world must contain* — continent shapes, mountain ranges, rivers,
+swamps, named regions, faction territories, canon-constrained facts — using the same
+tools (`alter_feature`, `define_faction`, `define_world_concept`, `declare_world_state`)
+that are used for live play. While the world is in **authoring mode**, these calls do
+not modify existing content (none exists yet) — they register **generation
+constraints**: "a mountain range must exist here, running this direction," "this
+faction's territory must be in this region and must be geologically suitable for a
+dwarf hold." The procedural generator then runs once, producing geography that
+satisfies every declared constraint plus filling in everything undeclared. After
+generation, the same tool calls return to their normal live-play meaning — modifying
+real, generated content.
+
+**The player's starting position is the coordinate origin for authoring, not a
+post-hoc anchor.** `location_relative` (`bearing`/`distance`/`alt_offset` from
+`"player_start"`) needs `"player_start"` to mean something *before* geography exists
+— it is the origin that all relative constraints are measured from. The WM must be
+able to establish this origin early in authoring, independent of `location_absolute`
+coordinates which may not correspond to anything meaningful until generation resolves
+them.
+
+**A canon-constrained world (Forgotten Realms) needs to author geography that matches
+real-world lore**, not just gameplay-relevant features near the player. The WM must
+be able to lay down continent outlines, named mountain ranges, seas, and major rivers
+as constraints — at whatever level of geometric precision the generator can use — so
+that generation produces a Faerûn-like world rather than an arbitrary one, while
+`canon_constraint` (R15) entries hold the load-bearing facts once play begins.
+
+**Generation is a one-time, explicit transition.** The WM must explicitly signal "I
+am done authoring constraints, generate the world now" — this cannot be implicit
+(e.g. triggered by the first player turn), because the WM needs to review what he's
+declared and may need several authoring calls before he's ready. This mirrors
+`set_world_orientation`'s existing one-time-call status (R-existing) but is a distinct
+later step — `set_world_orientation` establishes the grid and global parameters;
+generation itself is triggered separately once authoring constraints are complete.
+
+**Consequence:** the world has an explicit `world_generation_status`:
+`"authoring"` (set by `set_world_orientation`; constraints accepted, no procedural
+content exists) or `"generated"` (set by a new one-time tool,
+`finalize_world_generation`; all tools operate on real generated content from this
+point on). A new tool `set_player_start` establishes the coordinate origin for
+relative constraints during authoring, called early in the authoring session.
+`alter_feature`'s existing fields (`location_absolute`, `location_relative`,
+`location_region_hint`, geometry fields) are reinterpreted as generation constraints
+while `world_generation_status == "authoring"`, and as direct modifications once
+`"generated"`. `define_faction`'s settlement locations (`settlements[].location`,
+R18) are reinterpreted the same way. Only the *side effects* and *return values*
+differ by mode; the WM
+authors the same way in both phases.
+
+---
+
+### R18 — The Settlement-as-Territory-Atom Problem
+
+`territory_cells` on `define_faction` is an independent declaration with no
+structural object behind it. This is wrong for any setting where "where do these
+people actually live" matters — dwarves live in a hold, goblins in a warren or
+caves, a lich in a tower, humans in villages/cities/fortresses. None of these are
+currently first-class — `alter_feature feature_type: "settlement"` is a geographic
+label only, disconnected from faction ownership, population, garrison, or capture.
+
+**A settlement must be a capturable, located, faction-owned object** present for
+every faction at any `social_complexity` — a proto-faction's single warren *is* its
+territory; a mature kingdom has many tiered settlements. `territory_cells` should be
+*derived* from owned settlements' control radii, not declared independently — this
+also resolves R17's authoring-mode story: the WM declares settlement locations as
+generation constraints, and faction borders fall out of that.
+
+**Conquest currently has no concrete object that changes hands.** §10's "a faction's
+territory is absorbed" needs a precise mechanism: a specific settlement's
+`faction_id` changes, carrying its population share, institutions, resources, and
+latent contents (R12) with it. This is also how `define_relationship` vassalage
+concessions and negotiated peace settlements transfer territory at sub-faction
+granularity.
+
+**Consequence:** `define_faction` gains `settlements: list[dict]` (schema in L2/L2.5
+§2.5) — each settlement references a geographic feature (created via `alter_feature`,
+unchanged) and adds ownership, `population_share`, `garrison`, `institutions`
+placement, and `resources_present`. `territory_cells` becomes a read-only derived
+field in query responses rather than a `define_faction` input. `military_unit_of`
+(R14) may now reference a `settlement_id` in addition to a `faction_id`, scoping
+garrison directives to a specific settlement. `query_world_state` gains
+`query_type="settlements"`. Settlement capture is a new outcome of §4's combat
+resolution (Phase 3) and an `override_type` on `resolve_contradiction` for
+WM-declared territorial changes outside combat.
+
+---
+
+### R19 — The Settlement Footprint Problem
+
+L2/L2.5 settlements (R18) only ever *consume* L1/L0 fields — extraction flows read
+`population_density[species]`, `biomass`, `ore_deposit.volume_m3`. Nothing in either
+direction lets a settlement's mere existence *modify* the surrounding continuous
+fields. A thousand-person city should leave deforested land, depleted local wildlife,
+and modified soil around it; a dwarf hold's mining should lower the regional water
+table; a lich's tower should radiate an "unnatural" suppression of nearby life. None
+of this currently happens — L1 has no concept of a settlement as a field-effect
+source.
+
+**Different settlement_types must produce qualitatively different footprints, not
+just scaled versions of one footprint.** A human city's footprint (deforestation,
+hunting, soil change from agriculture) is structurally different from a dwarf hold's
+(water table drawdown, mine-spoil soil degradation, near-zero surface canopy effect)
+or a lich tower's (hazard increase, life-suppression in a radius, no
+deforestation/hunting at all). The footprint mechanism must be driven by registered,
+world-defined coefficients per `settlement_type` — not a single hardcoded formula.
+
+**A footprint must outlast the settlement.** If a settlement is destroyed, captured,
+or abandoned, the surrounding land should show lingering effects — deforestation that
+slowly regrows, a depleted water table that may never recover, fauna that gradually
+migrate back. A footprint tied to the settlement's continued existence (a per-tick
+effect re-applied only while the settlement is active) would vanish the instant the
+settlement does, which is wrong — the ruins of a city should be visibly different
+from land that was never settled.
+
+**Consequence:** a new `settlement_type` concept (`define_world_concept`) registers
+footprint coefficients (`deforestation_factor`, `hunting_factor`,
+`soil_modification_factor`, `water_table_factor`, `hazard_modifier`,
+`population_suppression_factor`, `ambient_material_extraction`,
+`recovery_rate_modifier`) referenced by `define_faction.settlements[].settlement_type`.
+A new L1 pass (`SettlementFootprint`, L1 completion design) applies these as
+*accumulating* changes to field base state — not per-tick reapplied effects — scaled
+by `population_share`/`settlement_tier`, within `control_radius`. Accumulated changes
+persist and recover via existing L1 dynamics (vegetation regrowth, fauna migration,
+§9 of the L1 design) at a rate controlled by `recovery_rate_modifier`, independent of
+whether the settlement that caused them still exists.
+
+---
+
 ## Part II — Tool Definitions
 
-Based on the requirements above, the WM tool set is **13 tools**:
+Based on the requirements above, the WM tool set is **15 tools**:
 
 | # | Tool | Purpose |
 |---|---|---|
-| 1 | `set_world_orientation` | One-time world initialization |
-| 2 | `define_world_concept` | Register any named world-specific type: resource, existence_type, stratum, norm, ore, etc. |
-| 3 | `alter_feature` | Create, update, or dissolve geographic/physical features |
-| 4 | `define_entity` | Create or update any named entity (L3, narrative-persistent, or legendary) |
-| 5 | `define_faction` | Create or update any faction, civilization, proto-faction, or institution |
-| 6 | `define_rule` | Create or update any event system production rule |
-| 7 | `declare_world_state` | Declare narrative facts, era parameters, prophecies, historical events |
-| 8 | `subscribe_to_events` | Register forward-looking filters for re-engagement before/after events commit |
-| 9 | `query_world_state` | Read current simulation state, registry contents, world debt, notifications, entity and relationship rosters |
-| 10 | `resolve_contradiction` | Declare authoritative world state going forward |
-| 11 | `post_intent` | Issue a directive to a faction's L2 decision engine |
-| 12 | `post_entity_directive` | Issue a scoped behavior directive to a single L3 entity |
-| 13 | `define_relationship` | Create or update structured inter-faction agreements: alliances, vassalage, empires, trade pacts |
+| 1 | `set_world_orientation` | One-time world initialization, enters authoring mode |
+| 2 | `set_player_start` | One-time: establish coordinate origin for authoring-phase constraints |
+| 3 | `finalize_world_generation` | One-time: run procedural generation from declared constraints |
+| 4 | `define_world_concept` | Register any named world-specific type: resource, existence_type, stratum, norm, ore, etc. |
+| 5 | `alter_feature` | Authoring: declare terrain constraint. Live: create/update/dissolve geographic/physical features |
+| 6 | `define_entity` | Create or update any named entity (L3, narrative-persistent, or legendary) |
+| 7 | `define_faction` | Authoring: declare territory constraint. Live: create/update any faction, civilization, proto-faction, or institution |
+| 8 | `define_rule` | Create or update any event system production rule |
+| 9 | `declare_world_state` | Declare narrative facts, era parameters, prophecies, historical events |
+| 10 | `subscribe_to_events` | Register forward-looking filters for re-engagement before/after events commit |
+| 11 | `query_world_state` | Read current simulation state, registry contents, world debt, notifications, entity and relationship rosters |
+| 12 | `resolve_contradiction` | Declare authoritative world state going forward |
+| 13 | `post_intent` | Issue a directive to a faction's L2 decision engine |
+| 14 | `post_entity_directive` | Issue a scoped behavior directive to a single L3 entity |
+| 15 | `define_relationship` | Create or update structured inter-faction agreements: alliances, vassalage, empires, trade pacts |
 
 Query tools for GM/SM are not included here — this document covers WM-only tools.
 
@@ -663,18 +802,188 @@ def set_world_orientation(
     #   "cell_side_length": float,
     #   "top_level_cell_count": int,       # always ~17,400
     #   "grid_initialized": bool,
+    #   "world_generation_status": "authoring",  # R17: world enters authoring
+    #                              # mode. alter_feature, define_faction, and
+    #                              # define_world_concept calls now register
+    #                              # generation constraints rather than modify
+    #                              # content. Call set_player_start to establish
+    #                              # the coordinate origin for relative
+    #                              # constraints, then finalize_world_generation
+    #                              # when authoring is complete.
     #   "ambient_rare_materials_registered": list[str],  # material_ids
     #   "warnings": list[str]
     # }
 ```
 
-**Side effects:** Initializes H3 cell grid. Creates ~17,400 empty cell condition vector
-records. Registers all declared special resources in the world registry. No features
-created yet.
+**Side effects:** Initializes H3 cell grid topology (~17,400 empty cell records — no
+geography, climate, or biome values yet). Registers all declared ambient rare
+materials in the world registry. Sets `world_generation_status = "authoring"`. No
+procedural generation runs yet — this happens once, at `finalize_world_generation`
+(R17, new tool below).
 
 ---
 
-### Tool 2: `define_world_concept`
+### Tool 2: `set_player_start`
+
+Establishes the coordinate origin for the campaign's starting position. Called early
+in the authoring phase (`world_generation_status == "authoring"`), before any
+`location_relative` constraints are declared — those constraints are measured from
+this origin. This is a one-time call, like `set_world_orientation`: it cannot be
+called again after `finalize_world_generation` runs.
+
+```python
+@tool
+def set_player_start(
+
+    # ── Origin specification (provide exactly one) ────────────────────────────
+
+    location_absolute: dict = {},
+    # { "lat": float, "lon": float, "alt": float (optional) }
+    # Use when the WM has a specific real-world-analog location in mind (e.g.
+    # Forgotten Realms: Waterdeep's approximate lat/lon on the authored
+    # continent outline).
+
+    location_region_hint: str = "",
+    # Natural language: "northern coast", "temperate river valley",
+    # "mountain pass between two ranges". The generator resolves this to a
+    # concrete point that also satisfies any continent/terrain constraints
+    # already declared via alter_feature. Use when the WM cares about the
+    # *kind* of starting location more than its exact coordinates.
+
+    # ── Constraints on the resolved location ──────────────────────────────────
+
+    required_properties: dict = {},
+    # Properties the generated terrain at this point must satisfy, e.g.
+    # { "biome_category": "temperate", "is_coastal": true,
+    #   "elevation_range": [0.1, 0.4], "near_navigable_water": true }
+    # Used whether location is given absolutely or via region_hint — for
+    # location_absolute, generation must produce terrain at that point
+    # consistent with these properties (e.g. the climate parameters and any
+    # nearby constraints must allow a coastal temperate result there).
+
+    player_faction_id: str = "",
+    # Optional: faction_id (to be defined via define_faction, in this call or
+    # later) designated as the players'/party's home faction. Used as a
+    # default for narrative_importance on nearby entities and as a
+    # convenience target for query_world_state region_center.
+
+    cause: str = "",
+    # Narrative description of the starting position's significance.
+
+) -> dict:
+    # Returns:
+    # {
+    #   "origin_established": bool,
+    #   "world_generation_status": "authoring",
+    #   "resolved_location": dict | null,  # null until finalize_world_generation
+    #                                      # runs; afterward, the concrete
+    #                                      # { "lat", "lon", "alt", "h3_id" }
+    #   "player_faction_id": str | null,
+    #   "validation_errors": list[str],
+    #   "warnings": list[str]
+    # }
+```
+
+**Side effects:** Registers the origin point and its `required_properties` as a
+generation constraint. All subsequent `location_relative: {"from": "player_start",
+...}` constraints (in `alter_feature`, `define_faction`, `define_entity` during
+authoring) are measured from this origin. The origin's own concrete coordinates are
+resolved by `finalize_world_generation` together with everything declared relative to
+it — `location_absolute` here is a strong preference, not a guarantee, if it would
+conflict with other declared constraints (e.g. a continent outline that doesn't
+cover that point); such conflicts are reported in `warnings` and the nearest
+satisfying point is used instead.
+
+---
+
+### Tool 3: `finalize_world_generation`
+
+Triggers procedural world generation from all constraints declared during the
+authoring phase, and transitions `world_generation_status` from `"authoring"` to
+`"generated"`. This is a one-time, explicit call — the WM reviews everything declared
+via `set_player_start`, `alter_feature`, `define_faction`, `define_world_concept`, and
+`declare_world_state` during authoring, then calls this when ready. After this call,
+all tools operate on real generated content; authoring-mode constraint semantics no
+longer apply.
+
+```python
+@tool
+def finalize_world_generation(
+
+    world_seed: int = 0,
+    # Random seed for generation aspects not fully determined by declared
+    # constraints (exact coastline detail, ore deposit placement within
+    # registered ore_type formation rules, etc.). 0 = random seed, recorded
+    # in the return value for reproducibility.
+
+    constraint_priority: str = "strict",
+    # "strict": generation must satisfy every declared constraint exactly as
+    #   specified, even if this requires unusual geological/climate outcomes.
+    #   Use for canon-constrained worlds (Forgotten Realms) where specific
+    #   geography is load-bearing.
+    # "best_effort": generation satisfies constraints where geologically
+    #   plausible given set_world_orientation's global parameters, and
+    #   reports unsatisfiable constraints in warnings rather than forcing
+    #   them. Use for original worlds where physical plausibility matters
+    #   more than matching an exact pre-conceived layout.
+
+    review_only: bool = False,
+    # If true: validates all declared constraints for consistency and
+    # estimates what generation would produce, WITHOUT running generation or
+    # changing world_generation_status. Use to check for constraint conflicts
+    # before committing. Returns the same validation_errors/warnings as a
+    # real run would, plus a constraint_summary, but generated_* fields are
+    # null and world_generation_status remains "authoring".
+
+) -> dict:
+    # Returns:
+    # {
+    #   "world_generation_status": "generated" | "authoring",  # "authoring"
+    #                              # if review_only=true, or if generation
+    #                              # failed validation entirely
+    #   "world_seed": int,
+    #   "constraint_summary": {
+    #     "continent_outlines":     int,
+    #     "named_terrain_features": int,   # mountain ranges, rivers, swamps,
+    #                                      # seas, etc. declared via alter_feature
+    #     "faction_territories":    int,
+    #     "canon_constraints":      int,
+    #     "myths_seeded":           int
+    #   },
+    #   "resolved_player_start": dict | null,  # {"lat","lon","alt","h3_id"}
+    #                              # from set_player_start, now concrete
+    #   "unsatisfiable_constraints": [          # only if constraint_priority
+    #                              # = "best_effort" and some couldn't be met
+    #     { "constraint_source": str,  # e.g. "alter_feature:sword_mountains"
+    #       "reason": str }
+    #   ],
+    #   "generated_features": int,       # total feature count after generation
+    #                              # (declared + procedurally filled)
+    #   "generated_factions": int,
+    #   "validation_errors": list[str],  # if nonempty and review_only=false,
+    #                              # generation did NOT run and status remains
+    #                              # "authoring"
+    #   "warnings": list[str]
+    # }
+```
+
+**Side effects:** Runs procedural generation (plate tectonics, climate, hydrology,
+ore/mineral placement per registered `ore_type` formations, biome classification,
+fauna/flora population seeding per registered `fauna_species`/`flora_pft`) over the
+full grid, producing geography and content consistent with every declared constraint
+plus filling in everything undeclared. Resolves `set_player_start`'s origin to
+concrete coordinates. Resolves all `location_relative: {"from": "player_start", ...}`
+and other authoring-phase constraints to concrete features. Sets
+`world_generation_status = "generated"` (unless `review_only=true` or validation
+fails). After this call, `alter_feature`/`define_faction`/etc. operate in normal
+live-play mode — the same calls now modify real generated content rather than
+registering constraints. This call cannot be undone (R13: no rewind) — if the result
+is unsatisfactory, the WM continues live-play authoring on the generated world rather
+than re-generating.
+
+---
+
+### Tool 4: `define_world_concept`
 
 Registers any named world-specific type into the simulation registry. This tool is
 called before referencing a concept type anywhere else — a `define_entity` call that
@@ -743,6 +1052,14 @@ def define_world_concept(
     #                           notification before any violating change commits.
     #                           (waterdeep_remains_independent, elminster_survives...)
     # "faction_template"     — default stock/flow/rule set for a faction archetype
+    # "settlement_type"      — footprint coefficients for a settlement category
+    #                           (R19, L1 completion design §SettlementFootprint).
+    #                           Determines how a settlement of this type affects
+    #                           surrounding L1 fields — deforestation, hunting
+    #                           pressure, soil modification, water table, hazard.
+    #                           "city", "dwarf_hold", "lich_tower", "goblin_warren",
+    #                           or any world-defined label referenced by
+    #                           define_faction.settlements[].settlement_type.
     # "behavior_template"    — reusable entity behavior profile
     # "damage_type"          — a named damage category for combat rules
     #                          (piercing, fire, void, divine, psionic, ...)
@@ -954,6 +1271,57 @@ def define_world_concept(
     #   "default_rules": [ { ... } ],       # see Rule schema in define_rule
     #   "social_structure": str,            # "feudal" | "flat" | "theocratic"
     #                                       # | "corporate" | "tribal" | (world-defined)
+    # }
+    #
+    # ── settlement_type parameters (R19) ──────────────────────
+    # Footprint coefficients applied each L1 step by the SettlementFootprint
+    # pass (L1 completion design) for every define_faction.settlements[] entry
+    # with this settlement_type, scaled by that settlement's population_share
+    # and settlement_tier. Most settlement_types leave several of these at 0 —
+    # a dwarf hold has near-zero deforestation_factor but high water_table_factor;
+    # a lich_tower has near-zero everything except hazard_modifier and
+    # population_suppression_factor.
+    # {
+    #   "deforestation_factor":  float,  # -canopy_density / -biomass within
+    #                                    # control_radius, accumulating per step
+    #   "hunting_factor":        float,  # -population_density[species] for
+    #                                    # species with huntable=true (see
+    #                                    # fauna_species), within control_radius
+    #   "soil_modification_factor": float,  # ±soil_fertility within a
+    #                                    # "farmland_ring" (smaller than
+    #                                    # control_radius) — positive for
+    #                                    # cultivating settlement_types,
+    #                                    # negative for purely extractive ones
+    #   "water_table_factor":    float,  # ±water_table_depth within
+    #                                    # control_radius — negative for
+    #                                    # mining/tunneling (drains water table),
+    #                                    # near-zero for surface settlements
+    #   "hazard_modifier":       float,  # +/- L0.hazard_level within
+    #                                    # control_radius — positive for
+    #                                    # settlement_types with an "unnatural"
+    #                                    # presence (lich_tower); usually 0 or
+    #                                    # slightly negative for settlements
+    #                                    # that actively clear hazards (a
+    #                                    # garrisoned fortress reduces
+    #                                    # encounter_probability, R[L1]§8)
+    #   "population_suppression_factor": float,  # additional
+    #                                    # -population_density[species] applied
+    #                                    # to ALL species (not just huntable),
+    #                                    # for settlement_types whose presence
+    #                                    # repels wildlife regardless of hunting
+    #                                    # (undead, extreme magical activity)
+    #   "ambient_material_extraction": list[str],  # material_ids (from
+    #                                    # set_world_orientation
+    #                                    # ambient_rare_materials) this
+    #                                    # settlement_type depletes locally
+    #   "recovery_rate_modifier": float,  # multiplies how fast abandoned
+    #                                    # footprints recover once this
+    #                                    # settlement is dissolved/captured —
+    #                                    # 1.0 = normal vegetation/fauna
+    #                                    # recovery rates; water_table_factor
+    #                                    # effects typically have near-0
+    #                                    # natural recovery regardless
+    #   "description": str
     # }
     #
     # ── damage_type parameters ────────────────────────────────
@@ -1214,7 +1582,7 @@ of all affected entities.
 
 ---
 
-### Tool 3: `alter_feature`
+### Tool 5: `alter_feature`
 
 Creates, updates, or dissolves any geographic or physical feature. The same tool covers
 initialization (building the world) and live play (world evolution). Presence of
@@ -1224,6 +1592,26 @@ triggers dissolution.
 Handles: terrain, water bodies, rivers, climate zones, geological zones, special
 resource zones, physics overrides (dead zones, anti-magic fields, radiation belts),
 settlements as geographic anchors, ruins, underground structures.
+
+**Authoring mode (R17, `world_generation_status == "authoring"`):** this call
+registers a **generation constraint** instead of creating a feature — no procedural
+content exists yet. `location_absolute`/`location_relative`/`location_region_hint`
+constrain where the feature must end up; `location_relative: {"from": "player_start",
+...}` is measured from the origin established by `set_player_start`. Geometry fields
+may be given at coarser precision than in live mode — the generator resolves exact
+shape. `feature_id` in authoring mode is the constraint's identifier, used in
+`finalize_world_generation`'s `constraint_summary` and `unsatisfiable_constraints`.
+The return value's `operation` field is `"constraint_registered"` in this mode, and
+no `event_log_id` is produced (nothing has happened in the world yet). Authoring-mode
+calls are how the WM lays down continent outlines (`feature_type` such as
+`"continent_outline"`, `"mountain_range"`, `"river"`, `"sea"`, `"swamp"`) to match a
+canon setting (e.g. Forgotten Realms' Sword Coast, Sword Mountains, Sea of Fallen
+Stars) before generation runs.
+
+**Live mode (`world_generation_status == "generated"`):** normal behavior as
+described below — `feature_id` refers to a real feature, `location_*` and geometry
+fields describe its actual placement, `operation` is `"created"`, `"updated"`, or
+`"dissolved"` as appropriate, and an `event_log_id` is produced.
 
 ```python
 @tool
@@ -1256,7 +1644,16 @@ def alter_feature(
     #   "void_zone"             — suppresses generation (deep ocean, impassable)
     #   "mountain_pass"         — traversable gap through elevation feature
     #   "fault_line"            — geological boundary, affects tectonic_stress
-    #   "settlement"            — named population center (city, town, village)
+    #   "settlement"            — named geographic location (city, town, village).
+    #                              Geographic record only: name, position, geometry.
+    #                              Ownership, population_share, garrison, tier, and
+    #                              control_radius are NOT here — they live on
+    #                              define_faction.settlements[] (R18, L2/L2.5 §2.5),
+    #                              which references this feature_id via "location".
+    #                              A feature of this type with no referencing
+    #                              define_faction.settlements[] entry is an
+    #                              unclaimed/abandoned location (consider "ruin"
+    #                              instead if it should have discoverable contains).
     #   "ruin"                  — former settlement or structure
     #   "underground_region"    — cave system, tunnel network, subsurface zone
     #   "physics_override"      — modifies physical laws in region (see below)
@@ -1319,10 +1716,10 @@ def alter_feature(
     #   climate_override: str        — Köppen-Geiger code, forces climate
     #   hazard_modifier: float       — multiplies base hazard_level in cells
     #   depth: float                 — for water bodies and caves
-    #   population: int              — for settlements
-    #   tech_level: int              — GURPS TL for settlements
     #   underground: bool            — marks subsurface features
     # All other keys stored as metadata without simulation effect.
+    # (population, tech_level for settlements: see define_faction.settlements[],
+    # R18 — these are NOT alter_feature properties.)
 
     # ── Layer 0 physics effects ───────────────────────────────────────────────
 
@@ -1448,7 +1845,7 @@ live play, inserts event record into event log with `cause` attribution.
 
 ---
 
-### Tool 4: `define_entity`
+### Tool 6: `define_entity`
 
 Creates or updates any named entity: individual characters (NPCs, legendary entities),
 group entities (military units, swarms), and narrative-persistent entities. This is the
@@ -1500,15 +1897,23 @@ def define_entity(
     # trust matrix resolution in condition expressions.
 
     military_unit_of: str = "",
-    # If nonzero: faction_id whose L2 military allocation this entity
-    # represents (R14). When the WM posts a military-domain intent_declaration
-    # for this faction (post_intent with intent_type concentrate_military,
-    # defend_location, retreat, or pursue_faction), the L2 update sequence
-    # (L2/L2.5 §12) automatically issues a matching behavior_mode update to
-    # all entities tagged with this field — the WM declares intent once and
-    # both the faction's aggregate accounting and this entity's visible
+    # If nonzero: faction_id OR settlement_id (R18, L2/L2.5 §2.5) whose L2
+    # military allocation this entity represents (R14). A settlement_id
+    # scopes this entity as part of that specific settlement's garrison —
+    # used for defend_location intents targeting one settlement, and for
+    # settlement capture (§4 Phase 3): on capture, garrison unit_entity_ids
+    # either have military_unit_of reassigned to the new owning faction or
+    # are released as independent/hostile entities, per the attacker's
+    # post_entity_directive choice. A faction_id scopes this entity as part
+    # of the faction's general (non-settlement-specific) military allocation.
+    # When the WM posts a military-domain intent_declaration (post_intent
+    # with intent_type concentrate_military, defend_location, retreat, or
+    # pursue_faction), the L2 update sequence (L2/L2.5 §12 step 1.5)
+    # automatically issues a matching behavior_mode update to all entities
+    # tagged with the matching faction_id or settlement_id — the WM declares
+    # intent once and both the aggregate accounting and this entity's visible
     # movement stay consistent. Usually equal to faction_id but may differ
-    # for proxy/mercenary forces.
+    # for proxy/mercenary forces or settlement garrisons.
 
     narrative_importance: str = "background",
     # "background" | "notable" | "named" | "critical"
@@ -1842,12 +2247,32 @@ places entity in EPL position index.
 
 ---
 
-### Tool 5: `define_faction`
+### Tool 7: `define_faction`
 
 Creates or updates any collective social structure: kingdoms, guilds, religions, tribes,
 corporations, proto-factions, hive minds, machine empires. Handles both high-complexity
 civilizations (full L2/L2.5 dynamics) and low-complexity collectives (proto-factions
 that blur the line between ecology and society).
+
+**Authoring mode (R17, `world_generation_status == "authoring"`):** this call
+registers **settlement location constraints** — each entry in `settlements[]`
+declares (via its `location` referencing an `alter_feature` constraint, or directly
+via `location_region_hint`/`location_relative` to `"player_start"`) where that
+settlement must end up, and generation produces geography there suitable for the
+faction's `social_structure_type`/registered `existence_type` (a dwarf hold generates
+as mountainous; a maritime trading faction's capital generates with coastline and
+navigable water). `territory_cells` for the faction is derived after generation from
+the resolved settlements' `control_radius` (R18, L2/L2.5 §2.5) — it is never an
+input. All other fields (`stocks`, `flows`, `institutions`, `council_members`,
+`knowledge_stocks`, etc.) are registered as the faction's starting state, applied
+once `finalize_world_generation` completes — the faction does not run or update
+during authoring. The return value's `operation` field is `"constraint_registered"`
+in this mode.
+
+**Live mode (`world_generation_status == "generated"`):** normal behavior as
+described below — the faction exists, runs in the L2/L2.5 update sequence, and this
+call creates new factions or modifies existing ones with `operation`
+`"created"`/`"updated"`/`"dissolved"`.
 
 ```python
 @tool
@@ -1889,18 +2314,62 @@ def define_faction(
     # Use to model a proto-faction that becomes a civilization as it grows.
     # 0 = complexity is fixed at social_complexity value above.
 
-    # ── Territory ─────────────────────────────────────────────────────────────
+    # ── Settlements (R18, L2/L2.5 §2.5) ───────────────────────────────────────
 
-    home_region: str = "",
-    # feature_id or location name. Primary territory at founding.
-
-    territory_cells: list[str] = [],
-    # H3 cell IDs or feature_ids for explicit territory definition.
-    # For underground/subterranean factions: use "underground:feature_id" prefix
-    # to reference subsurface territory.
+    settlements: list[dict] = [],
+    # Every faction has at least one settlement, at any social_complexity — a
+    # dwarf hold, goblin warren, lich's tower, village, or capital are all
+    # this same object with different settlement_type labels. territory_cells
+    # is DERIVED from these entries' control_radius — not declared separately.
+    # {
+    #   "settlement_id":   str,       # unique within faction; upsert key
+    #   "settlement_type": str,       # world-defined: "city" | "village" |
+    #                                 # "fortress" | "dwarf_hold" | "lich_tower" |
+    #                                 # "goblin_warren" | "monastery" |
+    #                                 # "megalopolis" | (anything)
+    #   "location":        str,       # feature_id created via alter_feature
+    #                                 # (in authoring mode: the alter_feature
+    #                                 # constraint's identifier — R17)
+    #   "population_share": float,    # this settlement's portion of
+    #                                 # faction.population. Near-zero for
+    #                                 # settlements not about population
+    #                                 # (a lich's tower: population_share ≈ 0)
+    #   "settlement_tier": str,       # "hamlet"|"town"|"city"|"capital"|...
+    #                                 # derived from population_share against
+    #                                 # registered thresholds, UNLESS this
+    #                                 # settlement_type has a fixed tier
+    #                                 # (a lich_tower's tier doesn't change
+    #                                 # with population)
+    #   "control_radius":  float,     # cells within this radius of location
+    #                                 # belong to faction.territory_cells via
+    #                                 # this settlement. For underground
+    #                                 # settlements: cells in the referenced
+    #                                 # underground_region feature instead of
+    #                                 # a surface radius.
+    #   "garrison": {                 # defensive strength at this settlement
+    #     "military_supply_share": float,  # this settlement's portion of
+    #                                       # faction's military_supply stock
+    #     "unit_entity_ids": list[str]      # L3 entities with
+    #                                       # military_unit_of == this
+    #                                       # settlement_id (R14 settlement scope)
+    #   },
+    #   "institutions":   list[str],  # institution_ids (from institutions[]
+    #                                 # below) physically located here
+    #   "resources_present": list[str],  # ore_type/flora_pft/fauna_species
+    #                                 # feature_ids within control_radius —
+    #                                 # what THIS settlement can extract
+    #   "contains": dict,             # latent contents revealed on capture,
+    #                                 # same schema as alter_feature.contains
+    #                                 # (R12) — a captured dwarf hold might
+    #                                 # reveal a forge, treasury, guardians
+    #   "garrison_collapse_threshold": float  # effective_strength below which
+    #                                 # this settlement is captured in combat
+    #                                 # (§4 Phase 3). Default world-wide value
+    #                                 # if omitted.
+    # }
 
     territory_expansion_rules: list[dict] = [],
-    # Rules that drive autonomous territory expansion/contraction.
+    # Rules that drive autonomous settlement founding / control_radius growth.
     # Same format as entity action rules; conditions reference faction state.
     # { "rule_id": str, "condition": str, "effects": list[dict], ... }
 
@@ -2144,6 +2613,10 @@ def define_faction(
     #   "operation": "created" | "updated" | "dissolved",
     #   "social_complexity": float,
     #   "layers_active": list[str],
+    #   "settlements_registered": list[str],  # settlement_ids
+    #   "territory_cells": list[str],  # derived from settlements'
+    #                       # control_radius (R18). Empty/null while
+    #                       # world_generation_status == "authoring".
     #   "knowledge_domains_initialized": list[str],
     #   "capabilities_unlocked": list[str],
     #   "institutions_registered": int,
@@ -2160,7 +2633,7 @@ def define_faction(
 
 ---
 
-### Tool 6: `define_rule`
+### Tool 8: `define_rule`
 
 Creates or updates a global event system production rule — a rule that fires on world
 state conditions and applies effects, independently of any single entity or faction.
@@ -2247,7 +2720,7 @@ def define_rule(
 
 ---
 
-### Tool 7: `declare_world_state`
+### Tool 9: `declare_world_state`
 
 Declares high-level narrative facts, historical events, era parameters, prophecies,
 and world-building stubs that do not yet have full simulation infrastructure. This is
@@ -2362,7 +2835,7 @@ def declare_world_state(
 
 ---
 
-### Tool 8: `subscribe_to_events`
+### Tool 10: `subscribe_to_events`
 
 Registers the WM's interest in categories of future events. This is the WM's sole
 forward-looking mechanism (R13) — he does not advance time, poll, or get invoked on
@@ -2380,7 +2853,13 @@ def subscribe_to_events(
     #   "filter_id":     str,            # unique identifier for this subscription
     #
     #   "event_types":   list[str],      # registered event_type concept_ids;
-    #                                    # empty = any type
+    #                                    # empty = any type. Built-in types
+    #                                    # include "settlement_founded",
+    #                                    # "settlement_captured",
+    #                                    # "settlement_tier_changed" (R18,
+    #                                    # L2/L2.5 §12 step 2h) alongside
+    #                                    # research_complete, capability_unlocked,
+    #                                    # discover_location, migration, etc.
     #   "entity_ids":    list[str],      # empty = any entity
     #   "faction_ids":   list[str],      # empty = any faction
     #   "location": {                    # empty = anywhere
@@ -2459,7 +2938,7 @@ advance completes silently.
 
 ---
 
-### Tool 9: `query_world_state`
+### Tool 11: `query_world_state`
 
 Read-only. Returns current simulation state, registry contents, world debt status,
 WM notification queue, and available variable catalogue. The WM's primary diagnostic
@@ -2501,6 +2980,11 @@ def query_world_state(
     #                    a party). Use to discover relationship_ids before
     #                    updating with define_relationship, or to audit
     #                    current alliance/vassalage/trade structure.
+    # "settlements"    — roster query (R18, L2/L2.5 §2.5): list of settlement
+    #                    summaries matching filters (settlement_type,
+    #                    faction_id, settlement_tier, min_population_share).
+    #                    Use to find target_settlement_ids for combat/intent,
+    #                    or to audit territory after capture.
     # "events"         — event log query (same as GM get_events)
     # "social_context" — L2.5 norm vectors, trust baselines, and myth_vector
     #                    (myths held by the queried stratum/location with
@@ -2554,6 +3038,16 @@ def query_world_state(
     #   "role":                str,    # only relationships where faction_id has
     #                                  # this role ("patron", "vassal", "suzerain", ...)
     # }
+    # For "settlements" (R18): {
+    #   "faction_id":          str,    # settlements owned by this faction
+    #   "settlement_type":     str,    # "city"|"village"|"fortress"|"dwarf_hold"|
+    #                                  # "lich_tower"|"goblin_warren"|(world-defined)
+    #   "settlement_tier":     str,    # "hamlet"|"town"|"city"|"capital"|...
+    #   "min_population_share": float, # only settlements with population_share
+    #                                  # >= this value
+    # }
+    # region_center + region_radius (above) further restrict "settlements" to
+    # locations within that radius.
 
     fields: list[str] = [],
     # Subset of fields to return. Empty = all fields.
@@ -2577,11 +3071,11 @@ def query_world_state(
 
 ---
 
-### Tool 10: `resolve_contradiction`
+### Tool 12: `resolve_contradiction`
 
 Declares authoritative world state going forward. Used when the simulation has
 produced a result that contradicts established narrative, or when a `"before"`-timing
-subscription (Tool 8) has paused an event and the WM wants to declare a different
+subscription (Tool 10) has paused an event and the WM wants to declare a different
 outcome than the one about to commit.
 
 This is not a general-purpose state editor. It is for contradiction resolution: the
@@ -2607,10 +3101,18 @@ def resolve_contradiction(
     #                     subscription has paused, before it commits
     # "world_field"     — override a specific L0-L2.5 field value
     # "entity_location" — relocate an entity to resolve a movement contradiction
+    # "settlement_control" — WM-declared settlement faction_id change (R18)
+    #                     outside combat resolution — e.g. a narrative
+    #                     surrender, a relationship-driven territorial
+    #                     concession (define_relationship vassalage terms),
+    #                     or correcting an autonomous capture outcome. Applies
+    #                     the same transfer mechanics as §4 Phase 3 (population
+    #                     share, institutions, resources_present, contains
+    #                     reveal, territory_cells recompute for both parties).
 
     target_id: str,
-    # entity_id, faction_id, event_id (for pending_event), or feature_id
-    # depending on override_type.
+    # entity_id, faction_id, event_id (for pending_event), feature_id, or
+    # settlement_id (for settlement_control) depending on override_type.
 
     # ── Declared truth ────────────────────────────────────────────────────────
 
@@ -2622,6 +3124,11 @@ def resolve_contradiction(
     #   suppressed (does not fire at all).
     # For world_field: { "field_path": str, "value": float, "region": str }
     # For entity_location: { "lat": float, "lon": float, "alt": float }
+    # For settlement_control: { "new_faction_id": str,
+    #   "garrison_disposition": str }  # "reassign" (unit_entity_ids'
+    #   military_unit_of becomes new_faction_id / this settlement under new
+    #   ownership) | "release" (garrison entities become independent/hostile,
+    #   not tagged to either faction)
 
     # ── Attribution ───────────────────────────────────────────────────────────
 
@@ -2650,7 +3157,7 @@ def resolve_contradiction(
 
 ---
 
-### Tool 11: `post_intent`
+### Tool 13: `post_intent`
 
 Issues a time-bounded directive from a named entity (or the WM directly) to a faction's
 L2 decision engine. This is the primary live-play tool for active NPC/WM direction of
@@ -2671,7 +3178,13 @@ def post_intent(
     # What the directive is. Open string validated against registered event_types.
     # Common built-in types:
     #   "concentrate_military"  — move military assets toward a target location
-    #   "defend_location"       — prioritize defense of a specific feature
+    #   "defend_location"       — prioritize defense of a specific feature OR
+    #                              settlement_id (R18). When target is a
+    #                              settlement_id, propagation (L2/L2.5 §12
+    #                              step 1.5) reaches only that settlement's
+    #                              tagged garrison (military_unit_of ==
+    #                              settlement_id), leaving other settlements'
+    #                              garrisons unaffected.
     #   "pursue_faction"        — increase pressure against a target faction
     #   "open_trade"            — establish or expand trade with a target
     #   "cease_expansion"       — halt territorial expansion in a domain/direction
@@ -2754,7 +3267,7 @@ faction in the relevant domain.
 
 ---
 
-### Tool 12: `post_entity_directive`
+### Tool 14: `post_entity_directive`
 
 Issues a scoped, live-play directive to a single L3 entity, redirecting its
 `behavior_mode`/`behavior_parameters` (and for Tier 3, optionally its HFSM state)
@@ -2856,7 +3369,7 @@ entity field. Stores `previous_behavior_mode`/`previous_behavior_parameters` so 
 
 ---
 
-### Tool 13: `define_relationship`
+### Tool 15: `define_relationship`
 
 Creates or updates a structured agreement between factions: alliances, vassalage,
 empire or union membership, trade pacts, patronage, non-aggression, marriage pacts,
@@ -3018,11 +3531,13 @@ vassal/member faction as a subordinate node, with `tribute_rate` and
 
 | Tool | Auth | Purpose | Simulation Layers Touched |
 |---|---|---|---|
-| `set_world_orientation` | WM | One-time init: grid, climate, resource types | H3 grid, L0 params, registry |
+| `set_world_orientation` | WM | One-time init: grid, climate, resource types; enters authoring mode | H3 grid, L0 params, registry |
+| `set_player_start` | WM | One-time: coordinate origin for authoring-phase relative constraints | Generation constraint registry |
+| `finalize_world_generation` | WM | One-time: run procedural generation from declared constraints | All L0 layers (full generation) |
 | `define_world_concept` | WM | Register any world-specific type vocabulary | Registry only |
-| `alter_feature` | WM | Create/update/dissolve geographic & physical features | L0 cells, feature store, event log |
+| `alter_feature` | WM | Authoring: terrain constraint. Live: create/update/dissolve geographic & physical features | L0 cells, feature store, event log |
 | `define_entity` | WM | Create/update any named entity, including legendary | L3 EPL, combat injection table, L2 override handles |
-| `define_faction` | WM | Create/update any faction or collective | L2, L2.5, territory, event log |
+| `define_faction` | WM | Authoring: territory constraint. Live: create/update any faction or collective | L2, L2.5, territory, event log |
 | `define_rule` | WM | Create/update global event system production rules | Event rule engine |
 | `declare_world_state` | WM | Narrative facts, era, prophecies, history, task queue | World debt registry, event log, L2.5 norms |
 | `subscribe_to_events` | WM | Register forward-looking filters for re-engagement | Event evaluation step, notification queue |
@@ -3032,7 +3547,7 @@ vassal/member faction as a subordinate node, with `tribute_rate` and
 | `post_entity_directive` | WM | Issue a scoped behavior directive to one L3 entity | L3 entity behavior_mode, event log |
 | `define_relationship` | WM | Create/update structured inter-faction agreements | L2/L2.5 trust, profile blending, authority hierarchy |
 
-**Total WM tools: 13**
+**Total WM tools: 15**
 
 Key design decisions:
 - Every create/update pair is unified into a single upsert tool. The WM does not need
@@ -3118,3 +3633,40 @@ Key design decisions:
   `standing_effects` are re-applied every update step for as long as any faction
   holds the capability, layered on top of that faction's own registered flows,
   demographic rates, and combat parameters.
+- World generation is constraint satisfaction, not a black box (R17). `set_world_orientation`
+  establishes the grid and enters `"authoring"` mode; `set_player_start` fixes the
+  coordinate origin for relative constraints; the WM then authors geography
+  (`alter_feature`), settlement locations (`define_faction.settlements[]`), vocabulary
+  (`define_world_concept`), and lore (`declare_world_state`, `canon_constraint`)
+  exactly as in live play — these calls register constraints rather than create
+  content while in authoring mode. `finalize_world_generation` runs once, producing a
+  complete world satisfying every constraint (`constraint_priority="strict"` for
+  canon settings like Forgotten Realms, `"best_effort"` for original worlds), and
+  transitions to `"generated"` mode, after which the same tool calls operate on real
+  content. `review_only=true` validates constraints without committing.
+- Settlements are the atom of territory (R18, L2/L2.5 §2.5). Every faction at any
+  `social_complexity` has at least one settlement — a dwarf hold, goblin warren,
+  lich's tower, and capital city are the same structural object with different
+  `settlement_type` labels. `define_faction.settlements[]` replaces the old
+  independent `territory_cells` declaration; territory is derived from settlements'
+  `control_radius`. Combat (§4 Phase 3) can capture a specific settlement —
+  population share, institutions, resources, and latent `contains` transfer with it,
+  and territory recomputes for both factions — without affecting either faction's
+  other settlements. `military_unit_of` (R14) can scope a garrison to a specific
+  `settlement_id`, and `defend_location` intents can target one. WM-declared
+  territorial changes outside combat (vassalage concessions, narrative surrenders)
+  use `resolve_contradiction override_type="settlement_control"`.
+- Settlements leave a footprint on surrounding L1 fields (R19). `settlement_type`
+  (registered via `define_world_concept`) carries coefficients —
+  `deforestation_factor`, `hunting_factor`, `soil_modification_factor`,
+  `water_table_factor`, `hazard_modifier`, `population_suppression_factor`,
+  `ambient_material_extraction` — applied by a new L1 `SettlementFootprint` pass as
+  accumulating field changes within `control_radius`, scaled by `population_share`/
+  `settlement_tier`. Different settlement_types produce qualitatively different
+  footprints: a city deforests and depletes huntable fauna; a dwarf hold lowers the
+  water table with near-zero surface effect; a lich's tower suppresses nearby life
+  and raises hazard without deforestation or hunting at all. Because footprints are
+  accumulated changes to field base state rather than per-tick effects tied to the
+  settlement's existence, they outlast the settlement — ruins show lingering
+  deforestation that slowly regrows and a water table that may never recover,
+  governed by `recovery_rate_modifier`.

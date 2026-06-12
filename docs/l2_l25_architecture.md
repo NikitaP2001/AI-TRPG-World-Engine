@@ -35,6 +35,15 @@ recomputing the past. World time advances only as a consequence of player turn
 progression; the WM does not advance time himself and is not invoked on every advance.
 `subscribe_to_events` is his sole forward-looking mechanism, evaluated in §12 step 6.
 
+**Settlements are the atom of territory.** Every faction, at any `social_complexity`,
+has at least one settlement (§2.5) — a dwarf hold, a goblin warren, a lone wizard's
+tower, a capital city are all the same structural object with different
+`settlement_type` labels. `territory_cells` is derived from owned settlements'
+control radii, not declared independently. Conquest, vassalage concessions, and trade
+routing all operate on specific settlements rather than on abstract faction-wide
+territory — a war can transfer one border fortress without affecting the rest of
+either faction.
+
 ---
 
 ## Layer Map
@@ -155,9 +164,129 @@ intercepted, redirected, or absorbed by adjacent factions.
 
 ---
 
+### §2.5 Settlements
+
+**A settlement is the atomic unit of territory, present for every faction at any
+`social_complexity`.** A dwarf hold, a goblin warren, a lone lich's tower, a human
+village, a border fortress, and a capital megalopolis are all settlements — the
+`settlement_type` label differs, but structurally each is the same object: a located,
+faction-owned, capturable node. Every faction has at least one settlement from the
+moment it is defined; a proto-faction at `social_complexity 0.3` typically has exactly
+one (its warren/camp/lair *is* its territory), while a mature civilization has many.
+
+**Territory is derived from settlements, not declared independently.** A faction's
+`territory_cells` is the union of each owned settlement's `control_radius` — cells
+within that radius of the settlement's location. This replaces an independent
+`territory_cells` declaration: the WM declares settlements (each with a location and
+`control_radius`), and territory falls out as a computed property. This also resolves
+the R17 authoring-mode story cleanly — the WM declares *where settlements are* as
+generation constraints (a dwarf hold here, a lich tower there, a capital here), and
+faction borders emerge from that without a separate, potentially inconsistent
+territory declaration.
+
+**Settlement schema:**
+
+```
+settlement_id:      str
+faction_id:         str         # current owner. THIS is what changes on capture.
+settlement_type:    str         # world-defined: "city", "village", "fortress",
+                                 # "dwarf_hold", "lich_tower", "goblin_warren",
+                                 # "monastery", "megalopolis", (anything)
+location:           feature_id  # geographic record, created via alter_feature
+population_share:   float       # this settlement's portion of faction.population.
+                                 # Near-zero for settlements not about population
+                                 # (a lich's tower: a few undead servants, not a city)
+settlement_tier:    str         # derived from population_share via registered
+                                 # thresholds, OR fixed for non-population
+                                 # settlement_types (a lich_tower's tier doesn't
+                                 # change with population)
+control_radius:     float       # cells within this radius of location are part
+                                 # of faction.territory_cells via this settlement
+garrison:           {            # defensive strength at this settlement
+  "military_supply_share": float,  # this settlement's portion of faction's
+                                    # military_supply stock
+  "unit_entity_ids": list[str]     # L3 entities with military_unit_of ==
+                                    # this settlement_id (extends R14's tagging
+                                    # to settlement scope, not only faction scope)
+}
+institutions:       list[str]   # institution_ids (from define_faction.institutions)
+                                 # located at this settlement
+resources_present:  list[str]   # ore_type/flora_pft/fauna_species feature_ids
+                                 # within control_radius — what THIS settlement
+                                 # can extract, distinct from the faction's
+                                 # territory-wide totals
+contains:           dict        # latent contents revealed on capture, same
+                                 # schema as alter_feature.contains (R12) — a
+                                 # captured dwarf hold might reveal a forge,
+                                 # treasury, or dormant guardians
+```
+
+**Settlement growth and tier.** Each step, `population_share` grows/shrinks
+proportionally to `faction.population`'s overall growth rate (§2), modulated by
+local conditions at this settlement's location (soil_fertility, trade route health,
+recent combat). `settlement_tier` is recomputed from `population_share` against
+registered thresholds (`hamlet < 100`, `town < 1000`, `city < 10000`, ... — registered
+per `social_structure_type` or world-wide default). A settlement crossing a tier
+threshold fires a `narrative_flag` event. `settlement_type`s with
+`population_share ≈ 0` by design (a lich's tower, a forward fortress with only a
+garrison) have a fixed `settlement_tier` independent of this computation.
+
+**Settlement founding.** New settlements can be founded in two ways: WM declaration
+(`define_faction.settlements[]`, at any time — founding a new town is a normal live-
+play action) or autonomous founding when `faction.population` significantly exceeds
+the sum of existing settlements' capacity *and* suitable unclaimed territory exists
+adjacent to current `territory_cells` (read from L0 fields — not desert/ocean/
+mountain-interior). Autonomous founding fires `notify_wm_on_unlock`-style notification
+(`"after"`-timing by default; `subscribe_to_events` with `event_types:
+["settlement_founded"]` and `timing: "before"` lets the WM name it or adjust its
+location before it commits).
+
+**Settlement capture.** This is the mechanism by which "a settlement could go to
+another faction." When an L2 combat engagement (§4) targets a settlement and the
+defender's `garrison` is reduced below a `garrison_collapse_threshold`:
+
+```
+settlement.faction_id = attacker_faction_id
+# Transfers with the settlement:
+#   - population_share (attacker's faction.population stock increases by this
+#     amount; defender's decreases by the same — a population transfer, not
+#     creation/destruction)
+#   - institutions located here (now contribute to attacker's research/production)
+#   - resources_present (attacker's territory-wide resource access grows)
+#   - garrison.unit_entity_ids surviving the engagement: military_unit_of
+#     reassigned to attacker, OR released as independent/hostile entities
+#     per the attacker's post_entity_directive choice
+# Triggered:
+#   - contains is revealed (R12 discovery model — same mechanism as discovering
+#     a ruin, triggered by faction_id change instead of discover_location)
+#   - faction.territory_cells recomputed for both factions (control_radius
+#     union changes)
+#   - narrative_flag event: "[settlement] has fallen to [attacker]"
+```
+
+This is the concrete mechanism behind §10's *Conquest* event — "a faction's territory
+is absorbed" is now precisely "one or more settlements change `faction_id`, and
+territory is recomputed as a consequence." A war can transfer a single border
+fortress without affecting the rest of either faction's territory, or can cascade
+through many settlements in sequence.
+
+**Settlement-scoped relationships (R15).** A `define_relationship` of type
+`"vassalage"` or a negotiated peace can transfer specific settlements' `faction_id`
+as part of its `terms` — territorial concessions without full conquest, using the
+same capture mechanism but triggered by a relationship establishment rather than a
+combat outcome.
+
+**Trade between settlements (§3 revision).** The gravity model's `distance(i,j)` and
+`route_quality` are computed between specific settlements, not faction centroids — a
+capital is a trade hub; a border fortress is not. Trade disruption from a captured or
+besieged settlement is localized to routes terminating there, rather than affecting a
+faction's trade uniformly.
+
+---
+
 ### §3 Trade Model
 
-**Model: Gravity with Infrastructure Cap**
+**Model: Gravity with Infrastructure Cap, between settlements (§2.5)**
 
 ```
 raw_flow(i,j) = prosperity_i × prosperity_j / distance(i,j)²
@@ -168,32 +297,46 @@ infrastructure_cap = min(route_quality, border_crossing_capacity)
 relationship_modifier = f(L2_5.trust_matrix[i][j], diplomatic_status[i][j])
 ```
 
-`prosperity` is a derived aggregate of a faction's key stocks weighted by registered
+`i` and `j` range over **settlements**, not factions — `distance(i,j)` and
+`route_quality(i,j)` are computed between specific settlement locations. A capital
+with many institutions and a high `population_share` has high `prosperity` and acts
+as a trade hub; a border fortress with `population_share ≈ 0` contributes little to
+trade regardless of its faction's overall prosperity. Bilateral faction-level trade
+totals are the sum of flows across all settlement pairs between the two factions.
+
+`prosperity` of a settlement is a derived aggregate of the *fraction* of its
+faction's key stocks attributable to it (`population_share` for population-weighted
+stocks; `resources_present`-derived production for extraction stocks; institutions
+located here for research/knowledge-adjacent stocks), weighted by registered
 `trade_value` parameters, with `trade_value` for goods listed in an active
 `trade_pact`'s `terms.goods` multiplied by that pact's `terms.tariff_modifier` for
 flows between its parties. Stocks with `trade_value = 0` (political_legitimacy,
 social_cohesion, knowledge stocks) never participate in trade automatically.
 
-Trade flows are directional. Each faction exports surplus and imports deficit goods.
-The simulation finds bilateral flows that maximize aggregate surplus reduction across
-all pairs subject to infrastructure constraints, solved as an LP relaxation per tick.
+Trade flows are directional. Each settlement exports surplus and imports deficit
+goods, aggregated to faction-level stock changes. The simulation finds bilateral
+settlement-pair flows that maximize aggregate surplus reduction subject to
+infrastructure constraints, solved as an LP relaxation per step.
 
-`route_quality` between factions is computed from the feature store: the simulation
-finds the best path between faction centroids through navigable features and sums
-quality scores. Roads, rivers, mountain passes, and sea routes all contribute.
-Feature degradation from geological events or conflict degrades routes automatically.
+`route_quality(i,j)` between settlements is computed from the feature store: the
+simulation finds the best path between the two settlements' locations through
+navigable features and sums quality scores. Roads, rivers, mountain passes, and sea
+routes all contribute. Feature degradation from geological events or conflict
+degrades routes automatically.
 
-**Trade disruption** fires when `actual_flow` drops below 50% of previous tick's
-value. This event propagates to L2.5 (relationship pressure) and can trigger entity
-spawning (merchants diverting, scouts investigating).
+**Trade disruption** fires when a settlement-pair's `actual_flow` drops below 50% of
+the previous step's value — localized to routes terminating at a besieged or captured
+settlement (§2.5) rather than affecting a faction's trade uniformly. This event
+propagates to L2.5 (relationship pressure) and can trigger entity spawning (merchants
+diverting, scouts investigating).
 
 ---
 
 ### §4 Large-Scale Combat
 
-**Model: Generalized Lanchester with Pre-Engagement Injection**
+**Model: Generalized Lanchester with Pre-Engagement Injection and Settlement Capture**
 
-Two phases run in sequence:
+Three phases run in sequence:
 
 **Phase 1 — Pre-engagement modification.** Before any Lanchester calculation, all
 registered `pre_engagement_effects` from L3 entities present in the engagement zone
@@ -232,13 +375,39 @@ Integration runs for `engagement_duration_ticks` with adaptive Euler step. Outco
 halves effective strength immediately and enters RETREAT behavior on all L3 units.
 
 **Supply attrition.** Engaged forces draw from their faction's `military_supply` stock
-each engagement tick. Supply below `supply_critical_threshold` accelerates morale decay
-and reduces lethality. This connects combat to economics without explicit logistics
-entities for every army.
+each engagement step. Supply below `supply_critical_threshold` accelerates morale
+decay and reduces lethality. This connects combat to economics without explicit
+logistics entities for every army.
 
 **Asymmetric entity immunity.** Entities with `"lanchester_attrition"` in their
 `immunities` list are not reduced by Lanchester. They must be eliminated through
 specific L3 interaction rules. Non-immune force elements are still affected normally.
+
+**Phase 3 — Settlement capture (§2.5).** Every engagement is associated with a
+`target_settlement_id` (the settlement under attack — siege, raid, or invasion).
+After Phase 2's integration completes:
+
+```
+if defender's effective_strength_at_settlement (A_final or B_final, whichever
+   corresponds to the settlement's garrison) < garrison_collapse_threshold:
+
+    settlement.faction_id = attacker_faction_id
+    # population_share, institutions, resources_present, contains transfer
+    # per §2.5's capture mechanism
+    # faction.territory_cells recomputed for both parties
+    # narrative_flag event fires
+
+else:
+    # garrison survives; settlement.faction_id unchanged
+    # garrison's military_supply_share and unit_entity_ids reflect attrition
+    # from Phase 2
+```
+
+A single engagement captures at most one settlement. A campaign against a faction
+with multiple settlements is a sequence of engagements, each with its own
+`target_settlement_id` — this is what allows a war to transfer a single border
+fortress without cascading to the rest of either faction's territory, or to cascade
+through many settlements if each falls in turn.
 
 **Alliance mutual defense (R15).** If a faction with active engagements is party to
 a `define_relationship` of type `"alliance"` with `terms.mutual_defense = true`, each
@@ -689,9 +858,14 @@ fires. A new entity (named or stub) is inserted at the same node. The new entity
 `leadership_profile` replaces the dissolved entity's contribution to the effective
 decision profile.
 
-*Conquest:* a faction's territory is absorbed. The conquered faction's authority
-hierarchy becomes a subordinate subtree of the conqueror's. Their council_members
-become vassals with reduced `authority_weight`.
+*Conquest:* one or more settlements change `faction_id` via §4 Phase 3 / §2.5 capture.
+If the conquered faction's *capital* settlement (or all of its settlements) is
+captured, its authority hierarchy becomes a subordinate subtree of the conqueror's
+and its council_members become vassals with reduced `authority_weight` — full
+conquest. If only some settlements are captured (a border war), the conquered
+faction's authority hierarchy is unaffected; only `territory_cells` and the
+transferred settlements' contributions to stocks/institutions change for both
+parties.
 
 *Coup:* an entity with sufficient military/institutional support displaces the root
 node. Requires `stability_score` below `coup_threshold`. The new root's profile
@@ -759,13 +933,17 @@ steps below produce forward-only state changes.
    - Evaluate expires_condition and revoke_condition for each; remove expired/revoked
    - Build constrained objective function for each faction
 
-1.5. MILITARY INTENT PROPAGATION (R14)
+1.5. MILITARY INTENT PROPAGATION (R14, §2.5)
    - For each active military-domain intent_declaration (concentrate_military,
      defend_location, retreat, pursue_faction):
-     - Find all L3 entities with military_unit_of == faction_id
+     - Find all L3 entities with military_unit_of == faction_id, AND all
+       entities with military_unit_of == settlement_id for any settlement
+       owned by this faction (settlement-scoped tagging, §2.5 garrison)
      - Issue a matching behavior_mode/behavior_parameters update to each,
        subject to the same priority_over_own_rules consideration as
        post_entity_directive (an entity's own higher-priority rules may contest)
+   - defend_location targeting a specific settlement_id propagates only to
+     that settlement's tagged units, leaving other garrisons unaffected
    - This keeps the faction's L2 aggregate accounting and its visible L3 units
      consistent without a separate WM call per unit
 
@@ -807,16 +985,32 @@ steps below produce forward-only state changes.
       including tribute_rate and subsidy_flows from active relationships (step 1.6)
    b. Run demographic transition (population change)
    c. Propagate migration_out events → spawn refugee_group L3 entities
-   d. Run trade gravity model for all faction pairs
+   d. Run trade gravity model for all settlement pairs (§3 revision, §2.5)
    e. Check capability prerequisites for all factions
       - For any capability where ALL prerequisites now met: unlock it
       - Notify WM if notify_wm_on_unlock = true
-   f. Run Lanchester for active engagements:
+   f. Run Lanchester for active engagements (each associated with a
+      target_settlement_id, §4):
       i.  Collect pre_engagement_effects from L3 entities in zone
       ii. Apply phase-1 modifications to combatant parameters
       iii. Run Lanchester equations for the engagement's configured duration
       iv. Apply attrition to military stocks
+      v.  Phase 3: evaluate settlement capture against
+          target_settlement_id's garrison (§2.5, §4)
    g. Apply L2 production modifier from previous step's L2.5 institutional_health
+   h. SETTLEMENT UPDATE (§2.5)
+      - For each settlement: update population_share proportionally to
+        faction.population's growth rate (step b), modulated by local
+        conditions at the settlement's location
+      - Recompute settlement_tier from population_share against registered
+        thresholds; fire narrative_flag on tier change
+      - Check autonomous settlement founding: if faction.population
+        significantly exceeds existing settlements' total capacity and
+        suitable unclaimed adjacent territory exists, found a new settlement
+        (subject to subscribe_to_events event_types=["settlement_founded"])
+      - Recompute faction.territory_cells as the union of all owned
+        settlements' control_radius (both for factions gaining/losing
+        settlements via step f.v this step, and for normal growth)
 
 3. L2.5 SOCIAL UPDATE
    a. Run Deffuant opinion dynamics for all stratum pairs
@@ -852,7 +1046,7 @@ steps below produce forward-only state changes.
 
 6. SUBSCRIPTION EVALUATION (R13, R15)
    - For each pending state change produced by steps 2-5, check active
-     subscribe_to_events filters (WM tool 8), including event_payload_filters
+     subscribe_to_events filters (WM tool 10), including event_payload_filters
      matching against the change's payload fields (project_id, capability_id,
      myth_id, feature_id, or other world-defined keys)
    - "before"-timing matches: hold this specific change's effects pending;
@@ -881,31 +1075,47 @@ granularity of a single update pass.
 
 ### §13 Complexity Scaling
 
-`social_complexity` on `define_faction` determines active subsystems:
+`social_complexity` on `define_faction` determines active subsystems. Every tier
+0.1+ has at least one settlement (§2.5) — a settlement is not itself a complexity
+feature; even the lowest complexity tiers with faction identity are anchored to a
+location (a warren, a lair, a camp) that can be found and captured.
 
 ```
-0.0       Pure L1 ecology. Population counts only. No L2/L2.5 computation.
+0.0       Pure L1 ecology. Population counts only. No L2/L2.5 computation,
+          no settlement (a wild animal population has no "lair" settlement —
+          if a notable individual's den should be capturable/visitable, register
+          it directly as an alter_feature with discovery_required, R12, not
+          as a settlement).
 
 0.1–0.2   Emergent raiding. L1 population + faction identity + one stock
-          (food_pressure). One rule: raid when food_pressure > threshold.
+          (food_pressure) + one settlement (the raiding band's camp/warren).
+          One rule: raid when food_pressure > threshold.
           No knowledge, no research, no L2.5.
 
 0.3–0.4   Proto-faction. Basic stocks and flows. Simple raiding/territory rules.
+          One settlement typically holds the entire population (population_share
+          ≈ 1.0) — the tribe's settlement IS its territory.
           L2.5 initialized with one stratum. Named leaders activate profile.
-          Suitable for goblin tribes, feral constructs, primitive clans.
+          Suitable for goblin tribes, feral constructs, primitive clans,
+          a lone wizard's tower (settlement_type "lich_tower" or similar,
+          population_share ≈ 0, garrison = the wizard + guardians).
 
 0.5–0.6   Emergent civilization. Full L2 stocks, flows, and trade.
+          Multiple settlements possible; settlement founding (§2.5) may
+          begin firing as population grows.
           L2.5 with faction identity, norms, simple trust.
           Knowledge system active but no research institutions yet.
           Suitable for barbarian confederacies, nomadic empires.
 
 0.7–0.9   Mature civilization. Full L2 including research tree and capability unlocks.
+          Multiple settlements with tiered hierarchy (capital, towns, fortresses).
           Full L2.5 with institutions and authority hierarchy.
           Research institutions operate; L2 assigns projects autonomously.
           WM can define a full research tree for this faction.
 
 1.0       Full complexity. All subsystems active. Complex succession, trade
-          networks, full knowledge economy, capability unlock system.
+          networks, full knowledge economy, capability unlock system,
+          settlement-precise conquest and trade routing.
 ```
 
 `complexity_threshold` enables automatic progression: when population exceeds the
@@ -948,12 +1158,15 @@ than one with 30 fully-complex factions.
 **→ To Query API:**
 - `get_region()` → `faction_control`, `settlements`, `social_context`
 - `get_faction_state()` → all L2/L2.5 state including knowledge stocks, capabilities,
-  and visible_projects (research_projects whose discoverability conditions are met)
+  visible_projects (research_projects whose discoverability conditions are met),
+  and settlements (§2.5) owned by this faction
 - `get_social_context()` → norm_vector, trust_baseline, and myth_vector for
   stratum/location
 - `get_events()` → L2/L2.5 events filtered by type, faction, severity
 - `query_world_state(query_type="entities")` → filterable roster of L3 entities,
-  including by `military_unit_of` and `faction_id`
+  including by `military_unit_of` (faction_id or settlement_id, §2.5) and `faction_id`
+- `query_world_state(query_type="settlements")` → filterable roster of settlements
+  (settlement_type, faction_id, settlement_tier, min_population_share)
 
 **← WM intent_declarations (via post_intent):**
 - Modify L2 objective function without disabling it

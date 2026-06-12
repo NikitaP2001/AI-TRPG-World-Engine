@@ -38,6 +38,12 @@ independent feature.
 6. **Migration as L1 dynamics.** Species ranges should shift with `habitat_suitability`
    changes (climate drift, vegetation succession) — currently nothing models
    population redistribution.
+7. **Settlement footprint (R19).** Settlements (L2/L2.5 §2.5) only consume L1/L0
+   fields — nothing lets a settlement's existence modify the surrounding
+   `canopy_density`/`biomass`/`soil_fertility`/`water_table_depth`/
+   `population_density[species]`/`hazard_level`. A city should deforest and deplete
+   local wildlife; a dwarf hold should lower the water table; a lich's tower should
+   suppress nearby life — and these footprints should outlast the settlement.
 
 This document designs all six, following the same architectural patterns as the
 existing four features (continuous fields, persistent effects, two-phase tick,
@@ -119,6 +125,14 @@ class FaunaSpeciesDef:
     drops: List[dict] = field(default_factory=list)
     # [{ "stock_id": str, "quantity": float, "probability": float,
     #    "condition": str }]
+
+    huntable: bool = True
+    # Whether settlements' hunting_factor (R19, §10) applies to this species.
+    # Most fauna are huntable by default. Set false for species a
+    # settlement_type's hunting shouldn't touch regardless of proximity
+    # (a sacred/protected species in a given culture would instead be
+    # modeled via a faction-specific rule or canon_constraint, not here —
+    # this flag is the world-wide physical default).
 
     # ── Migration ────────────────────────────────────────────────────
     migration_rate: float = 0.05  # max fraction of local population that can
@@ -396,20 +410,169 @@ proto-faction's territory to become unsuitable for its founding species — a
 narratively rich slow-motion event (the orcs' homeland is drying out) that emerges
 from physics rather than being scripted.
 
+### §10 Settlement Footprint (R19)
+
+**The reverse direction.** Everything above is L1/L0 fields feeding L2 (extraction,
+habitat, hazard). Nothing yet lets an L2 settlement's existence modify the L1 fields
+around it. A `SettlementFootprint` pass closes this — structurally it is "one more L1
+feature," reading `define_faction.settlements[]` from the feature store (just as
+`Lake`/`Wetland` read their own feature-store records) and writing field effects
+within each settlement's `control_radius`.
+
+```python
+class SettlementFootprint(Feature):
+    """One instance per settlement. Reads settlement_type coefficients
+    (registered via define_world_concept), writes accumulating field
+    changes scaled by population_share/settlement_tier within
+    control_radius.
+    """
+
+    def __init__(self, settlement_id: str, faction_id: str,
+                 settlement_type: str, location: tuple,
+                 control_radius: float, population_share: float,
+                 settlement_tier: str, feature_id: str = ""):
+        ...
+```
+
+**Accumulating, not reapplied — this is the critical difference from existing L1
+effects.** `Vegetation`'s canopy/biomass effects (§ vegetation.py) are recomputed
+fresh every tick from current climate — if `Vegetation` stopped running, its
+persistent effects would simply not be re-added next tick and would vanish (per
+`SimEngine.step()` Phase 1: "Clear ALL persistent effects — fresh slate"). A
+settlement's footprint must NOT work this way, or a captured/dissolved settlement's
+footprint would vanish the instant it does — wrong for "ruins show lingering
+deforestation."
+
+Instead, `SettlementFootprint.compute_effects()` writes a **small incremental delta
+to the field's stored base value** each step — the same mechanism `Vegetation`
+already uses for its slow soil-fertility litterfall feedback (`soil_mut.add_persistent
+(lat, lon, radius_deg=..., strength=om_delta)` where `om_delta` is a small per-tick
+increment, accumulating over many ticks into a substantial change). The settlement's
+effect on `canopy_density`/`biomass`/`soil_fertility`/`water_table_depth`/
+`population_density[species]` is this same kind of slow accumulating delta — written
+to `CellData`'s stored fields at end-of-step (§10 of `_run_l1_step`, alongside
+`Vegetation`'s existing soil-fertility writeback), not as a per-tick
+`MutableField.add_persistent` effect re-derived from the settlement's current state.
+
+```
+Each L1 step, for each active settlement:
+    intensity = population_share_normalized × tier_multiplier[settlement_tier]
+    coeffs = SETTLEMENT_TYPE_REGISTRY[settlement_type]
+
+    # Deforestation — accumulating reduction toward a floor (can't deforest
+    # below 0)
+    for cell in cells_within(location, control_radius):
+        cell.canopy_density -= coeffs.deforestation_factor × intensity × dt
+        cell.canopy_density = max(0.0, cell.canopy_density)
+        cell.biomass_kgm2 -= coeffs.deforestation_factor × intensity × dt × biomass_scale
+        cell.biomass_kgm2 = max(0.0, cell.biomass_kgm2)
+
+    # Soil modification — within a smaller "farmland_ring" for cultivating
+    # types; can be positive (cultivation) or negative (extraction-only)
+    for cell in cells_within(location, farmland_radius(coeffs, control_radius)):
+        cell.soil_fertility += coeffs.soil_modification_factor × intensity × dt
+        cell.soil_fertility = clamp(cell.soil_fertility, 0.0, 1.0)
+
+    # Water table — typically negative for mining settlement_types
+    for cell in cells_within(location, control_radius):
+        cell.water_table_depth += coeffs.water_table_factor × intensity × dt
+        # no clamp — can go arbitrarily deep; this is the "may never recover" case
+
+    # Hunting and population suppression — written to population_density
+    # fields (§1), same accumulating-delta treatment
+    for species_id, pop_field in population_density_fields.items():
+        huntable = FAUNA_REGISTRY[species_id].huntable  # new field, §2 extension
+        delta = 0.0
+        if huntable:
+            delta += coeffs.hunting_factor × intensity × dt
+        delta += coeffs.population_suppression_factor × intensity × dt
+        # applied as -delta to population_density within control_radius
+
+    # Ambient material extraction — depletes set_world_orientation
+    # ambient_rare_materials fields, same accumulating treatment, within
+    # control_radius, for materials listed in coeffs.ambient_material_extraction
+
+    # Hazard — typically near-zero or slightly negative (garrisons clear
+    # hazards) for ordinary settlements, strongly positive for "unnatural"
+    # types (lich_tower)
+    for cell in cells_within(location, control_radius):
+        cell.hazard_level += coeffs.hazard_modifier × intensity × dt
+        cell.hazard_level = clamp(cell.hazard_level, 0.0, 1.0)
+```
+
+**Recovery after abandonment.** Once a settlement is captured/dissolved (§2.5), its
+`SettlementFootprint` instance is removed from the engine — no further deltas are
+applied. The *accumulated* state remains in `CellData` and recovers via each field's
+own existing dynamics, scaled by `recovery_rate_modifier`:
+
+- `canopy_density`/`biomass` recover via `Vegetation`'s normal equilibrium-seeking
+  computation (§ vegetation.py `compute_vegetation_cell`) — abandoned farmland
+  gradually returns toward the climate-determined canopy/biomass for that cell.
+  `recovery_rate_modifier` can slow this (a magically blighted clearing regrows
+  slower than a mundane one) by damping how far `compute_vegetation_cell`'s result
+  is allowed to move per step while recovery is active.
+- `population_density[species]` recovers via §9's migration mechanism — species
+  redistribute back into the formerly-suppressed cells as `habitat_suitability`
+  there is no longer artificially lowered (once `population_suppression_factor`'s
+  accumulated effect is no longer being reinforced, it should itself decay — see
+  below).
+- `soil_fertility` recovers slowly via `Vegetation`'s litterfall feedback — the same
+  mechanism that produced cultivation's positive modification in the first place,
+  now running in reverse (regrowing vegetation's litter rebuilds fertility).
+- `water_table_depth` has **no general recovery mechanism** in `Groundwater` —
+  consistent with mining-drained water tables being a genuinely permanent landscape
+  scar in most settings. `recovery_rate_modifier` can enable slow recovery for
+  settlement_types where it's narratively appropriate (a dwarf hold's drainage
+  tunnels collapsing and resealing over centuries), but the default is 0 recovery for
+  `water_table_factor` effects specifically, even when `recovery_rate_modifier` is
+  nonzero for other fields of the same settlement_type.
+
+**Accumulated-effect decay.** Even the accumulating deltas above (`canopy_density -=
+...`, etc.) need their *own* slow decay once the settlement is gone — otherwise an
+abandoned city's deforestation is a permanent fixed offset that vegetation's
+equilibrium-seeking can approach but never fully overcome if the offset itself
+persists unchanged. The simplest correct model: while a settlement is active, each
+step's footprint delta is applied AND a small fraction of the *total accumulated*
+footprint for that settlement decays back toward zero (representing constant upkeep
+— a living city actively maintains its cleared land, so net deforestation reaches an
+equilibrium rather than growing forever). Once the settlement is gone, only the decay
+term remains, scaled by `recovery_rate_modifier` — this is what makes abandoned land
+recover at a *bounded* rate rather than either snapping back instantly or staying
+permanently scarred (except `water_table_depth`, by design, per above).
+
 ---
 
 ## Part IV — TimeEngine Integration
 
-### §10 `_run_l1_step` Changes
+### §11 `_run_l1_step` Changes
 
 ```python
 # Existing imports plus:
 from .layer1.features.fauna import Fauna
 from .layer1.fauna_registry import FAUNA_REGISTRY
+from .layer1.features.settlement_footprint import SettlementFootprint
+from .layer1.settlement_type_registry import SETTLEMENT_TYPE_REGISTRY
 
 # After Vegetation is added:
 for species_id in FAUNA_REGISTRY:
     engine.add_feature(Fauna(species_id))
+
+# Add one SettlementFootprint instance per settlement (R19), read from
+# each faction's define_faction.settlements[] (feature store / WorldDB)
+for faction in self.db.load_factions():
+    for settlement in faction["settlements"]:
+        engine.add_feature(SettlementFootprint(
+            settlement_id=settlement["settlement_id"],
+            faction_id=faction["faction_id"],
+            settlement_type=settlement["settlement_type"],
+            location=settlement["location"],  # resolved feature_id -> lat/lon
+            control_radius=settlement["control_radius"],
+            population_share=settlement["population_share"],
+            settlement_tier=settlement["settlement_tier"],
+        ))
+# A settlement captured/dissolved this step simply has no SettlementFootprint
+# instance added next step — its accumulated CellData changes remain and
+# recover per §10's decay/recovery model, with no special removal logic needed.
 
 # After engine.step(dt=...):
 # Propagate population_density fields back to fauna_populations table
@@ -435,7 +598,15 @@ default=0.0))` for each registered species, populated from
 `load_fauna_populations(species_id)` rather than `from_cells` (since population isn't
 a `CellData` attribute).
 
-### §11 Performance Note
+`SettlementFootprint.compute_effects()` (§10) writes directly to `cell.canopy_density`,
+`cell.biomass_kgm2`, `cell.soil_fertility`, `cell.water_table_depth`, and
+`cell.hazard_level` on the `CellData` objects in `cells` — the same writeback
+mechanism `Vegetation` already uses for its soil-fertility litterfall feedback —
+plus accumulating deltas to `population_density[species_id]` fields via the
+`MutableField` persistent-effect mechanism (§1), since those aren't `CellData`
+attributes.
+
+### §12 Performance Note
 
 §9's migration pass is O(cells × neighbors × species) — at `_LAT_STEP/_LON_STEP = 2.0`
 sampling (~16,000 sample points globally) with, say, 20 registered species, this is
@@ -463,10 +634,13 @@ for first implementation.
 | `check_fauna_emergence()` | `layer1/emergence.py` (new) | R4 proto-faction spawn trigger, §7 |
 | `encounter_probability` | derived query, not stored | L1→L2 hazard feedback, §8 |
 | L2 extraction flows | `define_faction.flows` (WM-authored) | `harvest_yield`/population extraction, §6 |
+| `SETTLEMENT_TYPE_REGISTRY` | `layer1/settlement_type_registry.py` (new) | WM-registered footprint coefficients (R19), via `define_world_concept concept_type="settlement_type"` |
+| `SettlementFootprint` feature | `layer1/features/settlement_footprint.py` (new) | One instance per settlement; accumulating deforestation/hunting/soil/water-table/hazard effects within `control_radius`, §10 |
 
-This closes all six gaps identified in "Current State" using only patterns already
-established by the existing four L1 features — no new architectural concepts beyond
-what `Vegetation`/`Lake`/`Wetland`/`Groundwater` already demonstrate, and full
-consistency with the WM tools (`fauna_species` registration), L2/L2.5
-(`current_population`, `encounter_probability`, complexity scaling §13), and L3
-(`drops`, termination-driven item creation) specifications already written.
+This closes all six original gaps plus the settlement-footprint gap (R19) using only
+patterns already established by the existing four L1 features — no new architectural
+concepts beyond what `Vegetation`/`Lake`/`Wetland`/`Groundwater` already demonstrate,
+and full consistency with the WM tools (`fauna_species`, `settlement_type`
+registration), L2/L2.5 (`current_population`, `encounter_probability`, complexity
+scaling §13, settlements §2.5), and L3 (`drops`, termination-driven item creation)
+specifications already written.

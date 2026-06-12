@@ -13,9 +13,9 @@ from typing import Any, Dict, List, Optional
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
 from memory_store import append_message, load_history, limits_from_env
-from openrouter_langchain_logging import logs_enabled
+from openrouter_langchain_logging import logs_enabled, _safe_label
 from openrouter_llm import build_openrouter_chat_llm, openrouter_logging_callbacks, read_prompt_text
-from gm.react_loop import coerce_tool_calls
+from gm.react_loop import coerce_tool_calls, react_loop_iteration
 
 
 WORLD_SETTING_FIELDS = [
@@ -25,8 +25,69 @@ WORLD_SETTING_FIELDS = [
 ]
 
 
+# ======================================================================
+# Invocation log helper
+# ======================================================================
+
+
+def _invocation_log_dir() -> Path:
+    """Directory for full prompt+output logs per WM invocation."""
+    base = Path("logs") / "wm_invocations"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _dump_invocation(
+    tag: str,
+    prompt_text: str,
+    all_messages: List[BaseMessage],
+    raw_result: dict,
+    thinking: str,
+) -> None:
+    """Dump full WM invocation (prompt + messages + result + thinking) to a log file."""
+    from datetime import datetime, timezone
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    safe_tag = _safe_label(tag)[:40]
+    log_path = _invocation_log_dir() / f"wm_{ts}_{safe_tag}.json"
+
+    msgs_serializable = []
+    for m in all_messages:
+        entry = {"role": type(m).__name__, "content": str(m.content)}
+        if hasattr(m, "tool_calls") and m.tool_calls:
+            entry["tool_calls"] = [
+                {"name": tc.get("name", ""), "args": tc.get("args", {})}
+                for tc in m.tool_calls
+            ]
+        msgs_serializable.append(entry)
+
+    log = {
+        "tag": tag,
+        "timestamp": ts,
+        "prompt_text": prompt_text,
+        "messages": msgs_serializable,
+        "result": {
+            "exit_tool": raw_result.get("exit_tool"),
+            "exit_args": raw_result.get("exit_args"),
+        },
+        "thinking": thinking,
+    }
+
+    try:
+        log_path.write_text(json.dumps(log, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+# ======================================================================
+
+
 class WorldManager:
-    """World Manager agent — defines and maintains the core world setting."""
+    """World Manager agent — defines and maintains the core world setting.
+
+    Two invocation modes:
+      create_world_setting()  — startup: generates world essence/GURPS/time
+      call_wm()               — subscription-triggered: responds to world events
+    """
 
     def __init__(
         self,
@@ -38,6 +99,8 @@ class WorldManager:
         self._prompt_text = read_prompt_text(prompt_path)
         self._temperature = temperature
         self._history_path = history_path
+        self._last_call_tick: int = 0
+        self._last_summary: str = ""
 
     def create_world_setting(
         self,
@@ -324,3 +387,301 @@ class WorldManager:
             )
         except Exception:
             pass
+
+    # ── ReAct-based invocation (world events / subscription triggers) ──
+
+    def initialize_world(
+        self,
+        *,
+        context: Optional[Dict[str, Any]] = None,
+        tools: Optional[List[Any]] = None,
+    ) -> Dict[str, Any]:
+        """First-time WM invocation to define concepts, factions, rules, entities.
+
+        Args:
+            context: Optional dict with characters, plot info.
+            tools: Override tool list (defaults to all WM tools).
+
+        Returns:
+            Dict with "exit_tool", "exit_args", "thinking".
+        """
+        return self.call_wm(
+            notice="initialize_world",
+            context=context,
+            tools=tools,
+        )
+
+    def call_wm(
+        self,
+        *,
+        notice: str,
+        context: Optional[Dict[str, Any]] = None,
+        tools: Optional[List[Any]] = None,
+        llm: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Invoke WM with a notice via ReAct loop. WM uses tools until termination.
+
+        Args:
+            notice: Why WM was called.
+            context: Optional dict with subscription_trigger, event_summary,
+                     pending_events, faction_snapshot, world_debt, etc.
+            tools: Override tool list (defaults to all WM tools).
+            llm: Optional LLM instance.
+
+        Returns:
+            Dict with: "exit_tool" (str|None), "exit_args" (dict|None), "thinking" (str).
+        """
+        if llm is None:
+            llm = build_openrouter_chat_llm(
+                temperature=float(self._temperature),
+                streaming=True,
+                title_suffix="-world-manager",
+                max_tokens=4000,
+                parallel_tool_calls=False,
+            )
+
+        from world_manager.tools import (
+            ready_to_proceed,
+            answer_world_question,
+            read_tool_doc,
+            set_world_orientation,
+            set_player_start,
+            finalize_world_generation,
+            define_world_concept,
+            alter_feature,
+            define_entity,
+            define_faction,
+            define_rule,
+            declare_world_state,
+            subscribe_to_events,
+            query_world_state,
+            resolve_contradiction,
+            post_intent,
+            post_entity_directive,
+            define_relationship,
+        )
+
+        all_tools = tools or [
+            ready_to_proceed,
+            answer_world_question,
+            read_tool_doc,
+            set_world_orientation,
+            set_player_start,
+            finalize_world_generation,
+            define_world_concept,
+            alter_feature,
+            define_entity,
+            define_faction,
+            define_rule,
+            declare_world_state,
+            subscribe_to_events,
+            query_world_state,
+            resolve_contradiction,
+            post_intent,
+            post_entity_directive,
+            define_relationship,
+        ]
+
+        tools_by_name = {t.name: t for t in all_tools}
+        llm_with_tools = llm.bind_tools(all_tools).with_config({
+            "callbacks": openrouter_logging_callbacks(scope="world_manager", label="call_wm"),
+        })
+
+        # ── Build intro message ────────────────────────────────────
+        intro_parts = [f"[call_wm: {notice}]"]
+
+        # Elapsed time since last call
+        elapsed_days = 0
+        if context and context.get("world_time"):
+            # Orchestrator provides days_since_last_call
+            elapsed_days = context.get("days_since_last_call", 0)
+
+        if elapsed_days > 0:
+            intro_parts.append(f"World time advanced {elapsed_days} days since last call.")
+
+        # Reason for this call
+        if notice == "initialize_world":
+            intro_parts.append("Reason: first invocation — world initialization.")
+        elif notice == "fallback_tick":
+            intro_parts.append("Reason: fallback interval expired — no subscribed events fired.")
+        elif context and context.get("subscription_trigger"):
+            st = context["subscription_trigger"]
+            intro_parts.append("Reason: subscription match.")
+            intro_parts.append(
+                "[trigger]\n"
+                f"  filter_id: {st.get('filter_id', '?')}\n"
+                f"  event_type: {st.get('event_type', '?')}\n"
+                f"  timing: {st.get('timing', 'after')}\n"
+                f"  payload: {json.dumps(st.get('payload', {}), ensure_ascii=False)}"
+            )
+        else:
+            intro_parts.append(f"Reason: {notice}.")
+
+        # Last summary from previous invocation
+        if self._last_summary:
+            intro_parts.append(f"\n[last_summary]\n{self._last_summary}")
+
+        human_msg = "\n".join(intro_parts)
+
+        # ── Build remaining messages ────────────────────────────────
+
+        # Persistent context
+        persistent = []
+        if context and context.get("world_registry"):
+            persistent.append(SystemMessage(
+                content=f"[world_registry]\n{json.dumps(context['world_registry'], indent=2)}"
+            ))
+        if context and context.get("world_orientation"):
+            persistent.append(SystemMessage(
+                content=f"[world_orientation]\n{json.dumps(context['world_orientation'], indent=2)}"
+            ))
+
+        # History: previous WM write-tool calls (reads are NOT saved)
+        history_msgs: List[BaseMessage] = []
+        if self._history_path and self._history_path.exists():
+            history = load_history(self._history_path)
+            for h in history:
+                role = (h.get("role") or "").strip().lower()
+                content = str(h.get("content") or "")
+                if role == "user":
+                    history_msgs.append(HumanMessage(content=content))
+                elif role == "assistant":
+                    history_msgs.append(AIMessage(content=content))
+
+        # Invocation context (fresh each call)
+        invocation = []
+        if context:
+            if context.get("subscription_trigger"):
+                invocation.append(SystemMessage(
+                    content=f"[subscription_trigger]\n{json.dumps(context['subscription_trigger'], indent=2)}"
+                ))
+            if context.get("event_summary"):
+                invocation.append(SystemMessage(
+                    content=f"[event_summary]\n{context['event_summary']}"
+                ))
+            if context.get("pending_events"):
+                invocation.append(SystemMessage(
+                    content=f"[pending_events]\n{json.dumps(context['pending_events'], indent=2)}"
+                ))
+            if context.get("faction_snapshot"):
+                invocation.append(SystemMessage(
+                    content=f"[faction_snapshot]\n{json.dumps(context['faction_snapshot'], indent=2)}"
+                ))
+            if context.get("world_debt"):
+                invocation.append(SystemMessage(
+                    content=f"[world_debt]\n{json.dumps(context['world_debt'], indent=2)}"
+                ))
+            if context.get("active_intents"):
+                invocation.append(SystemMessage(
+                    content=f"[active_intents]\n{json.dumps(context['active_intents'], indent=2)}"
+                ))
+
+        # ── Assemble and invoke ──────────────────────────────────────
+
+        messages = [
+            SystemMessage(content=self._prompt_text),
+            *persistent,
+            *history_msgs,
+            *invocation,
+            HumanMessage(content=human_msg),
+        ]
+
+        result = react_loop_iteration(
+            messages,
+            llm_with_tools,
+            tools_by_name,
+            termination_tools={"ready_to_proceed", "answer_world_question"},
+            readonly_tools={
+                "query_world_state", "read_tool_doc",
+            },
+        )
+
+        # ── Extract thinking ─────────────────────────────────────────
+
+        thinking_parts = []
+        for m in result["messages"]:
+            t = str(getattr(m, "type", "") or "").strip().lower()
+            content = str(getattr(m, "content", "") or "").strip()
+            if t in {"ai", "assistant"} and content:
+                thinking_parts.append(content)
+
+        thinking = "\n\n".join(thinking_parts)
+
+        # ── Log full invocation ──────────────────────────────────────
+
+        _dump_invocation(
+            tag=notice,
+            prompt_text=self._prompt_text,
+            all_messages=messages,
+            raw_result=result,
+            thinking=thinking,
+        )
+
+        # ── Persist to history (only write-tools, not reads) ────────
+        WRITE_TOOLS = {
+            "set_world_orientation", "set_player_start",
+            "finalize_world_generation",
+            "define_world_concept", "alter_feature",
+            "define_entity", "define_faction", "define_rule",
+            "declare_world_state", "subscribe_to_events",
+            "resolve_contradiction", "post_intent",
+            "post_entity_directive", "define_relationship",
+        }
+
+        if self._history_path:
+            limits = limits_from_env()
+            # Save the intro as user message
+            append_message(self._history_path, role="user", content=human_msg, limits=limits)
+
+            # Extract exit args from result messages
+            exit_tool_name = result.get("exit_tool", "")
+            exit_tool_args = result.get("exit_args") or {}
+
+            # Save write-tool calls from the ReAct loop (chronological order)
+            for m in result["messages"]:
+                t = str(getattr(m, "type", "") or "").strip().lower()
+                if t in {"ai", "assistant"}:
+                    tcalls = getattr(m, "tool_calls", None) or []
+                    for tc in tcalls:
+                        name = str(tc.get("name", "") or "")
+                        if name in WRITE_TOOLS:
+                            args = tc.get("args", {}) or {}
+                            args_str = " ".join(f"{k}={v}" for k, v in args.items() if k not in ("world_summary", "fallback_interval_days"))
+                            line = f"[{name}] {args_str}"[:500]
+                            append_message(
+                                self._history_path, role="assistant",
+                                content=line, limits=limits,
+                            )
+
+            # Save terminal tool result AFTER write-tools (chronological end)
+            if exit_tool_name == "ready_to_proceed":
+                summary = exit_tool_args.get("world_summary", "") or ""
+                if summary:
+                    append_message(
+                        self._history_path, role="assistant",
+                        content=f"[world_summary] {summary}", limits=limits,
+                    )
+                    self._last_summary = summary
+                else:
+                    append_message(
+                        self._history_path, role="assistant",
+                        content="[ready_to_proceed] (no summary)", limits=limits,
+                    )
+            elif exit_tool_name == "answer_world_question":
+                q = exit_tool_args.get("question", "") or ""
+                a = exit_tool_args.get("answer", "") or ""
+                if q and a:
+                    append_message(
+                        self._history_path, role="assistant",
+                        content=f"[qa] Q: {q}  A: {a}", limits=limits,
+                    )
+
+        # ── Update last_call_tick ───────────────────────────────────
+        if context and context.get("current_tick"):
+            self._last_call_tick = int(context["current_tick"])
+
+        return {
+            "exit_tool": result.get("exit_tool"),
+            "exit_args": result.get("exit_args"),
+            "thinking": thinking,
+        }

@@ -116,18 +116,37 @@ def sample_grid(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Sample a continuous field on a regular lat/lon grid.
 
+    Uses vectorized KDTree query when field is a ContinuousField
+    (avoids 1M+ Python function calls). Falls back to scalar
+    iteration for generic callables.
+
     Returns:
         (lats_1d, lons_1d, values_2d) where values_2d[i, j] is the
         field value at (lats[i], lons[j]).
     """
     lats = np.arange(lat_range[0], lat_range[1] + lat_step * 0.5, lat_step)
     lons = np.arange(lon_range[0], lon_range[1] + lon_step * 0.5, lon_step)
-    values = np.zeros((len(lats), len(lons)), dtype=np.float64)
 
+    # Fast path: ContinuousField with KDTree → vectorized
+    if isinstance(field, ContinuousField):
+        return _sample_grid_vectorized(field, lats, lons)
+
+    # Fallback: generic callable → scalar iteration
+    values = np.zeros((len(lats), len(lons)), dtype=np.float64)
     for i, lat in enumerate(lats):
         for j, lon in enumerate(lons):
             values[i, j] = field(float(lat), float(lon))
+    return lats, lons, values
 
+
+def _sample_grid_vectorized(
+    field: ContinuousField,
+    lats: np.ndarray,
+    lons: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorized grid sampling via shared grid_utils."""
+    from ..grid_utils import sample_field_vectorized
+    values = sample_field_vectorized(field, lats, lons)
     return lats, lons, values
 
 
@@ -304,7 +323,9 @@ def threshold_polygons(
 ) -> List[Polygon]:
     """Extract polygons where values >= or < threshold.
 
-    Uses grid point clustering + concave hull for tight polygon fit.
+    Uses scipy.ndimage.label for fast C-accelerated connected component
+    labelling (replaces O(N) Python flood-fill with an O(N) C loop),
+    then concave hull for tight polygon fit.
     Multiple disjoint regions produce multiple polygons.
 
     Args:
@@ -320,6 +341,7 @@ def threshold_polygons(
     """
     from shapely import concave_hull
     from shapely.geometry import MultiPoint, Polygon as SPolygon
+    from scipy import ndimage as ndi
 
     # Build mask of points meeting threshold
     if use_above:
@@ -327,39 +349,27 @@ def threshold_polygons(
     else:
         mask = values < threshold
 
-    # Find connected components in mask using flood fill
-    nlat, nlon = mask.shape
-    visited = np.zeros_like(mask, dtype=bool)
-    components: List[List[Tuple[int, int]]] = []
-
-    for i in range(nlat):
-        for j in range(nlon):
-            if mask[i, j] and not visited[i, j]:
-                stack = [(i, j)]
-                comp: List[Tuple[int, int]] = []
-                while stack:
-                    ci, cj = stack.pop()
-                    if ci < 0 or ci >= nlat or cj < 0 or cj >= nlon:
-                        continue
-                    if not mask[ci, cj] or visited[ci, cj]:
-                        continue
-                    visited[ci, cj] = True
-                    comp.append((ci, cj))
-                    # 8-direction connectivity
-                    for di, dj in [(-1, 0), (1, 0), (0, -1), (0, 1),
-                                   (-1, -1), (-1, 1), (1, -1), (1, 1)]:
-                        stack.append((ci + di, cj + dj))
-                if comp:
-                    components.append(comp)
+    # C-accelerated connected component labelling (8-connectivity)
+    structure = np.array([[1, 1, 1], [1, 1, 1], [1, 1, 1]], dtype=bool)
+    labeled, n_features = ndi.label(mask, structure)
 
     polys: List[SPolygon] = []
-    for comp in components:
-        # Convert grid indices to (lon, lat) coordinates
-        pts = []
-        for ci, cj in comp:
-            pts.append((float(lons[cj]), float(lats[ci])))
-        if len(pts) < 3:
+    for feat_id in range(1, n_features + 1):
+        component_mask = labeled == feat_id
+        n_cells = int(component_mask.sum())
+        if n_cells < 3:
             continue
+
+        # Convert grid indices to (lon, lat) coordinates
+        rows, cols = np.where(component_mask)
+        pts = [(float(lons[c]), float(lats[r])) for r, c in zip(rows, cols)]
+
+        # Subsample very large components to keep concave_hull fast
+        # (50K+ points → concave_hull becomes very expensive, but
+        #  subsampling to ~5000 gives near-identical hulls)
+        if len(pts) > 10000:
+            step = max(1, len(pts) // 5000)
+            pts = pts[::step]
 
         try:
             mp = MultiPoint(pts)
@@ -392,29 +402,40 @@ def classify_vegetation_grid(
 ) -> Dict[str, np.ndarray]:
     """Classify each grid point by vegetation type.
 
+    Uses vectorized KDTree sampling (batch C-level queries) instead of
+    per-point Python calls — replaces 4 × N individual queries with
+    4 batch queries.
+
     Returns dict mapping vegetation_type → boolean 2D mask.
     """
+    from ..grid_utils import sample_field_vectorized
+
+    # Vectorized KDTree sampling — 4 C-level batch queries instead of
+    # 4 × nlat × nlon individual Python calls
+    soil_grid = sample_field_vectorized(soil_field, lats, lons)
+    temp_grid = sample_field_vectorized(temp_field, lats, lons)
+    precip_grid = sample_field_vectorized(precip_field, lats, lons)
+
+    if ocean_field is not None:
+        ocean_grid = sample_field_vectorized(ocean_field, lats, lons)
+        ocean_mask = ocean_grid < ocean_threshold
+    else:
+        ocean_mask = np.zeros((len(lats), len(lons)), dtype=bool)
+
     masks: Dict[str, np.ndarray] = {}
     nlat, nlon = len(lats), len(lons)
 
+    # Still a Python loop over grid points, but NO KDTree queries inside
     for i in range(nlat):
-        lat = float(lats[i])
         for j in range(nlon):
-            lon = float(lons[j])
-
-            # Determine ocean
-            is_ocean = False
-            if ocean_field is not None:
-                is_ocean = ocean_field(lat, lon) < ocean_threshold
-
-            if is_ocean:
+            if ocean_mask[i, j]:
                 veg = "barren"
             else:
-                soil = soil_field(lat, lon)
-                temp = temp_field(lat, lon)
-                precip = precip_field(lat, lon)
-                veg = classify_fn(soil, temp, precip)
-
+                veg = classify_fn(
+                    float(soil_grid[i, j]),
+                    float(temp_grid[i, j]),
+                    float(precip_grid[i, j]),
+                )
             if veg not in masks:
                 masks[veg] = np.zeros((nlat, nlon), dtype=bool)
             masks[veg][i, j] = True
@@ -430,50 +451,40 @@ def vegetation_masks_to_polygons(
 ) -> List[Tuple[str, Polygon]]:
     """Convert classified vegetation masks to Shapely polygons.
 
-    For each vegetation type, extracts connected components and
-    converts to concave hull polygons.
+    Uses scipy.ndimage.label for C-accelerated connected component
+    labelling instead of Python flood fill.
 
     Returns list of (cover_type, polygon) tuples.
     """
-    import h3
+    from scipy import ndimage as ndi
+    from shapely import concave_hull
+    from shapely.geometry import MultiPoint
+
     results: List[Tuple[str, Polygon]] = []
+    structure = np.array([[1, 1, 1], [1, 1, 1], [1, 1, 1]], dtype=bool)
 
     for veg_type, mask in masks.items():
         if veg_type == "barren":
             continue
 
-        # Find connected components in the mask using flood fill
-        nlat, nlon = mask.shape
-        visited = np.zeros_like(mask, dtype=bool)
-        components: List[List[Tuple[int, int]]] = []
+        # C-accelerated connected component labelling
+        labeled, n_features = ndi.label(mask, structure)
 
-        for i in range(nlat):
-            for j in range(nlon):
-                if mask[i, j] and not visited[i, j]:
-                    # Flood fill
-                    stack = [(i, j)]
-                    comp: List[Tuple[int, int]] = []
-                    while stack:
-                        ci, cj = stack.pop()
-                        if ci < 0 or ci >= nlat or cj < 0 or cj >= nlon:
-                            continue
-                        if not mask[ci, cj] or visited[ci, cj]:
-                            continue
-                        visited[ci, cj] = True
-                        comp.append((ci, cj))
-                        for di, dj in [(-1, 0), (1, 0), (0, -1), (0, 1),
-                                       (-1, -1), (-1, 1), (1, -1), (1, 1)]:
-                            stack.append((ci + di, cj + dj))
-                    if len(comp) >= min_cells:
-                        components.append(comp)
+        for feat_id in range(1, n_features + 1):
+            component_mask = labeled == feat_id
+            n_cells = int(component_mask.sum())
+            if n_cells < min_cells:
+                continue
 
-        for comp in components:
-            # Convert grid coordinates to (lon, lat)
-            pts = []
-            for ci, cj in comp:
-                pts.append((float(lons[cj]), float(lats[ci])))
+            rows, cols = np.where(component_mask)
+            pts = [(float(lons[c]), float(lats[r])) for r, c in zip(rows, cols)]
             if len(pts) < 3:
                 continue
+
+            # Subsample large components
+            if len(pts) > 10000:
+                step = max(1, len(pts) // 5000)
+                pts = pts[::step]
 
             try:
                 mp = MultiPoint(pts)

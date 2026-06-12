@@ -24,7 +24,7 @@ import math
 from typing import Dict, List, Optional, Tuple
 
 from .cell_model import CellData
-from .plant_registry import PFT_REGISTRY, PlantDef
+from .plant_registry import PFT_REGISTRY, PlantDef, pft_interception_coefficient
 
 
 # ======================================================================
@@ -59,6 +59,7 @@ def compute_vegetation_cell(
             "pft_composition": {},
             "dominant_pft": "",
             "vegetation_cover": "barren",
+            "interception_coefficient": 0.15,
         }
 
     if soil_fertility < 0.02:
@@ -69,6 +70,7 @@ def compute_vegetation_cell(
             "pft_composition": {},
             "dominant_pft": "",
             "vegetation_cover": "barren",
+            "interception_coefficient": 0.15,
         }
 
     # Compute suitability and equilibrium biomass for every PFT
@@ -122,7 +124,6 @@ def compute_vegetation_cell(
     interception_coeff = 0.15  # default fallback
     if total_bio > 0:
         weighted = 0.0
-        from .plant_registry import PFT_REGISTRY, pft_interception_coefficient
         for name, biomass in pft_composition.items():
             pft = PFT_REGISTRY.get(name)
             if pft:

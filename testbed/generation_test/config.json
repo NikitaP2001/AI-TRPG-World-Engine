@@ -1,0 +1,35 @@
+{
+  "name": "Forgotten Realms — generation test",
+  "description": "Reusable world generation test with caching. First run generates; subsequent runs reuse the SQLite DB.",
+  "wm_state_dir": "wm_state",
+  "world_seed": 14920315,
+  "expected": {
+    "world_name": "Forgotten Realms (Toril)",
+    "planet_radius": 6371.0,
+    "features": {
+      "continent": 1,
+      "mountain": 1,
+      "river": 1,
+      "lake": 1,
+      "settlement": 3,
+      "total": 7
+    },
+    "feature_names": [
+      "Sword Coast", "Neverwinter", "Waterdeep", "Phandalin",
+      "Sea of Swords", "Mount Hotenow", "Neverwinter River"
+    ],
+    "faction_count": 7,
+    "faction_names": [
+      "City-State of Neverwinter", "City of Waterdeep",
+      "Lords' Alliance", "Neverwinter Merchant Council",
+      "Many Arrows (Orc Tribes)", "Emerald Enclave",
+      "Zhentarim (Black Network)"
+    ],
+    "entity_count": 4,
+    "entity_names": ["Elena Brightwood", "Marek Stonehand", "Seraphina Windmere", "Tiko Swiftfoot"],
+    "concepts": {
+      "existence_types": 18,
+      "settlement_types": 5
+    }
+  }
+}

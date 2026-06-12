@@ -76,7 +76,7 @@ def _drift_climate(
         # Recompute Köppen class if temperature moved significantly
         if abs(dt) > drift_rate * 0.5 or abs(dp) > drift_rate * 0.5:
             # Import locally to avoid circular dependency at module level
-            from .generator import _koppen_class
+            from .climate import koppen_classify as _koppen_class
             new_class = _koppen_class(new_temp, new_precip, cell.temp_seasonal_range)
             if new_class != cell.climate_class:
                 cell.climate_class = new_class

@@ -58,15 +58,18 @@ def _detect_depressions(
     if verbose:
         print(f"    grid={nlat}x{nlon}={nlat*nlon:,} pts", flush=True)
 
-    grid = np.zeros((nlat, nlon), dtype=np.float64)
+    # 1b. Vectorized KDTree sampling (replaces 259K Python calls)
+    from simulation.grid_utils import sample_field_vectorized
+    grid = sample_field_vectorized(elev_f, lats, lons)
+
+    # Add tiny noise to break ties in priority flood (opensimplex loop, unavoidable)
     opensimplex.seed(999)
     for i in range(nlat):
         for j in range(nlon):
-            base = elev_f.base_only(float(lats[i]), float(lons[j]))
             noise = opensimplex.noise3(
                 float(lats[i]) * 0.1, float(lons[j]) * 0.1, 0.0
             ) * 0.005
-            grid[i, j] = base + noise
+            grid[i, j] += noise
 
     # 2. Priority flood from ocean
     visited = np.zeros((nlat, nlon), dtype=bool)

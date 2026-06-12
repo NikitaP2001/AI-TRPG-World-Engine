@@ -247,6 +247,23 @@ class FieldRegistry:
         reg.register_mutable("biomass", MutableField(None, default=0.0))
         reg.register_mutable("canopy_density", MutableField(None, default=0.0))
         reg.register_mutable("sediment_flux", MutableField(None, default=0.0))
+
+        # ── Fauna population_density[species_id] fields ─────────────
+        # Each registered species gets a MutableField, initially zero.
+        # Loaded from fauna_populations table in TimeEngine, not from CellData.
+        try:
+            from .fauna_registry import FAUNA_REGISTRY
+            for sp_id in FAUNA_REGISTRY:
+                reg.register_mutable(
+                    f"population_density[{sp_id}]",
+                    MutableField(None, default=0.0),
+                )
+        except (ImportError, Exception):
+            pass  # Registry may not be populated during import
+
+        # ── Plankton density (aquatic base resource) ────────────────
+        reg.register_mutable("plankton_density", MutableField(None, default=0.0))
+
         return reg
 
 

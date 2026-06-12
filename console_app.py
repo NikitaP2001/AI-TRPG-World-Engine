@@ -303,3 +303,131 @@ class GameOrchestrator:
             character_names=char_names,
         )
 
+    # ── Command dispatch (for webui and console) ─────────────────
+
+    def _dispatch_user_input(self, user_text: str, debug_trace: bool = False) -> Optional[str]:
+        """Parse and execute a user command or turn input.
+
+        Handles slash commands:
+          /generate [seed=N] [review]  — finalize world generation
+          /advance N[d|h|m]           — advance simulation time
+
+        Non-command text is treated as a turn input (calls run_turn).
+
+        Args:
+            user_text: Raw user input string.
+            debug_trace: If True, print debug info.
+
+        Returns:
+            Optional response text (None for commands that produce no output).
+        """
+        text = user_text.strip()
+        if not text:
+            return None
+
+        # ── Slash commands ────────────────────────────────────────
+        if text.startswith("/"):
+            parts = text[1:].split()
+            cmd = parts[0].lower()
+            args = parts[1:]
+
+            if cmd == "generate":
+                return self._cmd_generate(args, debug_trace)
+            elif cmd == "advance":
+                return self._cmd_advance(args, debug_trace)
+            else:
+                return f"Unknown command: /{cmd}"
+
+        # ── Regular turn input ────────────────────────────────────
+        from turn_runner import run_turn
+        from langchain_core.messages import HumanMessage
+        run_turn(self, HumanMessage(content=text))
+        return None
+
+    def _cmd_generate(self, args: list, debug: bool = False) -> str:
+        """Handle /generate command."""
+        world_seed = 0
+        review_only = False
+        for arg in args:
+            al = arg.lower()
+            if al == "review":
+                review_only = True
+            elif al.startswith("seed="):
+                try:
+                    world_seed = int(al.split("=")[1])
+                except (ValueError, IndexError):
+                    pass
+
+        if debug:
+            print(f"[cmd] /generate seed={world_seed} review={review_only}")
+
+        try:
+            from world_manager.tools import finalize_world_generation
+            result = finalize_world_generation.invoke({
+                "world_seed": world_seed,
+                "review_only": review_only,
+            })
+        except Exception as e:
+            import traceback
+            return f"Generation failed: {e}\n{traceback.format_exc()}"
+
+        if not isinstance(result, dict):
+            return f"Generation returned: {result}"
+
+        status = result.get("world_generation_status", "?")
+        errors = result.get("validation_errors", [])
+        warnings = result.get("warnings", [])
+
+        lines = [f"World generation: {status}"]
+        if result.get("constraint_summary"):
+            cs = result["constraint_summary"]
+            lines.append(f"  Continents: {cs.get('continent_outlines', 0)}")
+            lines.append(f"  Features: {cs.get('named_terrain_features', 0)}")
+            lines.append(f"  Factions: {cs.get('faction_territories', 0)}")
+        lines.append(f"  Cell count: {result.get('generated_features', 0)}")
+        for e in errors:
+            lines.append(f"  ERROR: {e}")
+        for w in warnings:
+            lines.append(f"  WARNING: {w}")
+
+        return "\n".join(lines)
+
+    def _cmd_advance(self, args: list, debug: bool = False) -> str:
+        """Handle /advance command — parse time and advance simulation."""
+        from simulation.time_engine import parse_advance_args, TimeEngine
+        from simulation.world_db import WorldDB
+
+        text = "/advance " + " ".join(args)
+        parsed = parse_advance_args(text)
+        if not parsed.get("days") and not parsed.get("hours"):
+            return "Usage: /advance 7d 12h 30m"
+
+        db = WorldDB("game/simulation/world.sqlite")
+        engine = TimeEngine(db)
+        summary = engine.advance(**parsed)
+
+        return (f"Advanced {parsed.get('days', 0)}d {parsed.get('hours', 0)}h "
+                f"— tick {summary['tick']}, Y{summary['year']}, "
+                f"temp {summary['temp_mean']:.1f}°C")
+
+    # ── Session state (for webui) ─────────────────────────────────
+
+    def _load_session_state(self, show_history_stats: bool = True) -> None:
+        """Load/resume GM history from disk. Called by webui before dispatch."""
+        _ = show_history_stats  # placeholder for future stats display
+        # GM history is loaded lazily by GameMaster on first use.
+
+    def _progress_snapshot(self) -> dict:
+        """Return current game progress snapshot for webui."""
+        try:
+            turns, paras, last_text = self.story_progress_and_last_text()
+        except Exception:
+            turns, paras, last_text = 0, 0, ""
+
+        return {
+            "turns": turns,
+            "paragraphs": paras,
+            "last_narration": last_text[:200] if last_text else "",
+            "world_setting_ready": self._world_setting_ready,
+        }
+

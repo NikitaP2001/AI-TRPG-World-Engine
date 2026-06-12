@@ -553,6 +553,9 @@ class PlanetScene(Scene):
 
         Ocean detection uses geological type (geo_type == 0), NOT
         elevation — rift valleys have negative elevation but are land.
+
+        Cells NOT in generated data render as dark 'void' so the
+        user can see which areas have no data.
         """
         import h3
         if not self._ico_vertices_base:
@@ -560,18 +563,23 @@ class PlanetScene(Scene):
         n = len(self._ico_vertices_base)
         verts = []
         cell_geo_map = {}
+        cell_set = set()
         if self.cells:
             cell_geo_map = {cell.h3_id: cell.geological_type for cell in self.cells}
+            cell_set = set(cell_geo_map.keys())
+        _VOID = (0.05, 0.05, 0.08)
         for i in range(n):
             x, y, z = self._ico_vertices_base[i]
             el = self._ico_vertex_elevs[i]
             lat = math.degrees(math.asin(max(-1.0, min(1.0, y))))
             lon = math.degrees(math.atan2(z, x))
-            # Ocean from geological type, not elevation
             h = h3.latlng_to_cell(lat, lon, 2)
-            geo_type = cell_geo_map.get(h, 2)
-            is_ocean = (geo_type == 0)
-            col = self._sample_color(lat, lon, el, is_ocean, geo_type)
+            if h not in cell_set:
+                col = _VOID
+            else:
+                geo_type = cell_geo_map.get(h, 2)
+                is_ocean = (geo_type == 0)
+                col = self._sample_color(lat, lon, el, is_ocean, geo_type)
             self._ico_vertex_colors[i] = col
             verts.append((x, y, z, col[0], col[1], col[2], el))
         arr = np.array(verts, dtype=np.float32)
@@ -984,6 +992,17 @@ void main() {
         db = WorldDB(db_path)
         self._feature_store = db.load_features()
         cells_raw = db.load_cells()
+        # ── Load fauna populations ──────────────────────────────────
+        self._fauna_data: dict = {}
+        try:
+            fauna_rows = db.load_fauna_populations()
+            for row in fauna_rows:
+                h3_id = row["h3_id"]
+                self._fauna_data.setdefault(h3_id, {})
+                self._fauna_data[h3_id][row["species_id"]] = float(row.get("density", 0.0))
+        except Exception:
+            self._fauna_data = {}
+        print(f"[PlanetScene] Loaded {len(self._fauna_data)} cells with fauna data")
         db.close()
 
         from simulation.layer0.climate import norm_to_c
@@ -1069,18 +1088,20 @@ void main() {
         # Pre-build cell lookup maps
         cell_elev_map = {cell.h3_id: cell.elevation_mean for cell in cells}
         cell_geo_map = {cell.h3_id: cell.geological_type for cell in cells}
+        cell_set = set(cell_geo_map.keys())
+        _VOID = (0.05, 0.05, 0.08)
         for i, (x, y, z) in enumerate(ico_verts):
             lat = math.degrees(math.asin(max(-1.0, min(1.0, y))))
             lon = math.degrees(math.atan2(z, x))
-            el = _interp_elevation(lat, lon)
-            # Ocean detection from geological type at vertex position
             h = h3.latlng_to_cell(lat, lon, 2)
-            if h in cell_geo_map:
+            if h not in cell_set:
+                el = 0.0
+                col = _VOID
+            else:
+                el = _interp_elevation(lat, lon)
                 geo_type = cell_geo_map[h]
                 is_ocean_cell = (geo_type == 0)
-            else:
-                is_ocean_cell = el < -0.015
-            col = self._sample_color(lat, lon, el, is_ocean_cell, geo_type)
+                col = self._sample_color(lat, lon, el, is_ocean_cell, geo_type)
             self._ico_vertex_elevs.append(el)
             self._ico_vertex_colors.append(col)
             vertices.append((x, y, z, col[0], col[1], col[2], el))
@@ -1380,7 +1401,23 @@ void main() {
             water_rows.append(("Hazard Level", f"{cell.hazard_level:.2f}"))
             add_section("WATER", water_rows)
 
-            # ── 5. VEGETATION ──
+            # ── 5. FAUNA ──
+            fauna_rows_local = []
+            fauna_at_cell = self._fauna_data.get(cell.h3_id, {})
+            if fauna_at_cell:
+                for sp_id, density in sorted(fauna_at_cell.items()):
+                    sp_name = sp_id.replace("_", " ").title()
+                    if density >= 1.0:
+                        fauna_rows_local.append((sp_name, f"{density:.0f} individuals"))
+                    elif density >= 0.1:
+                        fauna_rows_local.append((sp_name, f"{density:.1f}"))
+                    else:
+                        fauna_rows_local.append((sp_name, f"{density:.2f}"))
+            else:
+                fauna_rows_local.append(("(none)", ""))
+            add_section("FAUNA", fauna_rows_local)
+
+            # ── 6. VEGETATION ──
             veg_rows = []
             veg_rows.append(("Cover", cell.vegetation_cover or "barren"))
             veg_rows.append(("Canopy", f"{cell.canopy_density*100:.0f}%"))

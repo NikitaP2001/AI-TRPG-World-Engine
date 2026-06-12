@@ -159,7 +159,8 @@ class TimeEngine:
         self.db.conn.commit()
 
     def _run_l1_step(self, dt_days: float) -> None:
-        """Run one L1 tick: lakes, groundwater, wetlands.
+        """Run one L1 tick: lakes, groundwater, wetlands, vegetation,
+        fauna, settlement footprints, emergence.
 
         Loads current state from SQLite, builds FieldRegistry,
         runs SimEngine features, saves back.
@@ -184,21 +185,53 @@ class TimeEngine:
         from .layer1.features.lake import Lake
         from .layer1.features.wetland import Wetland
         from .layer1.features.vegetation import Vegetation
+        from .layer1.features.fauna import Fauna
+        from .layer1.features.settlement_footprint import SettlementFootprint
+        from .layer1.fauna_registry import FAUNA_REGISTRY, get_species_ids
+        from .layer1.settlement_type_registry import SETTLEMENT_TYPE_REGISTRY
+        from .layer1.emergence import check_fauna_emergence
 
         fields = FieldRegistry.from_cells(cells)
         engine = SimEngine(fields)
 
-        # 3. Add Vegetation (L0→L1 migration: continuous PFT updates)
+        # 3. Load fauna population_density fields from DB into MutableFields
+        fauna_rows_all = self.db.load_fauna_populations()
+        fauna_by_species: dict = {}
+        for row in fauna_rows_all:
+            sid = row["species_id"]
+            if sid not in fauna_by_species:
+                fauna_by_species[sid] = []
+            fauna_by_species[sid].append(row)
+
+        import h3 as _h3_fauna
+        for species_id, rows in fauna_by_species.items():
+            field_name = f"population_density[{species_id}]"
+            if fields.has(field_name):
+                try:
+                    mf = fields.get_mutable(field_name)
+                except KeyError:
+                    continue
+                # Set field values via sample points
+                for r in rows:
+                    try:
+                        latlng = _h3_fauna.cell_to_latlng(r["h3_id"])
+                        lat, lon = float(latlng[0]), float(latlng[1])
+                        density = max(0.0, float(r.get("density", 0.0)))
+                        if density > 1e-8:
+                            mf.add_persistent(lat, lon, radius_deg=2.0, strength=density)
+                    except Exception:
+                        pass
+
+        # 4. Add Vegetation
         engine.add_feature(Vegetation())
 
-        # 4. Reconstruct L1 features from feature store
+        # 5. Reconstruct L1 features from feature store
         has_groundwater = False
         for feat in fs.all_active:
             if feat.type == "lake" and feat.geometry is not None:
                 spill = feat.properties.get("spill_elevation", 0.1)
                 lake = Lake(polygon=feat.geometry, spill_elevation=spill,
                             feature_id=feat.feature_id)
-                # Restore persisted state
                 if "volume_m3" in feat.properties:
                     lake.props["volume_m3"] = feat.properties["volume_m3"]
                 if "level_m" in feat.properties:
@@ -223,27 +256,141 @@ class TimeEngine:
         if not has_groundwater:
             engine.add_feature(Groundwater())
 
-        # 5. Run for dt_days
+        # 6. Compute plankton_density from water temperature (for aquatic species)
+        import h3 as _h3_plank
+        plank_mf = None
+        try:
+            plank_mf = fields.get_mutable("plankton_density")
+        except KeyError:
+            pass
+        if plank_mf is not None:
+            for cell in cells:
+                latlng = _h3_plank.cell_to_latlng(cell.h3_id)
+                lat, lon = float(latlng[0]), float(latlng[1])
+                elev_f = fields.get("elevation_mean")
+                elev = elev_f(lat, lon) if elev_f else 0.0
+                if elev >= 0:
+                    continue  # land — no plankton
+                temp_f = fields.get("temperature")
+                temp = max(0.0, min(1.0, temp_f(lat, lon))) if temp_f else 0.5
+                # Plankton blooms at moderate temps (0.3-0.7 norm = ~8-26°C)
+                plank = 0.0
+                if 0.1 < temp < 0.9:
+                    plank = math.sin(math.pi * (temp - 0.1) / 0.8) * 0.15
+                if plank > 1e-6:
+                    plank_mf.add_persistent(lat, lon, radius_deg=2.0, strength=plank)
+
+        # 7. Add Fauna features (one per registered species)
+        for species_id in get_species_ids():
+            engine.add_feature(Fauna(species_id))
+
+        # 7. Run for dt_days
         engine.step(dt=float(dt_days))
 
-        # 6. Propagate mutable field state back to CellData
-        import h3
+        # 8. Propagate mutable field state back to CellData
+        import h3 as _h3_prop
         wt_f = fields.get("water_table_depth")
         canopy_f = fields.get("canopy_density")
         biomass_f = fields.get("biomass")
         soil_mut = fields.get("soil_fertility")
         for cell in cells:
-            latlng = h3.cell_to_latlng(cell.h3_id)
+            latlng = _h3_prop.cell_to_latlng(cell.h3_id)
             lat, lon = float(latlng[0]), float(latlng[1])
             cell.water_table_depth = max(0.0, wt_f(lat, lon))
             cell.canopy_density = max(0.0, min(1.0, canopy_f(lat, lon)))
             cell.biomass_kgm2 = max(0.0, biomass_f(lat, lon))
             cell.soil_fertility = max(0.0, min(1.0, soil_mut(lat, lon)))
 
-        # 7. Save updated state back to SQLite
+        # 9. Apply settlement footprint — accumulating deltas to CellData
+        for feat in engine.features:
+            if feat.feature_type == "settlement_footprint":
+                sf = feat
+                sf.apply_to_cells(cells, dt=float(dt_days))
+
+        # 10. Save fauna population_density fields to DB
+        fauna_save_rows = []
+        for species_id in get_species_ids():
+            field_name = f"population_density[{species_id}]"
+            try:
+                pop_mf = fields.get_mutable(field_name)
+            except KeyError:
+                continue
+            current_tick = 0
+            time = self.db.get_time()
+            if time:
+                current_tick = time.get("tick", 0)
+
+            # Apply settlement hunting/suppression deltas
+            for sf_feat in engine.features:
+                if sf_feat.feature_type != "settlement_footprint":
+                    continue
+                deltas = sf_feat.props.get("_hunting_deltas", {})
+                if not deltas:
+                    continue
+                # Write hunting deltas to population_density fields
+                for h3_id_str, delta in deltas.items():
+                    try:
+                        latlng = _h3_prop.cell_to_latlng(h3_id_str)
+                        lat, lon = float(latlng[0]), float(latlng[1])
+                        pop_mf.add_persistent(lat, lon, radius_deg=2.0, strength=delta)
+                    except Exception:
+                        pass
+
+            # Sample field to get per-cell densities
+            for cell in cells:
+                latlng = _h3_prop.cell_to_latlng(cell.h3_id)
+                lat, lon = float(latlng[0]), float(latlng[1])
+                density = max(0.0, pop_mf(lat, lon))
+                if density > 1e-6:
+                    fauna_save_rows.append({
+                        "h3_id": cell.h3_id,
+                        "species_id": species_id,
+                        "density": density,
+                        "updated_at_tick": current_tick,
+                    })
+
+        self.db.save_fauna_populations(fauna_save_rows)
+
+        # 11. Check fauna emergence → feed WM notification queue
+        emergence_events = check_fauna_emergence(
+            fauna_save_rows,
+            current_tick=time.get("tick", 0) if time else 0,
+        )
+        if emergence_events:
+            for ev in emergence_events:
+                print(f"  [Emergence] {ev['faction_name']} ({ev['faction_id']}) "
+                      f"— {ev['total_population']:.0f} individuals")
+
+        # 12. Compute encounter_probability → hazard_level feedback
+        # encounter_probability = Σ(pop_density/density_max × hazard_weight)
+        # for carnivore/dangerous species, added to hazard_level
+        from .layer1.fauna_registry import get_hazard_weight
+        for cell in cells:
+            latlng = _h3_prop.cell_to_latlng(cell.h3_id)
+            lat, lon = float(latlng[0]), float(latlng[1])
+            encounter = 0.0
+            for species_id in get_species_ids():
+                sp = FAUNA_REGISTRY.get(species_id)
+                if sp is None:
+                    continue
+                hw = get_hazard_weight(species_id)
+                if hw <= 0:
+                    continue
+                try:
+                    pop_f = fields.get(f"population_density[{species_id}]")
+                    density = max(0.0, pop_f(lat, lon))
+                    density_max = sp.population_density_max
+                    if density_max > 0:
+                        encounter += (density / density_max) * hw
+                except KeyError:
+                    pass
+            # Blend encounter probability into hazard_level (small additive)
+            cell.hazard_level = max(0.0, min(1.0, cell.hazard_level + encounter * 0.05))
+
+        # 13. Save updated cells to SQLite
         self.db.save_cells(cells)
 
-        # 9. Update feature store with new L1 state
+        # 14. Update feature store with new L1 state
         for feat in engine.features:
             if feat.feature_type == "lake":
                 for f in fs.all_active:

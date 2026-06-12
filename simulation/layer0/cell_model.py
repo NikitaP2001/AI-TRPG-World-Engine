@@ -94,7 +94,6 @@ class GenerationParams:
 
     # ── Geometry ─────────────────────────────────────────────────────
     planet_radius: float = 1.0          # radius of the world body (any unit)
-    world_extent: float = 1.0           # fraction of surface to simulate (0.0–1.0)
 
     # ── Terrain ──────────────────────────────────────────────────────
     tectonic_activity: float = 0.5      # 0.0–1.0 — plate count, uplift magnitude
@@ -125,7 +124,7 @@ class GenerationParams:
             planet_radius=self.planet_radius,
             axial_tilt=self.axial_tilt,
         )
-        target = int(round(orient.top_level_cell_count * self.world_extent))
+        target = orient.top_level_cell_count
         # Clamp to at least 1 cell
         target = max(1, target)
         self._top_level_cell_count = target
@@ -158,7 +157,7 @@ class GenerationParams:
 
     @property
     def surface_area(self) -> float:
-        return 4.0 * math.pi * self.planet_radius ** 2 * self.world_extent
+        return 4.0 * math.pi * self.planet_radius ** 2
 
     @property
     def cell_area(self) -> float:

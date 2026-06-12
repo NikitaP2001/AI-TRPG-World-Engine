@@ -4,7 +4,8 @@ import argparse
 import time
 from pathlib import Path
 from .cell_model import GenerationParams
-from .generator import generate_world, save_cells_parquet
+from ..generator import generate_world
+from .generator import save_cells_parquet
 from .renderer import render_textures
 from .tile_renderer import generate_all_tiles
 
@@ -13,7 +14,6 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Layer 0 — World Generation")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--planet-radius", type=float, default=1.0)
-    p.add_argument("--world-extent", type=float, default=1.0)
     p.add_argument("--tectonic-activity", type=float, default=0.5)
     p.add_argument("--num-plates", type=int, default=8)
     p.add_argument("--roughness", type=float, default=0.6)
@@ -26,7 +26,7 @@ def main() -> None:
     a = p.parse_args()
 
     params = GenerationParams(
-        planet_radius=a.planet_radius, world_extent=a.world_extent,
+        planet_radius=a.planet_radius,
         tectonic_activity=a.tectonic_activity, num_plates=a.num_plates,
         roughness=a.roughness,
         axial_tilt=a.axial_tilt, seed=a.seed,
@@ -35,7 +35,6 @@ def main() -> None:
     print("Layer 0 — World Generation")
     print("=" * 50)
     print(f"  planet_radius:      {params.planet_radius}")
-    print(f"  world_extent:       {params.world_extent}")
     print(f"  tectonic_activity:  {params.tectonic_activity}")
     print(f"  num_plates:         {params.num_plates}")
     print(f"  roughness:          {params.roughness}")

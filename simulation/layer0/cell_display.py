@@ -81,20 +81,15 @@ class CellDisplayGrid:
         self,
         feature_store: FeatureStore,
         resolution: int = 2,
-        world_extent: float = 1.0,
     ):
         self.feature_store = feature_store
         self.resolution = resolution
         self.h3_ids: List[str] = []
 
-        # Build H3 grid
+        # Build full H3 grid
         all_ids: List[str] = []
         for r0 in list(h3.get_res0_cells()):
             all_ids.extend(h3.cell_to_children(r0, resolution))
-        if world_extent < 1.0:
-            import random
-            random.Random(42).shuffle(all_ids)
-            all_ids = all_ids[:int(len(all_ids) * world_extent)]
         self.h3_ids = all_ids
 
     # ── Hex-based feature queries (polygon intersection, not centroid) ─

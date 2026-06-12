@@ -1,5 +1,3 @@
-init
-game
 .venv/*
 logs/*
 backups/*
@@ -13,3 +11,8 @@ scripts/*
 old_agent_def.txt
 plans.txt
 rag.txt
+# world generation artifacts
+*.sqlite
+*.parquet
+init
+game

@@ -86,53 +86,55 @@ def detect_wetlands(
     lats = np.arange(-88.0, 90.0, lat_step)
     lons = np.arange(-178.0, 180.0, lon_step)
 
-    # Pre-sample fields
-    elev_grid = np.zeros((len(lats), len(lons)))
-    wt_grid = np.zeros((len(lats), len(lons)))
-    precip_grid = np.zeros((len(lats), len(lons)))
-    temp_grid = np.zeros((len(lats), len(lons)))
+    # 1b. Vectorized KDTree sampling for all fields at once
+    from simulation.grid_utils import sample_fields_vectorized, make_latlon_grid
+    lats, lons = make_latlon_grid(lat_step, lon_step, (-88.0, 90.0), (-178.0, 180.0))
+    grids = sample_fields_vectorized({
+        "elevation_mean": elev_f,
+        "water_table_depth": wt_f,
+        "precipitation": precip_f,
+        "temperature": temp_f,
+    }, lats, lons)
+    elev_grid = grids["elevation_mean"]
+    wt_grid = grids["water_table_depth"]
+    precip_grid = grids["precipitation"]
+    temp_grid = grids["temperature"]
 
-    for i, lat in enumerate(lats):
-        for j, lon in enumerate(lons):
-            lat_f, lon_f = float(lat), float(lon)
-            elev_grid[i, j] = elev_f.base_only(lat_f, lon_f)
-            wt_grid[i, j] = wt_f(lat_f, lon_f)
-            precip_grid[i, j] = precip_f.base_only(lat_f, lon_f)
-            temp_grid[i, j] = temp_f.base_only(lat_f, lon_f)
-
-    # Compute continuous suitability for each cell
+    # 2. Vectorized suitability computation
     from collections import defaultdict
+    nlat, nlon = len(lats), len(lons)
+
+    # Ocean mask
+    land = elev_grid >= -0.01
+    dry = wt_grid <= 0.5
+    valid = land & dry
+
+    # Slope from neighbours using numpy slicing
+    el_pad = np.pad(elev_grid, 1, mode='edge')
+    slope_e = np.abs(elev_grid - el_pad[1:-1, 2:])
+    slope_w = np.abs(elev_grid - el_pad[1:-1, :-2])
+    slope_n = np.abs(elev_grid - el_pad[:-2, 1:-1])
+    slope_s = np.abs(elev_grid - el_pad[2:, 1:-1])
+    slope = np.maximum.reduce([slope_e, slope_w, slope_n, slope_s])
+    valid &= slope <= 0.02
+
+    # Wetland suitability for each valid cell
     by_type: dict = defaultdict(list)
 
-    for i in range(len(lats)):
-        for j in range(len(lons)):
-            el = elev_grid[i, j]
-            if el < -0.01:
+    for i in range(nlat):
+        for j in range(nlon):
+            if not valid[i, j]:
                 continue
-
-            wt = wt_grid[i, j]
-            if wt > 0.5:
-                continue
-
-            # Slope from neighbours
-            el_e = elev_grid[i, j + 1] if j + 1 < elev_grid.shape[1] else el
-            el_w = elev_grid[i, j - 1] if j - 1 >= 0 else el
-            el_n = elev_grid[i - 1, j] if i - 1 >= 0 else el
-            el_s = elev_grid[i + 1, j] if i + 1 < elev_grid.shape[0] else el
-            slope = max(abs(el - el_e), abs(el - el_w), abs(el - el_n), abs(el - el_s))
-            if slope > 0.02:
-                continue
-
             temp = temp_grid[i, j]
             precip = precip_grid[i, j]
+            wt = wt_grid[i, j]
 
             scores = _wetland_suitability(wt, temp, precip)
             if not scores:
                 continue
 
-            # Pick highest-scoring wetland type
             wtype = max(scores, key=scores.get)
-            if scores[wtype] > 0.3:  # minimum suitability threshold
+            if scores[wtype] > 0.3:
                 by_type[wtype].append((float(lats[i]), float(lons[j])))
 
     # For each type, extract polygons via threshold_polygons on water_table_depth
