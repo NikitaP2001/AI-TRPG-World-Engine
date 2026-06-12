@@ -1,7 +1,9 @@
 """Time Engine — advances world simulation state.
 
 Reads current time from SQLite, updates temperature (hourly) and
-L1 causal features (daily: lakes, groundwater, wetlands).
+L1 causal features (daily: lakes, groundwater, wetlands, vegetation),
+plus long-cycle processes (climate drift, resources, tectonics) at
+configurable intervals.
 
 Usage:
     from simulation.time_engine import TimeEngine
@@ -11,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import math
+import random
 from typing import Dict, List, Optional
 
 from .world_db import WorldDB
@@ -22,6 +25,11 @@ from .layer0.climate import (
     _cos_zenith_angle,
 )
 
+# Long-cycle intervals [days] — no need on every advance
+_CLIMATE_DRIFT_INTERVAL = 100       # random walk temp/precip
+_RESOURCE_EVOLVE_INTERVAL = 365     # Gray-Scott resource flux drift
+_GEOLOGICAL_EVENT_INTERVAL = 1000   # tectonic stress → earthquakes
+
 
 class TimeEngine:
     """Drives world simulation forward in time.
@@ -29,12 +37,15 @@ class TimeEngine:
     Each advance() call:
       1. Moves world_time forward (handles day/year rollover)
       2. Recomputes temperature for every cell (hourly, seasonal+diurnal)
-      3. Runs L1 causal features (daily: lakes, groundwater, wetlands)
-      4. Writes updated cells + features to SQLite
+      3. Runs L1 causal features (daily: lakes, groundwater, wetlands, vegetation)
+      4. Runs long-cycle processes at configurable intervals
+      5. Writes updated cells + features to SQLite
     """
 
     def __init__(self, db: WorldDB):
         self.db = db
+        self._accumulated_days: float = 0.0
+        self._rng = random.Random(42)
 
     # ── Public API ──────────────────────────────────────────────────
 
@@ -43,7 +54,9 @@ class TimeEngine:
         """Advance world time and update all time-dependent fields.
 
         Hourly: temperature (instant_temperature with diurnal cycle).
-        Daily:  L1 features (lake water balance, groundwater, wetland peat).
+        Daily:  L1 features (lake, groundwater, wetland, vegetation).
+        Long-cycle: climate drift (~100d), resource evolution (~365d),
+                    geological events (~1000d).
 
         Args:
             days, hours, minutes, seconds: time to advance.
@@ -72,6 +85,10 @@ class TimeEngine:
         # ── L1 daily step: run causal features for total days ──
         total_days = max(1, int(days + hours / 24 + minutes / 1440))
         self._run_l1_step(dt_days=total_days)
+
+        # ── Long-cycle processes at intervals ──
+        self._accumulated_days += total_days
+        self._run_long_cycle()
 
         return self._summary(time)
 
@@ -210,13 +227,15 @@ class TimeEngine:
         engine.step(dt=float(dt_days))
 
         # 6. Propagate mutable field state back to CellData
-        canopy_f = fields.get_mutable("canopy_density")
-        biomass_f = fields.get_mutable("biomass")
-        soil_mut = fields.get_mutable("soil_fertility")
         import h3
+        wt_f = fields.get("water_table_depth")
+        canopy_f = fields.get("canopy_density")
+        biomass_f = fields.get("biomass")
+        soil_mut = fields.get("soil_fertility")
         for cell in cells:
             latlng = h3.cell_to_latlng(cell.h3_id)
             lat, lon = float(latlng[0]), float(latlng[1])
+            cell.water_table_depth = max(0.0, wt_f(lat, lon))
             cell.canopy_density = max(0.0, min(1.0, canopy_f(lat, lon)))
             cell.biomass_kgm2 = max(0.0, biomass_f(lat, lon))
             cell.soil_fertility = max(0.0, min(1.0, soil_mut(lat, lon)))
@@ -254,6 +273,54 @@ class TimeEngine:
             "temp_max": max(temps) if temps else 0,
             "temp_mean": sum(temps) / len(temps) if temps else 0,
         }
+
+    # ── Long-cycle processes (slow planetary changes) ──────────────
+
+    def _run_long_cycle(self) -> None:
+        """Run long-cycle planetary processes at configurable intervals.
+
+        Climate drift: ~100d — random walk temperature/precipitation.
+        Resource flux: ~365d — Gray-Scott resource evolution.
+        Geological events: ~1000d — tectonic stress → earthquakes.
+        """
+        acc = self._accumulated_days
+
+        if acc < _CLIMATE_DRIFT_INTERVAL:
+            return  # nothing to do yet
+
+        cells = self.db.load_cells_as_celldata()
+        if not cells:
+            return
+
+        # Climate drift at ~100d intervals
+        if acc >= _CLIMATE_DRIFT_INTERVAL:
+            from .layer0.long_cycle import _drift_climate
+            n = _drift_climate(cells, drift_rate=0.003, rng=self._rng)
+            if n > 0:
+                print(f"  [LongCycle] climate drift: {n} cells changed class")
+            self._accumulated_days -= _CLIMATE_DRIFT_INTERVAL
+
+        # Resource evolution at ~365d intervals
+        if acc >= _RESOURCE_EVOLVE_INTERVAL:
+            from .layer0.long_cycle import _evolve_resources
+            from .layer0.resources import default_resource_types
+            rtypes = default_resource_types()
+            _evolve_resources(cells, rtypes, steps=5, rng=self._rng)
+            self._accumulated_days -= _RESOURCE_EVOLVE_INTERVAL
+
+        # Geological events at ~1000d intervals
+        if acc >= _GEOLOGICAL_EVENT_INTERVAL:
+            from .layer0.long_cycle import _check_geological_events
+            events = _check_geological_events(
+                cells, stress_accumulation_rate=0.01,
+                event_threshold=0.8, rng=self._rng,
+            )
+            if events:
+                print(f"  [LongCycle] {len(events)} geological event(s)")
+            self._accumulated_days -= _GEOLOGICAL_EVENT_INTERVAL
+
+        # Save any cell modifications from long-cycle
+        self.db.save_cells(cells)
 
 
 # ======================================================================

@@ -23,7 +23,7 @@ from shapely.geometry import MultiPoint, Polygon as SPolygon
 
 from .base import Feature
 from ..fields import FieldRegistry
-from ...layer0.climate import potential_evap_mm_day, _saturation_vp
+from ...layer0.climate import potential_evap_mm_day, _saturation_vp, norm_to_c, _ELEV_UNIT_TO_M
 
 
 def _detect_depressions(
@@ -196,7 +196,7 @@ class Lake(Feature):
 
         # Max volume from area (conical depression approximation, P0.6)
         # V_max ≈ 0.3 * A * depth  where depth ≈ spill * 500 m
-        depth_m = max(10.0, spill_elevation * 500.0)
+        depth_m = max(10.0, spill_elevation * _ELEV_UNIT_TO_M)
         max_volume_m3 = max_area_m2 * depth_m * 0.3
 
         # Initial volume: small baseline, will be refined by water balance ticks (P0.7)
@@ -260,7 +260,7 @@ class Lake(Feature):
 
         # ── 5. Evaporation (Penman-Monteith, P0.8-P0.9) ──
         temp_norm = fields.get("temperature").base_only(clat, clon)
-        temp_c = temp_norm * 45.0 - 5.0
+        temp_c = norm_to_c(temp_norm)
         rh = min(0.90, max(0.25, 0.3 + precip_norm * 0.6))
 
         # Wind from fields (P0.8): геострофический ветер уже в CellData
@@ -321,7 +321,7 @@ class Lake(Feature):
         fill = new_vol / max(1.0, v_max)
         spill_elev = self.props.get("spill_elevation", 1.0)
         # Level from hypsometry: для конической депрессии depth ∝ V^(1/3)
-        new_level = spill_elev * 500.0 * (fill ** (1.0 / 3.0))
+        new_level = spill_elev * _ELEV_UNIT_TO_M * (fill ** (1.0 / 3.0))
 
         self.props["volume_m3"] = new_vol
         self.props["level_m"] = new_level

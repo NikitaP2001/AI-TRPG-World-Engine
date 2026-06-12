@@ -26,6 +26,7 @@ from shapely.geometry import Polygon as SPolygon
 
 from .base import Feature
 from ..fields import FieldRegistry
+from ...layer0.climate import norm_to_c
 
 
 def _wetland_suitability(
@@ -224,7 +225,7 @@ class Wetland(Feature):
         # Peat accumulation with Q10 temperature dependence (P1.2)
         # Q10 = 2.5 for peat formation (2-3 range)
         temp_norm = temp_f(clat, clon)
-        temp_c = max(0.0, temp_norm * 45.0 - 5.0)
+        temp_c = max(0.0, norm_to_c(temp_norm))
         q10 = 2.5
         base_rate = 0.0001  # 0.1mm/tick at 10°C
         temp_factor = q10 ** ((temp_c - 10.0) / 10.0)

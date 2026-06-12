@@ -984,30 +984,50 @@ void main() {
         db = WorldDB(db_path)
         self._feature_store = db.load_features()
         cells_raw = db.load_cells()
+        db.close()
 
+        from simulation.layer0.climate import norm_to_c
         cells = []
         for r in cells_raw:
-            temp_norm = r["temperature_norm"] if r["temperature_norm"] else (
-                r["temperature_c"] + 5.0) / 45.0
+            tn = r["temperature_norm"]
+            if tn is None:
+                tn = (r["temperature_c"] + 5.0) / 45.0 if r["temperature_c"] else 0.5
+            sl = (r["slope"], r.get("slope_dir", 0.0)) if r["slope"] else (0.0, 0.0)
             c = CellData(
-                h3_id=r["h3_id"],
-                resolution=2,
+                h3_id=r["h3_id"], resolution=2,
                 elevation_mean=r["elevation"],
+                elevation_variance=r.get("elevation_variance", 0.0),
+                slope=sl,
                 geological_type=r["geological_type"],
-                temperature=temp_norm,
-                precipitation=r["precipitation_norm"],
-                soil_fertility=r["soil_fertility"],
-                soil_depth=r["soil_depth"],
-                organic_matter=r["organic_matter"],
+                temperature=tn,
+                temp_seasonal_range=0.2,
+                precipitation=r["precipitation_norm"] or 0.5,
+                precip_seasonality=r.get("precip_seasonality", 0.3),
+                prevailing_wind=(r.get("wind_u", 0.0), r.get("wind_v", 0.0)),
+                soil_fertility=r["soil_fertility"] or 0.5,
+                soil_depth=r["soil_depth"] or 0.5,
+                water_table_depth=r.get("water_table_depth") or 5.0,
+                organic_matter=r["organic_matter"] or 0.0,
                 vegetation_cover=r["vegetation_cover"] or "barren",
                 bedrock_class=r.get("bedrock_class", "unknown"),
                 crustal_age_myr=r.get("crustal_age", 100.0),
                 crustal_thickness_km=r.get("crustal_thickness", 35.0),
                 thermal_gradient=r.get("thermal_gradient", 25.0),
-                climate_class=r.get("climate_class", ""),
+                climate_class=r.get("climate_class", "") or "",
+                canopy_density=r.get("canopy_density") or 0.0,
+                biomass_kgm2=r.get("biomass_kgm2") or 0.0,
+                runoff_ratio=r.get("runoff_ratio") or 0.5,
+                effective_precip=r.get("effective_precip") or 0.0,
+                hazard_level=r.get("hazard_level") or 0.0,
+                tectonic_stress=r.get("tectonic_stress") or 0.0,
+                clay_content=r.get("clay_content") or 0.0,
+                sand_content=r.get("sand_content") or 0.0,
+                silt_content=r.get("silt_content") or 0.0,
+                soil_ph=r.get("soil_ph") or 7.0,
+                cation_exchange=r.get("cation_exchange") or 5.0,
+                interception_coefficient=r.get("interception_coefficient") or 0.15,
             )
             cells.append(c)
-        db.close()
 
         # Print feature summary
         ftypes = {}
@@ -1311,66 +1331,103 @@ void main() {
 
             gen_rows = []
             import h3
+            from simulation.layer0.climate import norm_to_c
+
             latlng = h3.cell_to_latlng(cell.h3_id)
             lat_s = f"{latlng[0]:.2f}°{'N' if latlng[0]>=0 else 'S'}"
             lon_s = f"{latlng[1]:.2f}°{'E' if latlng[1]>=0 else 'W'}"
+
+            # ── 1. GENERAL ──
+            gen_rows = []
             gen_rows.append(("Coordinates", f"{lat_s}, {lon_s}"))
-            elev_m = cell.elevation_mean * 5000.0
-            temp_c = cell.temperature * 45.0 - 5.0
-            gen_rows.append(("Elevation", f"{elev_m:.0f} m"))
-            gen_rows.append(("Temperature", f"{temp_c:.1f} °C"))
+            gen_rows.append(("Elevation", f"{cell.elevation_mean*5000:.0f} m"))
+            gen_rows.append(("Slope", f"{cell.slope[0]*100:.1f}%"))
+            gen_rows.append(("Temperature", f"{norm_to_c(cell.temperature):.1f} °C"))
+            gen_rows.append(("Precipitation", f"{cell.precipitation*2000:.0f} mm/yr"))
+            gen_rows.append(("Seasonality", f"{cell.precip_seasonality*100:.0f}%"))
             cc = cell.climate_class or ""
-            climate_display = f"{koppen_name(cc)} ({cc})" if cc else "N/A"
-            gen_rows.append(("Climate", climate_display))
+            gen_rows.append(("Climate", f"{koppen_name(cc)} ({cc})" if cc else "N/A"))
+            gen_rows.append(("Wind", f"({cell.prevailing_wind[0]:.2f}, {cell.prevailing_wind[1]:.2f})"))
             add_section("GENERAL", gen_rows)
 
+            # ── 2. GEOLOGY ──
             geo_rows = []
-            gn = geology_name(cell.geological_type)
-            geo_rows.append(("Terrain", gn))
-            bc = getattr(cell, 'bedrock_class', 'unknown').replace('_', ' ').title()
-            geo_rows.append(("Bedrock", bc))
-            ca = getattr(cell, 'crustal_age_myr', 0)
-            geo_rows.append(("Crustal Age", f"{ca:.0f} Myr"))
-            ct = getattr(cell, 'crustal_thickness_km', 0)
-            geo_rows.append(("Crust Thick", f"{ct:.0f} km"))
-            tg = getattr(cell, 'thermal_gradient', 0)
-            geo_rows.append(("Thermal Grad", f"{tg:.0f} degC/km"))
+            geo_rows.append(("Terrain", geology_name(cell.geological_type)))
+            geo_rows.append(("Bedrock", getattr(cell, 'bedrock_class', 'unknown').replace('_', ' ').title()))
+            geo_rows.append(("Crustal Age", f"{getattr(cell, 'crustal_age_myr', 0):.0f} Myr"))
+            geo_rows.append(("Crust Thick", f"{getattr(cell, 'crustal_thickness_km', 0):.0f} km"))
+            geo_rows.append(("Thermal Grad", f"{getattr(cell, 'thermal_gradient', 0):.0f} °C/km"))
             ts = cell.tectonic_stress
-            ts_label = f"{'Low' if ts < 0.3 else 'Moderate' if ts < 0.6 else 'High' if ts < 0.8 else 'Extreme'} ({ts:.2f})"
+            ts_label = f"{'Low' if ts<0.3 else 'Moderate' if ts<0.6 else 'High' if ts<0.8 else 'Extreme'} ({ts:.2f})"
             geo_rows.append(("Tectonic Stress", ts_label))
-            geo_rows.append(("Soil Fertility", f"{cell.soil_fertility*100:.0f}%"))
             add_section("GEOLOGY", geo_rows)
 
-            env_rows = []
-            precip_mm = cell.precipitation * 2000.0
-            env_rows.append(("Precipitation", f"{precip_mm:.0f} mm/yr"))
-            hl = cell.hazard_level
-            hl_label = f"{'Safe' if hl < 0.2 else 'Low' if hl < 0.4 else 'Moderate' if hl < 0.6 else 'High' if hl < 0.8 else 'Extreme'} ({hl:.2f})"
-            env_rows.append(("Hazard Level", hl_label))
-            add_section("ENVIRONMENT", env_rows)
+            # ── 3. SOIL ──
+            soil_rows = []
+            soil_rows.append(("Fertility", f"{cell.soil_fertility*100:.0f}%"))
+            soil_rows.append(("Depth", f"{cell.soil_depth:.2f}"))
+            soil_rows.append(("Organic Matter", f"{cell.organic_matter*100:.1f}%"))
+            soil_rows.append(("Clay/Sand/Silt", f"{cell.clay_content*100:.0f}/{cell.sand_content*100:.0f}/{cell.silt_content*100:.0f}"))
+            soil_rows.append(("pH", f"{cell.soil_ph:.1f}"))
+            soil_rows.append(("CEC", f"{cell.cation_exchange:.1f} cmol/kg"))
+            add_section("SOIL", soil_rows)
 
-            feat_rows = []
+            # ── 4. WATER ──
+            water_rows = []
+            water_rows.append(("Water Table", f"{cell.water_table_depth:.1f}"))
+            water_rows.append(("Runoff Ratio", f"{cell.runoff_ratio*100:.0f}%"))
+            water_rows.append(("Effective Precip", f"{cell.effective_precip:.3f}"))
+            water_rows.append(("Hazard Level", f"{cell.hazard_level:.2f}"))
+            add_section("WATER", water_rows)
+
+            # ── 5. VEGETATION ──
+            veg_rows = []
+            veg_rows.append(("Cover", cell.vegetation_cover or "barren"))
+            veg_rows.append(("Canopy", f"{cell.canopy_density*100:.0f}%"))
+            veg_rows.append(("Biomass", f"{cell.biomass_kgm2:.1f} kg/m²"))
+            veg_rows.append(("Interception", f"{cell.interception_coefficient*100:.0f}%"))
+            add_section("VEGETATION", veg_rows)
+
+            # ── 6. RESOURCES + FEATURES (hex-query based) ──
             res_rows = []
-            if cell.feature_ids:
-                for fid in cell.feature_ids:
-                    feat = self._feature_store.get_feature(fid) if self._feature_store else None
-                    if not feat:
-                        continue
-                    name = feat.name or fid[:10]
-                    ftype = feat.type.replace("_", " ").title()
-                    if feat.type == "ore_deposit":
-                        primary = feat.properties.get("primary_ore", "?")
-                        grade = feat.properties.get("grade", 0)
-                        depth = feat.properties.get("depth_top_m", 0)
-                        label = primary.replace("_", " ").title()
-                        val = f"Grade {grade*100:.1f}%, {depth}m deep"
-                        res_rows.append((label, val))
-                    elif feat.type == "spring":
-                        flow = feat.properties.get("flow_rate_ls", 0)
-                        temp = feat.properties.get("temperature_c", 10)
-                        res_rows.append(("Spring", f"{flow:.1f} L/s, {temp:.0f} degC"))
-                    else:
-                        feat_rows.append((ftype, name))
+            feat_rows = []
+            if self._feature_store is not None:
+                hex_features = self._feature_store.features_in_hex(cell.h3_id)
+            else:
+                hex_features = []
+            seen_types: dict = {}
+            for feat in hex_features:
+                nm = feat.name or feat.feature_id[:10]
+                ft = feat.type.replace("_", " ").title()
+                seen_types.setdefault(ft, 0)
+                seen_types[ft] += 1
+                if feat.type == "ore_deposit":
+                    primary = feat.properties.get("primary_ore", "?")
+                    grade = feat.properties.get("grade", 0)
+                    depth = feat.properties.get("depth_top_m", 0)
+                    ore_name = primary.replace("_", " ").title() if primary != "?" else "Unknown Ore"
+                    res_rows.append((ore_name, f"Grade {grade*100:.1f}%, {depth}m deep"))
+                elif feat.type == "special_resource_zone":
+                    rpct = feat.properties.get("resource_pct", 0)
+                    res_rows.append(("Magic Flux", f"{rpct:.0f}% concentration"))
+                elif feat.type == "spring":
+                    flow = feat.properties.get("flow_rate_ls", 0)
+                    stemp = feat.properties.get("temperature_c", 10)
+                    res_rows.append(("Spring", f"{flow:.1f} L/s, {stemp:.0f} °C"))
+                elif feat.type == "lake":
+                    vol = feat.properties.get("volume_m3", 0)
+                    fill = feat.properties.get("fill_fraction", 0)
+                    res_rows.append(("Lake", f"{fill*100:.0f}% full, {vol:.0f} m³"))
+                elif feat.type == "river":
+                    width = feat.properties.get("width_km", 0)
+                    res_rows.append(("River", f"{width:.2f} km wide"))
+                elif feat.type not in ("ore_deposit", "special_resource_zone", "spring", "lake", "river",
+                                        "temperature_band", "soil_region", "geology_region"):
+                    feat_rows.append((ft, nm))
+            for ft, count in sorted(seen_types.items()):
+                if count > 1 and ft not in ("Ore Deposit", "Special Resource Zone", "Spring", "Lake", "River",
+                                             "Temperature Band", "Soil Region", "Geology Region"):
+                    feat_rows.append((f"{ft} (×{count})", ""))
             if res_rows:
                 add_section("RESOURCES", res_rows)
             if feat_rows:

@@ -20,6 +20,7 @@ import h3
 import numpy as np
 
 from .cell_model import CellData
+from .climate import norm_to_c
 
 
 # ======================================================================
@@ -247,7 +248,7 @@ def compute_runoff_for_cells(
             continue
 
         temp_norm = getattr(cell, 'temperature', 0.5)
-        temp_c = temp_norm * 45.0 - 5.0
+        temp_c = norm_to_c(temp_norm)
         # Use continuous canopy_density (P1.6/P1.4)
         canopy = getattr(cell, 'canopy_density', 0.0) or _VEG_CANOPY_FALLBACK.get(cell.vegetation_cover or "barren", 0.0)
 

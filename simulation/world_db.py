@@ -145,6 +145,18 @@ class WorldDB:
         "runoff_ratio": "REAL DEFAULT 0.3",
         "effective_precip": "REAL DEFAULT 0.15",
         "updated_at_tick": "INTEGER DEFAULT 0",
+        # Missing fields that CellData has but weren't in schema
+        "precip_seasonality": "REAL DEFAULT 0.3",
+        "hazard_level": "REAL DEFAULT 0.0",
+        "tectonic_stress": "REAL DEFAULT 0.0",
+        "clay_content": "REAL DEFAULT 0.0",
+        "sand_content": "REAL DEFAULT 0.0",
+        "silt_content": "REAL DEFAULT 0.0",
+        "soil_ph": "REAL DEFAULT 7.0",
+        "cation_exchange": "REAL DEFAULT 5.0",
+        "interception_coefficient": "REAL DEFAULT 0.15",
+        "slope_dir": "REAL DEFAULT 0.0",
+        "elevation_variance": "REAL DEFAULT 0.0",
     }
 
     def _migrate_schema(self) -> None:
@@ -229,8 +241,13 @@ class WorldDB:
                 canopy_density, biomass_kgm2,
                 runoff_ratio, effective_precip,
                 crustal_age, crustal_thickness, thermal_gradient,
-                updated_at_tick
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                updated_at_tick,
+                precip_seasonality, hazard_level, tectonic_stress,
+                clay_content, sand_content, silt_content,
+                soil_ph, cation_exchange, interception_coefficient,
+                slope_dir, elevation_variance
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )""",
             [self._cell_to_row(c) for c in cells],
         )
@@ -239,16 +256,16 @@ class WorldDB:
     def _cell_to_row(self, c: CellData) -> tuple:
         import h3
         latlng = h3.cell_to_latlng(c.h3_id)
+        from .layer0.climate import norm_to_c
         temp_norm = getattr(c, 'temperature', 0.5)
-        temp_c = temp_norm * 45.0 - 5.0
-        pw = getattr(c, 'prevailing_wind', (0.0, 0.0))
-        if pw is None:
-            pw = (0.0, 0.0)
+        temp_c = norm_to_c(temp_norm)
+        pw = getattr(c, 'prevailing_wind', (0.0, 0.0)) or (0.0, 0.0)
+        sl = getattr(c, 'slope', (0.0, 0.0)) or (0.0, 0.0)
         return (
             c.h3_id,
             latlng[0], latlng[1],
             getattr(c, 'elevation_mean', 0.0),
-            getattr(c, 'slope', (0.0, 0.0))[0],
+            sl[0],                       # slope magnitude
             getattr(c, 'bedrock_class', 'continental_granite'),
             getattr(c, 'geological_type', 2),
             1 if getattr(c, 'elevation_mean', 0) < -0.01 else 0,
@@ -256,7 +273,7 @@ class WorldDB:
             temp_norm,
             getattr(c, 'precipitation', 0.5),
             float(pw[0]), float(pw[1]),
-            getattr(c, 'soil_fertility', 0.3),
+            getattr(c, 'soil_fertility', 0.5),
             getattr(c, 'soil_depth', 0.5),
             getattr(c, 'water_table_depth', 5.0),
             getattr(c, 'organic_matter', 0.0),
@@ -265,12 +282,24 @@ class WorldDB:
             getattr(c, 'climate_class', ''),
             getattr(c, 'canopy_density', 0.0),
             getattr(c, 'biomass_kgm2', 0.0),
-            getattr(c, 'runoff_ratio', 0.3),
-            getattr(c, 'effective_precip', 0.15),
+            getattr(c, 'runoff_ratio', 0.5),
+            getattr(c, 'effective_precip', 0.0),
             getattr(c, 'crustal_age_myr', 100.0),
             getattr(c, 'crustal_thickness_km', 35.0),
             getattr(c, 'thermal_gradient', 25.0),
             0,
+            # New columns
+            getattr(c, 'precip_seasonality', 0.3),
+            getattr(c, 'hazard_level', 0.0),
+            getattr(c, 'tectonic_stress', 0.0),
+            getattr(c, 'clay_content', 0.0),
+            getattr(c, 'sand_content', 0.0),
+            getattr(c, 'silt_content', 0.0),
+            getattr(c, 'soil_ph', 7.0),
+            getattr(c, 'cation_exchange', 5.0),
+            getattr(c, 'interception_coefficient', 0.15),
+            sl[1],                       # slope direction (radians)
+            getattr(c, 'elevation_variance', 0.0),
         )
 
     def load_cells(self) -> List[Dict[str, Any]]:
@@ -280,24 +309,46 @@ class WorldDB:
         return [dict(r) for r in rows]
 
     def load_cells_as_celldata(self) -> List[CellData]:
-        """Load cells into CellData objects (for compatibility)."""
+        """Load cells into CellData objects — ALL fields."""
+        from .layer0.climate import norm_to_c
         rows = self.load_cells()
         cells = []
         for r in rows:
             c = CellData(h3_id=r["h3_id"], resolution=2)
             c.elevation_mean = r["elevation"]
-            c.slope = (r["slope"], 0.0) if r["slope"] else (0.0, 0.0)
+            c.elevation_variance = r.get("elevation_variance", 0.0)
+            c.slope = (r["slope"], r.get("slope_dir", 0.0)) if r["slope"] else (0.0, 0.0)
             c.bedrock_class = r["bedrock_class"]
             c.geological_type = r["geological_type"]
-            c.temperature = r["temperature_norm"] if r["temperature_norm"] else (r["temperature_c"] + 5.0) / 45.0
-            c.precipitation = r["precipitation_norm"]
-            c.soil_fertility = r["soil_fertility"]
-            c.soil_depth = r["soil_depth"]
-            c.water_table_depth = r["water_table_depth"] if r["water_table_depth"] else 5.0
-            c.organic_matter = r["organic_matter"]
-            c.vegetation_cover = r["vegetation_cover"]
-            c.canopy_density = r["canopy_density"] if r["canopy_density"] else 0.0
-            c.biomass_kgm2 = r["biomass_kgm2"] if r["biomass_kgm2"] else 0.0
+            # Temperature: prefer norm if available
+            tn = r["temperature_norm"]
+            if tn is None:
+                tn = (r["temperature_c"] + 5.0) / 45.0 if r["temperature_c"] else 0.5
+            c.temperature = tn
+            c.precipitation = r["precipitation_norm"] or 0.5
+            c.precip_seasonality = r.get("precip_seasonality", 0.3)
+            c.prevailing_wind = (r.get("wind_u", 0.0), r.get("wind_v", 0.0))
+            c.soil_fertility = r["soil_fertility"] or 0.5
+            c.soil_depth = r["soil_depth"] or 0.5
+            c.water_table_depth = r.get("water_table_depth") or 5.0
+            c.organic_matter = r["organic_matter"] or 0.0
+            c.vegetation_cover = r["vegetation_cover"] or "barren"
+            c.climate_class = r.get("climate_class", "") or ""
+            c.canopy_density = r.get("canopy_density") or 0.0
+            c.biomass_kgm2 = r.get("biomass_kgm2") or 0.0
+            c.runoff_ratio = r.get("runoff_ratio") or 0.5
+            c.effective_precip = r.get("effective_precip") or 0.0
+            c.hazard_level = r.get("hazard_level") or 0.0
+            c.tectonic_stress = r.get("tectonic_stress") or 0.0
+            c.clay_content = r.get("clay_content") or 0.0
+            c.sand_content = r.get("sand_content") or 0.0
+            c.silt_content = r.get("silt_content") or 0.0
+            c.soil_ph = r.get("soil_ph") or 7.0
+            c.cation_exchange = r.get("cation_exchange") or 5.0
+            c.interception_coefficient = r.get("interception_coefficient") or 0.15
+            c.crustal_age_myr = r.get("crustal_age") or 100.0
+            c.crustal_thickness_km = r.get("crustal_thickness") or 35.0
+            c.thermal_gradient = r.get("thermal_gradient") or 25.0
             cells.append(c)
         return cells
 

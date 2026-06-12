@@ -303,11 +303,12 @@ def _extract_resource_zone_polygons(
         # Sample mean flux inside polygon
         centroid = poly.centroid
         mean_flux = flux_field(centroid.y, centroid.x)
+        flux_pct = mean_flux * 100
         features.append(Feature(
             type="special_resource_zone",
-            name=f"Deposit #{len(features) + 1}",
+            name=f"Resource Zone ({flux_pct:.0f}% flux)",
             geometry=poly,
-            properties={"mean_flux": mean_flux, "area_deg2": poly.area},
+            properties={"mean_flux": mean_flux, "resource_pct": flux_pct, "area_deg2": poly.area},
         ))
     return features
 
@@ -566,21 +567,63 @@ def generate_world(
     ocean_set = ocean_cells
     land_set = land_cells
 
-    # Continent = largest connected land mass by elevation
-    # (elevation > 0, NOT geological_type — mountain belts on continent
-    #  are geo_type 3 but are NOT islands)
-    all_land_h3 = [h for h in all_ids if elevation.get(h, 0.0) > 0.0]
-    land_clusters = _cluster_cells(all_land_h3, lambda h: True)
-    land_clusters.sort(key=len, reverse=True)
-    if land_clusters and len(land_clusters[0]) > max(3, len(all_land_h3) * 0.1):
-        continent_cells = set(land_clusters[0])
-    else:
-        continent_cells = set(all_land_h3)
+    # Continent detection via elevation isoline (P0.4)
+    # Build temporary ContinuousField, extract elevation=0 isoline
+    from .contouring import ContinuousField, sample_grid, threshold_polygons
+    from scipy.spatial import cKDTree
+    import numpy as np
+    elev_pts = []
+    elev_vals = []
+    for h in all_ids:
+        latlng = h3.cell_to_latlng(h)
+        lat_r = math.radians(latlng[0])
+        lon_r = math.radians(latlng[1])
+        elev_pts.append([math.cos(lat_r)*math.cos(lon_r),
+                          math.sin(lat_r),
+                          math.cos(lat_r)*math.sin(lon_r)])
+        elev_vals.append(elevation.get(h, 0.0))
+    tmp_tree = cKDTree(np.array(elev_pts, dtype=np.float64))
+    tmp_elev = ContinuousField(tmp_tree, np.array(elev_vals, dtype=np.float64))
+    cont_lats, cont_lons, cont_vals = sample_grid(tmp_elev, lat_step=0.25, lon_step=0.25)
+    land_polys = threshold_polygons(cont_lats, cont_lons, cont_vals,
+                                     threshold=0.0, use_above=True,
+                                     min_area=0.1, simplify_tol=0.05)
+    land_polys.sort(key=lambda p: p.area, reverse=True)
 
-    # Islands = any land cluster not connected to the continent
+    res = params.h3_resolution
+    continent_cells = set()
     island_cells = set()
-    for cl in land_clusters[1:]:
-        island_cells.update(cl)
+    # Use KDTree to efficiently find H3 cells inside each polygon
+    for i, poly in enumerate(land_polys):
+        if poly.area < 0.01:
+            continue
+        minx, miny, maxx, maxy = poly.bounds
+        # Find candidate H3 cells within polygon bounding box
+        poly_cells = set()
+        for h in all_ids:
+            latlng = h3.cell_to_latlng(h)
+            if (minx <= latlng[1] <= maxx and miny <= latlng[0] <= maxy
+                    and elevation.get(h, 0.0) > 0.0):
+                pt = __import__('shapely').geometry.Point(latlng[1], latlng[0])
+                if poly.contains(pt):
+                    poly_cells.add(h)
+        if i == 0:
+            continent_cells = poly_cells
+        else:
+            island_cells |= poly_cells
+
+    # Fallback: if contouring produced no cells, use original clustering
+    if not continent_cells:
+        all_land_h3 = [h for h in all_ids if elevation.get(h, 0.0) > 0.0]
+        land_clusters = _cluster_cells(all_land_h3, lambda h: True)
+        land_clusters.sort(key=len, reverse=True)
+        if land_clusters and len(land_clusters[0]) > max(3, len(all_land_h3) * 0.1):
+            continent_cells = set(land_clusters[0])
+        else:
+            continent_cells = set(all_land_h3)
+        island_cells = set()
+        for cl in land_clusters[1:]:
+            island_cells.update(cl)
 
     # Continental shelf: oceanic cells adjacent to land
     shelf_cells: set = set()

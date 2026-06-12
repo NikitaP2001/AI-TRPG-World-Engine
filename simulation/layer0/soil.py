@@ -23,6 +23,7 @@ import math
 from typing import Dict, List, Optional, Tuple
 
 from .cell_model import CellData
+from .climate import norm_to_c
 from .geology import get_mineral_profile, MineralProfile
 
 
@@ -83,7 +84,7 @@ def compute_weathering(
         }
 
     # Temperature factor: Q10 ≈ 2 (reaction rate doubles per 10°C)
-    temp_c = temperature * 45.0 - 5.0
+    temp_c = norm_to_c(temperature)
     if temp_c <= 0.0:
         temp_factor = 0.05  # Freezing = minimal chemical weathering
     else:
@@ -349,7 +350,7 @@ def update_organic_matter(
     litter_input = 0.15 * canopy
 
     # Decomposition rate: Q10 ≈ 2 with moisture limitation
-    temp_c = temperature * 45.0 - 5.0
+    temp_c = norm_to_c(temperature)
     if temp_c <= 0.0:
         decomp_rate = 0.02  # minimal at freezing
     else:

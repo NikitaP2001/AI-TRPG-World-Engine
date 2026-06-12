@@ -97,40 +97,51 @@ class CellDisplayGrid:
             all_ids = all_ids[:int(len(all_ids) * world_extent)]
         self.h3_ids = all_ids
 
-    # ── Cell info queries (from Feature Store) ──────────────────────
+    # ── Hex-based feature queries (polygon intersection, not centroid) ─
 
     def features_at(self, h3_id: str) -> List[Any]:
-        """Return all features whose geometry contains this cell's centroid."""
-        latlng = h3.cell_to_latlng(h3_id)
-        return self.feature_store.at_point(latlng[0], latlng[1])
+        """Return all features intersecting this cell's hexagon area."""
+        return self.feature_store.features_in_hex(h3_id)
 
-    def cell_info(self, h3_id: str) -> dict:
-        """Compute all display properties for a cell from the feature store."""
+    def hex_info(self, h3_id: str) -> dict:
+        """Comprehensive info for a hexagon — features + inferred terrain.
+
+        Queries features by hex boundary intersection (not centroid point).
+        Returns everything the info panel needs.
+        """
         features = self.features_at(h3_id)
         latlng = h3.cell_to_latlng(h3_id)
 
         info = {
             "h3_id": h3_id,
+            "lat": latlng[0],
+            "lon": latlng[1],
             "features": features,
+            "features_by_type": {},
             "elevation_mean": 0.0,
             "geological_type": 0,
             "temperature": 0.5,
             "precipitation": 0.5,
+            "precip_seasonality": 0.3,
             "soil_fertility": 0.02,
             "vegetation_cover": "barren",
             "is_ocean": True,
+            "has_river": False,
+            "has_lake": False,
+            "has_road": False,
+            "hazard_level": 0.0,
+            "wind_u": 0.0,
+            "wind_v": 0.0,
         }
 
-        # Query features by type to populate info
+        # Classify features by type
         for f in features:
             ft = f.type
+            info["features_by_type"].setdefault(ft, []).append(f)
             props = f.properties or {}
 
             if ft == "elevation_contour":
-                info["elevation_mean"] = max(
-                    info["elevation_mean"],
-                    props.get("elevation", 0.0),
-                )
+                info["elevation_mean"] = max(info["elevation_mean"], props.get("elevation", 0.0))
             elif ft == "temperature_band":
                 info["temperature"] = props.get("temperature", info["temperature"])
                 info["precipitation"] = props.get("precipitation", info["precipitation"])
@@ -140,12 +151,16 @@ class CellDisplayGrid:
                 info["vegetation_cover"] = props.get("cover_type", info["vegetation_cover"])
             elif ft == "geology_region":
                 info["geological_type"] = props.get("geological_type", info["geological_type"])
+            elif ft == "climate_zone":
+                info["precip_seasonality"] = props.get("seasonality", info["precip_seasonality"])
+            elif ft == "river":
+                info["has_river"] = True
+            elif ft == "lake":
+                info["has_lake"] = True
             elif ft in ("ocean", "sea"):
                 info["is_ocean"] = True
 
-        # Determine ocean from geology
         info["is_ocean"] = info["geological_type"] == 0
-
         return info
 
     # ── Color queries (for rendering) ───────────────────────────────

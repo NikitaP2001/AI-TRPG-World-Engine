@@ -122,7 +122,7 @@ def compute_wind_field(
     # Convert temperature map to °C
     temp_c: Dict[str, float] = {}
     for h in h3_ids:
-        temp_c[h] = temperature.get(h, 0.5) * 45.0 - 5.0
+        temp_c[h] = norm_to_c(temperature.get(h, 0.5))
 
     wind: Dict[str, Tuple[float, float]] = {}
 
@@ -206,6 +206,16 @@ _ELEV_UNIT_TO_M = 500.0           # 1 elev unit ~ 500 m
 _TEMP_SENSITIVITY = 0.05          # dT/dQ [degC/(W/m^2)]
 _OCEAN_DAMPING = 4.0              # ocean thermal inertia vs land
 _COASTAL_DAMPING = 1.8            # coastal moderation factor
+
+# Normalised 0-1 ↔ °C conversion (used across L0+L1)
+TEMP_C_MIN = -5.0
+TEMP_C_MAX = 40.0
+_TEMP_C_RANGE = TEMP_C_MAX - TEMP_C_MIN  # 45.0
+
+
+def norm_to_c(temp_norm: float) -> float:
+    """Convert 0-1 normalised temperature to °C."""
+    return temp_norm * _TEMP_C_RANGE + TEMP_C_MIN
 
 
 def _solar_declination(day_of_year: float, axial_tilt: float) -> float:

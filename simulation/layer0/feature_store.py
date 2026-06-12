@@ -260,7 +260,6 @@ class FeatureStore:
 
     def within_distance(self, geometry: Any, distance_degrees: float) -> List[Feature]:
         """All active features within the given distance (in degrees)."""
-        # Buffer and intersect (Shapely 2.0 compat — dwithin needs 2.1+)
         buffered = geometry.buffer(distance_degrees)
         return self._query_indices(buffered, "intersects")
 
@@ -268,34 +267,45 @@ class FeatureStore:
         """All active features containing this lat/lon point, smallest area first."""
         pt = SPoint(lon, lat)
         results = self.intersect(pt)
-        # Sort by area ascending (most specific first)
+        results.sort(key=lambda f: f.geometry.area if f.geometry is not None else float("inf"))
+        return results
+
+    def features_in_hex(self, h3_id: str, line_distance: float = 0.3) -> List[Feature]:
+        """All features intersecting this H3 hexagon polygon (not just centroid).
+
+        Uses hexagon boundary for precise intersection. For LineStrings (rivers),
+        applies a distance buffer since they may pass through without touching
+        the hex boundary.
+
+        Returns features sorted by area (smallest/most specific first).
+        """
+        import h3
+        boundary = h3.cell_to_boundary(h3_id)
+        # boundary returns [(lat, lon), ...] → Shapely wants (lon, lat)
+        hex_pts = [(lon, lat) for lat, lon in boundary]
+        if len(hex_pts) < 3:
+            return []
+        hex_poly = Polygon(hex_pts)
+
+        # Direct polygon intersection via STRtree (O(log N))
+        results = self.intersect(hex_poly)
+
+        # Catch LineStrings near the hex (rivers rarely hit boundary exactly)
+        nearby = self.within_distance(hex_poly, distance_degrees=line_distance)
+        for f in nearby:
+            if f.geometry is not None and f.geometry.geom_type == "LineString":
+                if f not in results:
+                    results.append(f)
+
         results.sort(key=lambda f: f.geometry.area if f.geometry is not None else float("inf"))
         return results
 
     # ── Cell synchronisation ─────────────────────────────────────────
 
-    def sync_cell(
-        self,
-        cell: CellData,
-        resolution: int = 2,
-    ) -> CellData:
-        """Update a cell's feature_ids cache by querying all intersecting features.
-
-        For LineString features (rivers), uses distance threshold since
-        cell centroids rarely fall exactly on the line.
-        """
-        import h3
-        latlng = h3.cell_to_latlng(cell.h3_id)
-        pt = SPoint(latlng[1], latlng[0])
-        # Direct intersect first
-        intersecting = self.intersect(pt)
-        # Also find LineString features within cell radius (~55km at H3 res 2)
-        nearby = self.within_distance(pt, distance_degrees=0.5)
-        for f in nearby:
-            if f.geometry is not None and f.geometry.geom_type == "LineString":
-                if f not in intersecting:
-                    intersecting.append(f)
-        cell.feature_ids = [f.feature_id for f in intersecting]
+    def sync_cell(self, cell: CellData) -> CellData:
+        """Update cell's feature_ids using hex polygon intersection (not centroid)."""
+        features = self.features_in_hex(cell.h3_id)
+        cell.feature_ids = [f.feature_id for f in features]
         return cell
 
     # ── Serialisation ───────────────────────────────────────────────

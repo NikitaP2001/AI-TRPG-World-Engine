@@ -162,7 +162,7 @@ class Groundwater(Feature):
     def compute_effects(self, fields: FieldRegistry, dt: float = 1.0) -> None:
         """Update water table for all land cells — numpy vectorized."""
         import numpy as np
-        from ...layer0.climate import potential_evap_mm_day
+        from ...layer0.climate import potential_evap_mm_day, norm_to_c
 
         wt = fields.get_mutable("water_table_depth")
         elev_f = fields.get("elevation_mean")
@@ -210,7 +210,7 @@ class Groundwater(Feature):
         sy = np.clip(0.35 - 0.3 * clay_est + 0.15 * sand_est, 0.02, 0.35)
 
         # Temperature
-        temp_c = temp_g * 45.0 - 5.0
+        temp_c = norm_to_c(temp_g)
 
         # Penman ET (vectorized per grid point)
         abs_lat = np.abs(lats)[:, None] * np.ones((1, nlo))  # broadcast
