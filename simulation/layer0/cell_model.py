@@ -103,6 +103,9 @@ class GenerationParams:
     # ── Climate ──────────────────────────────────────────────────────
     axial_tilt: float = 23.5            # degrees — 0 = no seasons, 23.5 = Earth-like
 
+    # ── Deep time ────────────────────────────────────────────────────
+    planet_age_myr: float = 4500.0       # planet age in Myr (0.1 = magma, 4500 = Earth)
+
     # ── Ocean currents (P2.6) ────────────────────────────────────────
     ocean_currents_enabled: bool = True
     ocean_wind_drag: float = 0.03        # fraction of wind → surface current
@@ -244,6 +247,17 @@ class CellData:
     # ── Hydrology ────────────────────────────────────────────────────
     runoff_ratio: float = 0.5             # fraction of precipitation that runs off
     effective_precip: float = 0.0         # precipitation * runoff_ratio
+
+    # ── Eustasy ──────────────────────────────────────────────────────
+    sea_level_offset: float = 0.0         # global sea level offset [world units]
+
+    # ── Erosion / Sediment ───────────────────────────────────────────
+    sediment_thickness: float = 0.0       # accumulated sediment thickness [km]
+
+    # ── Diagenesis ───────────────────────────────────────────────────
+    porosity: float = 0.3                 # 0.0–0.5 fraction
+    bulk_density: float = 2.5             # g/cm³
+    cementation: float = 0.0              # 0.0–1.0 cement fill fraction
 
     # ── Generation metadata ──────────────────────────────────────────
     tectonic_stress: float = 0.0

@@ -162,6 +162,10 @@ def _classify_dominant(dominant_pft: str, total_biomass: float,
                        canopy: float, temp: float, precip: float,
                        fertility: float) -> str:
     """Derive a human-readable vegetation_cover string from continuous state."""
+    # Ice at polar temperatures (below ~-5 degC → temp_norm < 0)
+    # Display-only label; actual cryosphere requires a snowpack model.
+    if temp < 0.0:
+        return "ice"
     if not dominant_pft or total_biomass < 0.05:
         if fertility < 0.06:
             return "barren"

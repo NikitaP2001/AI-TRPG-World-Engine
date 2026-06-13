@@ -457,7 +457,8 @@ def compute_temperature(
         t_c -= _LAPSE_RATE * el_norm * _ELEV_UNIT_TO_M
 
         # --- 4. Normalise to 0-1 (0 <-> -5 degC, 1 <-> 40 degC) ---
-        t_norm = (t_c + 5.0) / 45.0
+        # No lower clamp — polar cells may go below 0 (e.g. -0.22 for -15 degC)
+        t_norm = (t_c - TEMP_C_MIN) / _TEMP_C_RANGE
         t_norm = min(1.0, t_norm)
 
         # --- 5. Seasonal range from solstice difference ---
@@ -479,12 +480,12 @@ def compute_temperature(
             if any(nh in ocean_set for nh in neighbours):
                 seasonal_amp_c /= _COASTAL_DAMPING
 
-        r_norm = min(0.5, seasonal_amp_c / 45.0)
+        r_norm = min(0.5, seasonal_amp_c / _TEMP_C_RANGE)
 
         # --- 6. Global modifiers ---
-        t_norm = min(1.0, max(0.0, t_norm + global_offset))
+        t_norm = min(1.0, t_norm + global_offset)
         t_norm *= solar_intensity
-        t_norm = min(1.0, max(0.0, t_norm))
+        t_norm = min(1.0, t_norm)  # no lower clamp — polar temps go below 0
 
         temp[h] = t_norm
         temp_range[h] = r_norm

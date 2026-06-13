@@ -443,12 +443,18 @@ def finalize_world_generation(
     from simulation.world_db import WorldDB
     db_path = "game/simulation/world.sqlite"
     db = WorldDB(db_path)
+
+    # New: save as WorldState (continuous fields + features)
+    from simulation.world_state_db import save_generated_world
+    init_year = 1000
+    save_generated_world(
+        db, cells, feature_store, params.__dict__,
+        time={"tick": 0, "year": init_year, "day_of_year": 0.0, "hour": 6.0},
+    )
+    # Legacy: keep cells table for GUI compat
     db.save_cells(cells)
     db.save_features(feature_store)
     db.set_params(**params.__dict__)
-
-    # Initial time
-    init_year = 1000  # default; WM can override via declare_world_state
     db.init_time(tick=0, year=init_year, day_of_year=0.0, hour=6.0)
 
     print(f"[DB] Saved to {db_path}")

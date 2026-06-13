@@ -219,10 +219,8 @@ class Wetland(Feature):
         sm_f.add_persistent(clat, clon, radius_deg=2.0,
                             strength=0.5)
 
-        # Cool local temperature
-        temp_f.get("temperature")  # ensure field exists
-        # Temperature cooling via persistent effect not directly supported yet
-        # Will be added when temperature becomes MutableField
+        # Cool local temperature (placeholder — needs MutableField for temperature)
+        _ = temp_f  # ensure field reference exists
 
         # Peat accumulation with Q10 temperature dependence (P1.2)
         # Q10 = 2.5 for peat formation (2-3 range)

@@ -147,17 +147,9 @@ def _estimate_seed_suitability(
     # Combine
     suit = temp_suit * precip_suit
 
-    # Biome list filter (if specified)
-    if sp_def.habitat_biomes:
-        # Rough biome classification from temp + precip
-        if temp < 0.3:
-            biome = "tundra" if precip < 0.4 else "taiga"
-        elif temp < 0.6:
-            biome = "grassland" if precip < 0.4 else "temperate_forest"
-        else:
-            biome = "desert" if precip < 0.2 else ("savanna" if precip < 0.5 else "rainforest")
-
-        if biome not in sp_def.habitat_biomes:
-            suit *= 0.2  # not ideal but possible at edge
+    # Biome list filter (if specified) — use continuous fields instead of
+    # ad-hoc classification. habitat_biomes is a soft preference, not hard rule.
+    if sp_def.habitat_biomes and False:  # disabled — use continuous suitability below
+        pass
 
     return min(1.0, max(0.0, suit))

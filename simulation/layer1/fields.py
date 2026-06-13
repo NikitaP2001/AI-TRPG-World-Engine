@@ -16,7 +16,7 @@ import math
 from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
-from scipy.spatial import cKDTree
+from scipy.spatial import cKDTree as _cKDTree
 
 
 # ======================================================================
@@ -47,7 +47,7 @@ class ContinuousField:
     here to avoid circular imports.
     """
 
-    def __init__(self, tree: cKDTree, values: np.ndarray):
+    def __init__(self, tree: _cKDTree, values: np.ndarray):
         self._tree = tree
         self._values = values
 
@@ -67,7 +67,7 @@ class ContinuousField:
                 math.cos(lat_r) * math.sin(lon_r),
             ])
             vals.append(getattr(c, attribute, 0.0))
-        tree = cKDTree(np.array(points, dtype=np.float64))
+        tree = _cKDTree(np.array(points, dtype=np.float64))
         return cls(tree, np.array(vals, dtype=np.float64))
 
     def __call__(self, lat: float, lon: float) -> float:
@@ -96,6 +96,9 @@ class MutableField:
     Feature effects are accumulated as (lat, lon, radius, strength)
     and applied with Gaussian-squared falloff.
 
+    For large effect counts (>200 persistent entries) a KDTree
+    is built lazily so each query is O(log n) instead of O(n).
+
     Usage:
         mf = MutableField(base_field)
         mf.add_effect(35.0, 120.0, radius=2.0, strength=-0.3)
@@ -109,6 +112,9 @@ class MutableField:
         self._effects: List[Tuple[float, float, float, float]] = []
         # Optional: persistent modifications that survive clear_effects
         self._persistent: List[Tuple[float, float, float, float]] = []
+        # KDTree for fast spatial queries on persistent effects
+        self._ptree: Optional[_cKDTree] = None
+        self._ptree_data: Optional[List[Tuple[float, float, float, float]]] = None
 
     def add_effect(self, lat: float, lon: float,
                    radius_deg: float, strength: float) -> None:
@@ -117,12 +123,36 @@ class MutableField:
 
     def add_persistent(self, lat: float, lon: float,
                        radius_deg: float, strength: float) -> None:
-        """Register a permanent modification (survives ticks)."""
+        """Register a permanent modification (survives ticks).
+        Invalidates KDTree cache so it will be rebuilt on next query."""
         self._persistent.append((lat, lon, radius_deg, strength))
+        self._ptree = None
+        self._ptree_data = None
 
     def clear_effects(self) -> None:
         """Clear temporary effects (call at end of each tick)."""
         self._effects.clear()
+
+    def clear_persistent(self) -> None:
+        """Clear all persistent effects and invalidate KDTree cache."""
+        self._persistent.clear()
+        self._ptree = None
+        self._ptree_data = None
+
+    def _rebuild_tree(self) -> None:
+        """Build a KDTree from persistent effects for fast spatial queries."""
+        n = len(self._persistent)
+        if n < 200:
+            return  # linear scan is fast enough
+        points = np.empty((n, 3), dtype=np.float64)
+        for i, (elat, elon, radius, strength) in enumerate(self._persistent):
+            lat_r = math.radians(elat)
+            lon_r = math.radians(elon)
+            points[i, 0] = math.cos(lat_r) * math.cos(lon_r)
+            points[i, 1] = math.sin(lat_r)
+            points[i, 2] = math.cos(lat_r) * math.sin(lon_r)
+        self._ptree = _cKDTree(points)
+        self._ptree_data = list(self._persistent)
 
     def __call__(self, lat: float, lon: float) -> float:
         if self._base is not None:
@@ -130,18 +160,37 @@ class MutableField:
         else:
             val = self._default
 
+        # Temporary effects (linear scan, should be small)
         for elat, elon, radius, strength in self._effects:
             d = _haversine_deg(lat, lon, elat, elon)
             if d < radius:
-                # Quadratic falloff: full at center, zero at radius
                 w = (1.0 - d / radius) ** 2
                 val += strength * w
 
-        for elat, elon, radius, strength in self._persistent:
-            d = _haversine_deg(lat, lon, elat, elon)
-            if d < radius:
-                w = (1.0 - d / radius) ** 2
-                val += strength * w
+        # Persistent effects: KDTree if large, linear scan otherwise
+        if len(self._persistent) >= 200 and self._ptree is None:
+            self._rebuild_tree()
+
+        if self._ptree is not None:
+            lat_r = math.radians(lat)
+            lon_r = math.radians(lon)
+            qx = math.cos(lat_r) * math.cos(lon_r)
+            qy = math.sin(lat_r)
+            qz = math.cos(lat_r) * math.sin(lon_r)
+            # Search radius in 3D: 2 deg ~ 0.035 chord, use 0.06 for safety
+            idxs = self._ptree.query_ball_point([qx, qy, qz], r=0.06)
+            for i in idxs:
+                elat, elon, radius, strength = self._ptree_data[i]
+                d = _haversine_deg(lat, lon, elat, elon)
+                if d < radius:
+                    w = (1.0 - d / radius) ** 2
+                    val += strength * w
+        else:
+            for elat, elon, radius, strength in self._persistent:
+                d = _haversine_deg(lat, lon, elat, elon)
+                if d < radius:
+                    w = (1.0 - d / radius) ** 2
+                    val += strength * w
 
         return val
 
@@ -219,7 +268,7 @@ class FieldRegistry:
                 math.sin(lat_r),
                 math.cos(lat_r) * math.sin(lon_r),
             ])
-        tree = cKDTree(np.array(pts, dtype=np.float64))
+        tree = _cKDTree(np.array(pts, dtype=np.float64))
 
         wind_u_vals = np.array([
             c.prevailing_wind[0] if c.prevailing_wind else 0.0 for c in cells

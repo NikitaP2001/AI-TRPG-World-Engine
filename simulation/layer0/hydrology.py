@@ -249,8 +249,8 @@ def compute_runoff_for_cells(
 
         temp_norm = getattr(cell, 'temperature', 0.5)
         temp_c = norm_to_c(temp_norm)
-        # Use continuous canopy_density (P1.6/P1.4)
-        canopy = getattr(cell, 'canopy_density', 0.0) or _VEG_CANOPY_FALLBACK.get(cell.vegetation_cover or "barren", 0.0)
+        # Use continuous canopy_density from PFT model (P1.6/P1.4)
+        canopy = max(0.0, getattr(cell, 'canopy_density', 0.0))
 
         cell_interception = getattr(cell, 'interception_coefficient', 0.15)
         runoff = compute_runoff_ratio(

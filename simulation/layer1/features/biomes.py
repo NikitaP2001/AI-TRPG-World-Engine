@@ -180,18 +180,10 @@ class BiomeRegion(Feature):
         )
 
     def compute_effects(self, fields: FieldRegistry, dt: float = 1.0) -> None:
-        """Minimal effects — PFT model handles vegetation dynamics."""
-        if self.geometry is None:
-            return
-        centroid = self.centroid()
-        if centroid is None:
-            return
-        clat, clon = centroid
-        canopy = self.props.get("canopy_density", 0.5)
-        if canopy > 0.3:
-            wt_f = fields.get_mutable("water_table_depth")
-            wt_f.add_persistent(clat, clon, radius_deg=2.0,
-                                strength=canopy * 0.02 * dt * 0.3)
+        """No simulation effects — biome is a display-only label.
+        Vegetation dynamics are handled by the continuous PFT model.
+        """
+        pass
 
 
 # ======================================================================

@@ -85,7 +85,7 @@ class SimEngine:
 
         # Phase 1: Clear ALL persistent effects — fresh slate
         for mf in self._fields._mutable_fields.values():
-            mf._persistent.clear()
+            mf.clear_persistent()
 
         # Phase 2: ALL features compute + write effects sequentially
         # Each feature reads the field state (which now includes previous

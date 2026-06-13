@@ -49,6 +49,8 @@ from .layer1.fields import FieldRegistry
 from .layer1.features.groundwater import Groundwater
 from .layer1.features.biomes import BiomeRegion, sample_biomes
 from .grid_utils import flood_fill_grid
+from .layer0.tectonics import TectonicEngine
+from .layer0.cryosphere import CryosphereEngine
 
 # ======================================================================
 # Stage helpers  (each ≤ ~100 lines)
@@ -65,16 +67,45 @@ def _compute_all_ids(params: GenerationParams) -> List[str]:
     return all_ids
 
 
+class _DictModelWrapper:
+    """Wraps a tectonic state dict to quack like PlateTectonicsModel."""
+    def __init__(self, state: dict):
+        self.assignment = state["assignment"]
+        self.boundary_type = state["boundary_type"]
+        self.distance_to_boundary = state["distance_to_boundary"]
+        self.crustal_age_myr = state["crustal_age_myr"]
+        self.crustal_thickness_km = state["crustal_thickness_km"]
+        self.thermal_gradient = state["thermal_gradient"]
+
+
 def _stage_tectonics(
     all_ids: List[str], params: GenerationParams,
 ) -> Tuple[PlateTectonicsModel, Dict[str, float], Dict[str, int], set, set]:
-    """Plates → elevation + geology + ocean/land sets."""
-    tectonics = PlateTectonicsModel(
-        all_ids, num_plates=params.num_plates,
-        seed=params.seed, tectonic_activity=params.tectonic_activity,
-    )
-    elevation = tectonics.compute_elevation()
-    geo_type = tectonics.compute_geology()
+    """Plates → elevation + geology + ocean/land sets.
+
+    Uses the new two-phase TectonicEngine with planet_age_myr.
+    Falls back to the legacy PlateTectonicsModel for age≈4500.
+    """
+    if abs(params.planet_age_myr - 4500.0) < 0.1:
+        # Legacy fast path for Earth-like default
+        tectonics = PlateTectonicsModel(
+            all_ids, num_plates=params.num_plates,
+            seed=params.seed, tectonic_activity=params.tectonic_activity,
+        )
+        elevation = tectonics.compute_elevation()
+        geo_type = tectonics.compute_geology()
+    else:
+        # Age-aware generation via TectonicEngine
+        engine = TectonicEngine(
+            all_ids,
+            tectonic_activity=params.tectonic_activity,
+            seed=params.seed,
+        )
+        state = engine.generate(age_myr=params.planet_age_myr)
+        tectonics = _DictModelWrapper(state)
+        elevation = state["elevation"]
+        geo_type = state["geological_type"]
+
     ocean_set = {h for h in all_ids if geo_type.get(h, 0) == 0}
     land_set = {h for h in all_ids if geo_type.get(h, 0) != 0}
     return tectonics, elevation, geo_type, ocean_set, land_set
@@ -617,6 +648,85 @@ def _register_wm_concepts(wm_constraints: Optional[Dict[str, Any]]) -> None:
 
 
 # ======================================================================
+# ── Initial fauna distribution ──────────────────────────────────────
+
+def _init_fauna_distribution(
+    cells: List[CellData],
+    elevation: Dict[str, float],
+    temperature: Dict[str, float],
+    precipitation: Dict[str, float],
+    ocean_set: set,
+) -> None:
+    """Compute initial simple fauna distribution per cell.
+
+    For each registered species, evaluates habitat suitability using
+    basic environmental variables and stores initial density as a
+    CellData attribute (list of (species_id, density) tuples).
+
+    Later saved to fauna_populations table by save_generated_world().
+    """
+    from .layer1.fauna_registry import FAUNA_REGISTRY, get_species_ids
+    species_ids = list(get_species_ids())
+    if not species_ids:
+        print("  [Fauna] No species registered, skipping")
+        return
+
+    import math, random
+    random.seed(42)
+
+    n_cells_with_fauna = 0
+    for c in cells:
+        hid = c.h3_id
+        el = elevation.get(hid, 0.0)
+        tn = temperature.get(hid, 0.5)
+        pn = precipitation.get(hid, 0.5)
+        is_ocean = hid in ocean_set
+
+        fauna_list = []
+        for sp_id in species_ids:
+            sp = FAUNA_REGISTRY.get(sp_id)
+            if sp is None:
+                continue
+
+            # Simple habitat suitability (same logic as Fauna._suitability)
+            suit = 1.0
+
+            if sp.habitat_type == "aquatic":
+                if not is_ocean and el >= 0:
+                    suit = 0.0
+            elif sp.habitat_type in ("terrestrial",):
+                if is_ocean or el < 0:
+                    suit = 0.0
+            elif sp.habitat_type == "amphibious":
+                pass  # can live anywhere
+            elif sp.habitat_type == "aerial":
+                pass  # can live anywhere
+
+            if suit > 0:
+                # Temperature penalties
+                if tn < 0.05:
+                    suit *= max(0.0, tn / 0.05)
+                if tn > 0.95:
+                    suit *= max(0.0, (1.0 - tn) / 0.05)
+                # Precipitation penalty for terrestrial
+                if sp.habitat_type != "aquatic" and pn < 0.02:
+                    suit *= max(0.0, pn / 0.02)
+
+            if suit > 0.01:
+                # Initial density = suitability * max_density * random jitter
+                jitter = 0.7 + random.random() * 0.6  # 0.7–1.3
+                density = suit * sp.population_density_max * jitter * 0.3
+                if density > 0.01:
+                    fauna_list.append((sp_id, density))
+
+        c.fauna = fauna_list
+        if fauna_list:
+            n_cells_with_fauna += 1
+
+    n_total_species = len(species_ids)
+    print(f"  [Fauna] {n_total_species} species, {n_cells_with_fauna}/{len(cells)} cells populated")
+
+
 # Main entry point  (≤ ~100 lines)
 # ======================================================================
 
@@ -627,14 +737,19 @@ def generate_world(
 ) -> Tuple[List[CellData], FeatureStore, Dict[str, float]]:
     """Run full L0 + L1 world generation pipeline.
 
-    Pipeline: Tectonics → Noise → WM Constraints → Continents → Climate →
-    Ocean Currents → CellData → Lithology → Soil → Vegetation → Resources →
-    Hydrology → Feature Extraction → L1 (Biomes/Lakes/Wetlands/Water Balance)
-    → Mineralogy → WM registrations.
+    Pipeline: Tectonics (age-aware) → Noise → WM Constraints → Continents →
+    Climate → Ocean Currents → CellData → Lithology → Soil → Vegetation →
+    Resources → Hydrology → Cryosphere (age-aware glaciers) → Feature Extraction →
+    L1 (Biomes/Lakes/Wetlands/Water Balance) → Mineralogy → WM registrations.
     """
     if params is None:
         params = GenerationParams()
     params.derive()
+
+    # Register default Earth-like fauna (WM can supplement later)
+    from .layer1.default_fauna import register_default_fauna
+    register_default_fauna()
+
     print(f"[Layer 0] resolution={params.h3_resolution}, top_level_cells={params.top_level_cell_count}", flush=True)
 
     # Phase 1 — Terrain
@@ -684,6 +799,23 @@ def generate_world(
     print("  [Hydrology] computing flow direction...", flush=True)
     river_flag, flow_dir, flow_acc, basin = _apply_hydrology(all_ids, elevation, ocean_set, cells, wm_constraints)
 
+    # Phase 4b — Cryosphere (age-aware glacier generation)
+    print("  [Cryosphere] computing glaciers...")
+    try:
+        cryo = CryosphereEngine(
+            all_ids, elevation, temp, precip, ocean_set,
+        )
+        ice_thickness = cryo.generate(age_myr=params.planet_age_myr)
+        n_glaciers = sum(1 for v in ice_thickness.values() if v > 1.0)
+        print(f"  [Cryosphere] {n_glaciers} cells with glacier ice")
+        # Store ice thickness on cells (for feature extraction + viewer)
+        for c in cells:
+            c.ice_thickness_m = ice_thickness.get(c.h3_id, 0.0)
+    except Exception as e:
+        print(f"  [Cryosphere] skipped: {e}")
+        for c in cells:
+            c.ice_thickness_m = 0.0
+
     # Phase 5 — Feature extraction
     print("  [Features] extracting terrain features...")
     feature_store = _extract_features(cells, island_cells, ocean_set, elevation, flow_acc, params)
@@ -692,6 +824,9 @@ def generate_world(
     print("  [Layer 1] building simulation fields...")
     _add_layer1(cells, feature_store)
     _register_wm_concepts(wm_constraints)
+
+    # Phase 7 — Initial fauna distribution
+    _init_fauna_distribution(cells, elevation, temp, precip, ocean_set)
 
     print(f"  Feature store: {feature_store.count} total features")
     return cells, feature_store, flow_acc

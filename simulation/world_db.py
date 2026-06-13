@@ -77,6 +77,11 @@ CREATE TABLE IF NOT EXISTS cells (
     crustal_thickness   REAL DEFAULT 35.0,
     thermal_gradient    REAL DEFAULT 25.0,
 
+    -- Tectonics
+    plate_id             INTEGER DEFAULT -1,
+    boundary_type        TEXT DEFAULT 'intraplate',
+    distance_to_boundary REAL DEFAULT -1.0,
+
     -- Tracking
     updated_at_tick INTEGER DEFAULT 0
 );
@@ -101,6 +106,8 @@ CREATE TABLE IF NOT EXISTS fauna_populations (
     h3_id        TEXT NOT NULL,
     species_id   TEXT NOT NULL,
     density      REAL DEFAULT 0.0,
+    lat          REAL DEFAULT 0.0,
+    lon          REAL DEFAULT 0.0,
     updated_at_tick INTEGER DEFAULT 0,
     PRIMARY KEY (h3_id, species_id)
 );
@@ -167,6 +174,15 @@ class WorldDB:
         "interception_coefficient": "REAL DEFAULT 0.15",
         "slope_dir": "REAL DEFAULT 0.0",
         "elevation_variance": "REAL DEFAULT 0.0",
+        "plate_id": "INTEGER DEFAULT -1",
+        "boundary_type": "TEXT DEFAULT 'intraplate'",
+        "distance_to_boundary": "REAL DEFAULT -1.0",
+        # Erosion + Diagenesis + Eustasy fields
+        "sea_level_offset": "REAL DEFAULT 0.0",
+        "sediment_thickness": "REAL DEFAULT 0.0",
+        "porosity": "REAL DEFAULT 0.3",
+        "bulk_density": "REAL DEFAULT 2.5",
+        "cementation": "REAL DEFAULT 0.0",
     }
 
     def _migrate_schema(self) -> None:
@@ -252,12 +268,15 @@ class WorldDB:
                 runoff_ratio, effective_precip,
                 crustal_age, crustal_thickness, thermal_gradient,
                 updated_at_tick,
+                plate_id, boundary_type, distance_to_boundary,
                 precip_seasonality, hazard_level, tectonic_stress,
                 clay_content, sand_content, silt_content,
                 soil_ph, cation_exchange, interception_coefficient,
-                slope_dir, elevation_variance
+                slope_dir, elevation_variance,
+                sea_level_offset, sediment_thickness, porosity, bulk_density, cementation
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                      ?, ?, ?, ?, ?, ?
             )""",
             [self._cell_to_row(c) for c in cells],
         )
@@ -298,6 +317,9 @@ class WorldDB:
             getattr(c, 'crustal_thickness_km', 35.0),
             getattr(c, 'thermal_gradient', 25.0),
             0,
+            getattr(c, 'plate_id', -1),
+            getattr(c, 'boundary_type', 'intraplate'),
+            getattr(c, 'distance_to_boundary', -1.0),
             # New columns
             getattr(c, 'precip_seasonality', 0.3),
             getattr(c, 'hazard_level', 0.0),
@@ -310,6 +332,12 @@ class WorldDB:
             getattr(c, 'interception_coefficient', 0.15),
             sl[1],                       # slope direction (radians)
             getattr(c, 'elevation_variance', 0.0),
+            # Erosion + Diagenesis + Eustasy
+            getattr(c, 'sea_level_offset', 0.0),
+            getattr(c, 'sediment_thickness', 0.0),
+            getattr(c, 'porosity', 0.3),
+            getattr(c, 'bulk_density', 2.5),
+            getattr(c, 'cementation', 0.0),
         )
 
     def load_cells(self) -> List[Dict[str, Any]]:
@@ -333,7 +361,8 @@ class WorldDB:
             # Temperature: prefer norm if available
             tn = r["temperature_norm"]
             if tn is None:
-                tn = (r["temperature_c"] + 5.0) / 45.0 if r["temperature_c"] else 0.5
+                from .layer0.climate import TEMP_C_MIN as _TCM, _TEMP_C_RANGE as _TCR
+                tn = (r["temperature_c"] - _TCM) / _TCR if r["temperature_c"] else 0.5
             c.temperature = tn
             c.precipitation = r["precipitation_norm"] or 0.5
             c.precip_seasonality = r.get("precip_seasonality", 0.3)
@@ -359,6 +388,15 @@ class WorldDB:
             c.crustal_age_myr = r.get("crustal_age") or 100.0
             c.crustal_thickness_km = r.get("crustal_thickness") or 35.0
             c.thermal_gradient = r.get("thermal_gradient") or 25.0
+            c.plate_id = r.get("plate_id", -1) or -1
+            c.boundary_type = r.get("boundary_type", "intraplate") or "intraplate"
+            c.distance_to_boundary = r.get("distance_to_boundary", -1.0) or -1.0
+            # Erosion + Diagenesis + Eustasy
+            c.sea_level_offset = r.get("sea_level_offset") or 0.0
+            c.sediment_thickness = r.get("sediment_thickness") or 0.0
+            c.porosity = r.get("porosity") or 0.3
+            c.bulk_density = r.get("bulk_density") or 2.5
+            c.cementation = r.get("cementation") or 0.0
             cells.append(c)
         return cells
 
@@ -411,10 +449,11 @@ class WorldDB:
         cur = self.conn.cursor()
         cur.executemany(
             """INSERT OR REPLACE INTO fauna_populations
-               (h3_id, species_id, density, updated_at_tick)
-               VALUES (?, ?, ?, ?)""",
+               (h3_id, species_id, density, lat, lon, updated_at_tick)
+               VALUES (?, ?, ?, ?, ?, ?)""",
             [
                 (r["h3_id"], r["species_id"], float(r.get("density", 0.0)),
+                 float(r.get("lat", 0.0)), float(r.get("lon", 0.0)),
                  int(r.get("updated_at_tick", 0)))
                 for r in rows
             ],
