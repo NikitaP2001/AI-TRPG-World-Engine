@@ -68,8 +68,27 @@ class FaunaSpeciesDef:
     # -1 = auto (1.0 for carnivore, 0.0 for herbivore)
     # 0-1 = explicit
 
+    # ── Water depth tolerance (in normalized elevation units) ────
+    # 0 = strictly terrestrial (can't swim)
+    # 0.02 = can wade through shallow puddles (deer, wolf)
+    # 0.1 = good swimmer (moose, bear)
+    # >1 = aquatic (fish, plankton)
+    water_depth_min: float = 0.0        # min depth for survival (-1 = any)
+    water_depth_max: float = 0.0        # max depth for survival (0 = land only)
+    wading_depth_max: float = 0.02      # max depth for migration (can wade through)
+
     # ── Migration ────────────────────────────────────────────────────
     migration_rate: float = 0.05
+
+    # ── Temperature tolerance (normalized 0-1) ─────────────────────
+    # Controls where species can live on the climate gradient.
+    # Defaults match the original hardcoded 0.05/0.95 thresholds.
+    temp_min: float = 0.0       # lethal minimum (suit=0 below this)
+    temp_max: float = 1.0       # lethal maximum (suit=0 above this)
+    temp_opt_low: float = 0.05  # optimal range start (suit=1 above this)
+    temp_opt_max: float = 0.95  # optimal range end (suit=1 below this)
+    # Example: arctic fish temp_min=0, temp_opt_low=0, temp_opt_max=0.5, temp_max=0.7
+    # Example: desert lizard temp_min=0.3, temp_opt_low=0.4, temp_opt_max=1.0, temp_max=1.0
 
     # ── Size class (affects carrying capacity ratios) ────────────────
     size_class: str = "medium"

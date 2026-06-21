@@ -43,56 +43,57 @@ def _register_mammals() -> None:
     # --- Herbivores (8) ---
     register_fauna_species("deer", FaunaSpeciesDef(
         name="Deer", habitat_type="terrestrial", diet="herbivore",
-        diet_sources={"biomass": 0.05},
+        diet_sources={"grass_temperate": 0.04, "birch_silver": 0.03, "shrub_wet": 0.03, "shrub_dry": 0.02, "riparian_willow": 0.02},
         base_birth=0.015, base_death=0.01, population_density_max=8.0,
         migration_rate=0.04, hazard_weight=0.0, huntable=True,
         size_class="large",
     ))
     register_fauna_species("sheep", FaunaSpeciesDef(
         name="Sheep", habitat_type="terrestrial", diet="herbivore",
-        diet_sources={"biomass": 0.06},
+        diet_sources={"grass_temperate": 0.08, "grass_tropical": 0.04},
         base_birth=0.02, base_death=0.012, population_density_max=15.0,
         migration_rate=0.03, hazard_weight=0.0, huntable=True,
         size_class="medium",
     ))
     register_fauna_species("moose", FaunaSpeciesDef(
         name="Moose", habitat_type="terrestrial", diet="herbivore",
-        diet_sources={"biomass": 0.04},
+        diet_sources={"shrub_wet": 0.05, "riparian_willow": 0.04, "birch_silver": 0.03, "pine_scots": 0.02},
         base_birth=0.008, base_death=0.008, population_density_max=3.0,
         migration_rate=0.02, hazard_weight=0.3, huntable=True,
         size_class="huge", habitat_suitability_modifiers=["L0.cell[elevation_mean] > 0.003 -> suit *= 0.5"],
+        temp_opt_low=0.0, temp_opt_max=0.6, temp_max=0.8,
     ))
     register_fauna_species("elk", FaunaSpeciesDef(
         name="Elk", habitat_type="terrestrial", diet="herbivore",
-        diet_sources={"biomass": 0.045},
+        diet_sources={"grass_temperate": 0.04, "shrub_dry": 0.03, "birch_silver": 0.02},
         base_birth=0.012, base_death=0.009, population_density_max=6.0,
         migration_rate=0.03, hazard_weight=0.0, huntable=True,
         size_class="large",
     ))
     register_fauna_species("bison", FaunaSpeciesDef(
         name="Bison", habitat_type="terrestrial", diet="herbivore",
-        diet_sources={"biomass": 0.04},
+        diet_sources={"grass_temperate": 0.06, "grass_tropical": 0.03},
         base_birth=0.01, base_death=0.008, population_density_max=5.0,
         migration_rate=0.02, hazard_weight=0.4, huntable=True,
         size_class="huge",
     ))
     register_fauna_species("rabbit", FaunaSpeciesDef(
         name="Rabbit", habitat_type="terrestrial", diet="herbivore",
-        diet_sources={"biomass": 0.08},
+        diet_sources={"grass_temperate": 0.08, "shrub_dry": 0.03, "heath_alpine": 0.02},
         base_birth=0.06, base_death=0.03, population_density_max=40.0,
         migration_rate=0.06, hazard_weight=0.0, huntable=True,
         size_class="small",
     ))
     register_fauna_species("hare", FaunaSpeciesDef(
         name="Hare", habitat_type="terrestrial", diet="herbivore",
-        diet_sources={"biomass": 0.07},
+        diet_sources={"grass_temperate": 0.06, "heath_alpine": 0.03, "shrub_dry": 0.02},
         base_birth=0.05, base_death=0.025, population_density_max=30.0,
         migration_rate=0.07, hazard_weight=0.0, huntable=True,
         size_class="small",
     ))
     register_fauna_species("beaver", FaunaSpeciesDef(
         name="Beaver", habitat_type="amphibious", diet="herbivore",
-        diet_sources={"biomass": 0.06},
+        diet_sources={"riparian_willow": 0.06, "birch_silver": 0.04},
         base_birth=0.015, base_death=0.012, population_density_max=10.0,
         migration_rate=0.02, hazard_weight=0.0, huntable=True,
         size_class="medium",
@@ -101,14 +102,14 @@ def _register_mammals() -> None:
     # --- Omnivores (5) ---
     register_fauna_species("bear", FaunaSpeciesDef(
         name="Bear", habitat_type="terrestrial", diet="omnivore",
-        diet_sources={"biomass": 0.03, "deer": 0.08, "rabbit": 0.10, "fish": 0.15, "scavenge": 0.05},
+        diet_sources={"shrub_wet": 0.02, "shrub_dry": 0.02, "grass_temperate": 0.01, "deer": 0.08, "rabbit": 0.10, "fish": 0.15, "scavenge": 0.05},
         base_birth=0.006, base_death=0.006, population_density_max=1.5,
         migration_rate=0.02, hazard_weight=0.9, huntable=True,
         size_class="huge",
     ))
     register_fauna_species("boar", FaunaSpeciesDef(
         name="Boar", habitat_type="terrestrial", diet="omnivore",
-        diet_sources={"biomass": 0.06, "scavenge": 0.03},
+        diet_sources={"grass_temperate": 0.03, "shrub_dry": 0.02, "scavenge": 0.03},
         base_birth=0.02, base_death=0.015, population_density_max=12.0,
         migration_rate=0.03, hazard_weight=0.5, huntable=True,
         size_class="large",
@@ -122,14 +123,14 @@ def _register_mammals() -> None:
     ))
     register_fauna_species("badger", FaunaSpeciesDef(
         name="Badger", habitat_type="terrestrial", diet="omnivore",
-        diet_sources={"biomass": 0.04, "scavenge": 0.03},
+        diet_sources={"grass_temperate": 0.02, "shrub_dry": 0.02, "scavenge": 0.03},
         base_birth=0.012, base_death=0.015, population_density_max=5.0,
         migration_rate=0.02, hazard_weight=0.3, huntable=True,
         size_class="medium",
     ))
     register_fauna_species("raccoon", FaunaSpeciesDef(
         name="Raccoon", habitat_type="terrestrial", diet="omnivore",
-        diet_sources={"biomass": 0.05, "scavenge": 0.05},
+        diet_sources={"grass_temperate": 0.03, "shrub_dry": 0.02, "scavenge": 0.05},
         base_birth=0.025, base_death=0.02, population_density_max=15.0,
         migration_rate=0.04, hazard_weight=0.1, huntable=True,
         size_class="small",
@@ -176,28 +177,28 @@ def _register_birds() -> None:
     # --- Herbivores / Granivores (4) ---
     register_fauna_species("sparrow", FaunaSpeciesDef(
         name="Sparrow", habitat_type="aerial", diet="herbivore",
-        diet_sources={"biomass": 0.10},
+        diet_sources={"grass_temperate": 0.08, "grass_tropical": 0.04},
         base_birth=0.08, base_death=0.04, population_density_max=80.0,
         migration_rate=0.15, hazard_weight=0.0, huntable=False,
         size_class="small",
     ))
     register_fauna_species("pigeon", FaunaSpeciesDef(
         name="Pigeon", habitat_type="aerial", diet="herbivore",
-        diet_sources={"biomass": 0.09},
+        diet_sources={"grass_temperate": 0.07, "grass_tropical": 0.03},
         base_birth=0.06, base_death=0.03, population_density_max=60.0,
         migration_rate=0.10, hazard_weight=0.0, huntable=False,
         size_class="small",
     ))
     register_fauna_species("goose", FaunaSpeciesDef(
         name="Goose", habitat_type="amphibious", diet="herbivore",
-        diet_sources={"biomass": 0.07, "plankton": 0.03},
+        diet_sources={"grass_temperate": 0.06, "grass_tropical": 0.03, "plankton": 0.03},
         base_birth=0.02, base_death=0.015, population_density_max=20.0,
         migration_rate=0.12, hazard_weight=0.2, huntable=True,
         size_class="medium",
     ))
     register_fauna_species("swan", FaunaSpeciesDef(
         name="Swan", habitat_type="amphibious", diet="herbivore",
-        diet_sources={"plankton": 0.06, "biomass": 0.04},
+        diet_sources={"plankton": 0.06, "grass_temperate": 0.03, "shrub_wet": 0.02},
         base_birth=0.01, base_death=0.01, population_density_max=5.0,
         migration_rate=0.08, hazard_weight=0.0, huntable=True,
         size_class="medium",
@@ -213,7 +214,7 @@ def _register_birds() -> None:
     ))
     register_fauna_species("woodpecker", FaunaSpeciesDef(
         name="Woodpecker", habitat_type="aerial", diet="carnivore",
-        diet_sources={"biomass": 0.08},  # insects in wood
+        diet_sources={"plankton": 0.08},  # insects in wood (via plankton proxy)
         base_birth=0.03, base_death=0.025, population_density_max=10.0,
         migration_rate=0.04, hazard_weight=0.0, huntable=False,
         size_class="small",
@@ -260,7 +261,7 @@ def _register_birds() -> None:
     ))
     register_fauna_species("raven", FaunaSpeciesDef(
         name="Raven", habitat_type="aerial", diet="omnivore",
-        diet_sources={"scavenge": 0.12, "sparrow": 0.08, "biomass": 0.04},
+        diet_sources={"scavenge": 0.12, "sparrow": 0.08, "grass_temperate": 0.02, "shrub_dry": 0.02},
         base_birth=0.02, base_death=0.018, population_density_max=10.0,
         migration_rate=0.08, hazard_weight=0.1, huntable=False,
         size_class="medium",
@@ -269,21 +270,21 @@ def _register_birds() -> None:
     # --- Domestic birds (3) ---
     register_fauna_species("chicken", FaunaSpeciesDef(
         name="Chicken", habitat_type="terrestrial", diet="herbivore",
-        diet_sources={"biomass": 0.10},
+        diet_sources={"grass_temperate": 0.08, "grass_tropical": 0.03},
         base_birth=0.10, base_death=0.04, population_density_max=50.0,
         migration_rate=0.01, hazard_weight=0.0, huntable=True,
         size_class="small",
     ))
     register_fauna_species("duck", FaunaSpeciesDef(
         name="Duck", habitat_type="amphibious", diet="omnivore",
-        diet_sources={"plankton": 0.08, "biomass": 0.05},
+        diet_sources={"plankton": 0.08, "grass_temperate": 0.04, "shrub_wet": 0.02},
         base_birth=0.05, base_death=0.03, population_density_max=30.0,
         migration_rate=0.10, hazard_weight=0.0, huntable=True,
         size_class="small",
     ))
     register_fauna_species("turkey", FaunaSpeciesDef(
         name="Turkey", habitat_type="terrestrial", diet="herbivore",
-        diet_sources={"biomass": 0.07},
+        diet_sources={"grass_temperate": 0.06, "shrub_dry": 0.03},
         base_birth=0.025, base_death=0.02, population_density_max=15.0,
         migration_rate=0.03, hazard_weight=0.0, huntable=True,
         size_class="medium",
@@ -296,7 +297,7 @@ def _register_fish() -> None:
     # --- Plankton-feeders (4) ---
     register_fauna_species("carp", FaunaSpeciesDef(
         name="Carp", habitat_type="aquatic", diet="herbivore",
-        diet_sources={"plankton": 0.15, "biomass": 0.03},
+        diet_sources={"plankton": 0.15, "grass_temperate": 0.02},
         base_birth=0.03, base_death=0.02, population_density_max=30.0,
         migration_rate=0.02, hazard_weight=0.0, huntable=True,
         size_class="small",
@@ -374,6 +375,7 @@ def _register_fish() -> None:
         base_birth=0.008, base_death=0.01, population_density_max=8.0,
         migration_rate=0.20, hazard_weight=0.3, huntable=True,
         size_class="medium",
+        temp_opt_low=0.0, temp_opt_max=0.5, temp_max=0.7,
     ))
 
 
@@ -401,6 +403,7 @@ def _register_reptiles_amphibians() -> None:
         migration_rate=0.04, hazard_weight=0.0, huntable=False,
         size_class="small",
         habitat_suitability_modifiers=["L0.cell[elevation_mean] > 0.001 -> suit *= 1.5"],
+        temp_min=0.2, temp_opt_low=0.35, temp_opt_max=1.0,
     ))
     register_fauna_species("snake", FaunaSpeciesDef(
         name="Snake", habitat_type="terrestrial", diet="carnivore",
@@ -408,10 +411,11 @@ def _register_reptiles_amphibians() -> None:
         base_birth=0.015, base_death=0.018, population_density_max=6.0,
         migration_rate=0.03, hazard_weight=0.6, huntable=False,
         size_class="medium",
+        temp_min=0.2, temp_opt_low=0.4, temp_opt_max=1.0,
     ))
     register_fauna_species("turtle", FaunaSpeciesDef(
         name="Turtle", habitat_type="amphibious", diet="omnivore",
-        diet_sources={"plankton": 0.08, "biomass": 0.04},
+        diet_sources={"plankton": 0.08, "grass_temperate": 0.03, "shrub_wet": 0.02},
         base_birth=0.005, base_death=0.006, population_density_max=4.0,
         migration_rate=0.01, hazard_weight=0.0, huntable=True,
         size_class="medium",
@@ -423,7 +427,7 @@ def _register_reptiles_amphibians() -> None:
 def _register_insects() -> None:
     register_fauna_species("bee", FaunaSpeciesDef(
         name="Bee", habitat_type="aerial", diet="herbivore",
-        diet_sources={"biomass": 0.10},
+        diet_sources={"grass_temperate": 0.05, "shrub_dry": 0.03, "shrub_wet": 0.03},
         base_birth=0.15, base_death=0.08, population_density_max=200.0,
         migration_rate=0.10, hazard_weight=0.0, huntable=False,
         size_class="micro",
@@ -433,14 +437,14 @@ def _register_insects() -> None:
     ))
     register_fauna_species("butterfly", FaunaSpeciesDef(
         name="Butterfly", habitat_type="aerial", diet="herbivore",
-        diet_sources={"biomass": 0.08},
+        diet_sources={"grass_temperate": 0.05, "shrub_dry": 0.03},
         base_birth=0.12, base_death=0.10, population_density_max=100.0,
         migration_rate=0.20, hazard_weight=0.0, huntable=False,
         size_class="micro",
     ))
     register_fauna_species("ant", FaunaSpeciesDef(
         name="Ant", habitat_type="terrestrial", diet="omnivore",
-        diet_sources={"biomass": 0.10, "scavenge": 0.08},
+        diet_sources={"grass_temperate": 0.05, "shrub_dry": 0.03, "scavenge": 0.08},
         base_birth=0.20, base_death=0.10, population_density_max=500.0,
         migration_rate=0.05, hazard_weight=0.0, huntable=False,
         size_class="micro",

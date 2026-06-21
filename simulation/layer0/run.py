@@ -43,7 +43,7 @@ def main() -> None:
     print()
 
     t0 = time.time()
-    cells, feature_store, flow_acc = generate_world(params)
+    cells, feature_store, flow_acc, fauna_fields = generate_world(params)
     t1 = time.time()
     print(f"  Generation took {t1 - t0:.1f}s")
     print(f"  Features: {feature_store.count}")
@@ -56,18 +56,33 @@ def main() -> None:
     # Write to SQLite (for time-aware simulation)
     try:
         from ..world_db import WorldDB
+        from ..world_state import WorldState
+        from ..world_state_db import save_world_state
+        import h3 as _h3
         db = WorldDB(str(out / "world.sqlite"))
-        db.set_params(
-            seed=str(a.seed),
-            axial_tilt=str(a.axial_tilt),
-            solar_constant="1361.0",
-            num_plates=str(a.num_plates),
-            planet_radius=str(a.planet_radius),
-            tectonic_activity=str(a.tectonic_activity),
-        )
-        db.init_time(tick=0, year=0, day_of_year=172.0, hour=12.0)
-        db.save_cells(cells)
-        db.save_features(feature_store)
+        ws = WorldState.from_cell_data(cells, {
+            "seed": str(a.seed),
+            "axial_tilt": str(a.axial_tilt),
+            "solar_constant": "1361.0",
+            "num_plates": str(a.num_plates),
+            "planet_radius": str(a.planet_radius),
+            "tectonic_activity": str(a.tectonic_activity),
+        })
+        ws.features = feature_store
+        ws._time = {"tick": 0, "year": 0, "day_of_year": 172.0, "hour": 12.0}
+        save_world_state(db, ws)
+        # Save fauna populations
+        fauna_rows = []
+        for species_id, cell_densities in fauna_fields.items():
+            for hid, density in cell_densities.items():
+                if density > 0:
+                    ll = _h3.cell_to_latlng(hid)
+                    fauna_rows.append({"h3_id": hid, "species_id": species_id,
+                                        "density": density, "lat": ll[0], "lon": ll[1],
+                                        "updated_at_tick": 0})
+        if fauna_rows:
+            db.save_fauna_populations(fauna_rows)
+            print(f"  [Fauna] Saved {len(fauna_rows)} population records")
         db.close()
         print(f"  [DB] Saved to {out / 'world.sqlite'}")
     except Exception as e:

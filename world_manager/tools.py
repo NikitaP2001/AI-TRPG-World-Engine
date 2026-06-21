@@ -394,7 +394,7 @@ def finalize_world_generation(
     print("[Generator] Starting world generation with WM constraints...")
     from simulation.generator import generate_world
     try:
-        cells, feature_store, flow_acc = generate_world(
+        cells, feature_store, flow_acc, fauna_fields = generate_world(
             params=params,
             wm_constraints=wm_c,
         )
@@ -450,12 +450,8 @@ def finalize_world_generation(
     save_generated_world(
         db, cells, feature_store, params.__dict__,
         time={"tick": 0, "year": init_year, "day_of_year": 0.0, "hour": 6.0},
+        fauna_fields=fauna_fields,
     )
-    # Legacy: keep cells table for GUI compat
-    db.save_cells(cells)
-    db.save_features(feature_store)
-    db.set_params(**params.__dict__)
-    db.init_time(tick=0, year=init_year, day_of_year=0.0, hour=6.0)
 
     print(f"[DB] Saved to {db_path}")
 

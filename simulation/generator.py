@@ -648,7 +648,7 @@ def _register_wm_concepts(wm_constraints: Optional[Dict[str, Any]]) -> None:
 
 
 # ======================================================================
-# ── Initial fauna distribution ──────────────────────────────────────
+# ── Initial fauna distribution (habitat + food‑web model) ────────────
 
 def _init_fauna_distribution(
     cells: List[CellData],
@@ -656,14 +656,20 @@ def _init_fauna_distribution(
     temperature: Dict[str, float],
     precipitation: Dict[str, float],
     ocean_set: set,
-) -> None:
-    """Compute initial simple fauna distribution per cell.
+) -> Dict[str, Dict[str, float]]:
+    """Compute initial fauna via ecological model — no stochastic jitter.
 
-    For each registered species, evaluates habitat suitability using
-    basic environmental variables and stores initial density as a
-    CellData attribute (list of (species_id, density) tuples).
-
-    Later saved to fauna_populations table by save_generated_world().
+    For each cell:
+      1. Evaluate habitat suitability for every registered species
+         (terrestrial → land + canopy + climate, aquatic → water + temp, etc.)
+      2. Determine trophic levels from diet_sources:
+         - herbivores  eat  "biomass" (vegetation)
+         - carnivores  eat  other fauna species (by species_id key)
+         - omnivores   eat  both
+      3. Compute equilibrium densities bottom‑up:
+         a) Herbivores: density capped by available biomass ÷ Σ consumption
+         b) Carnivores: density capped by available prey ÷ predation rate
+         c) Omnivores:  density capped by remaining biomass + prey
     """
     from .layer1.fauna_registry import FAUNA_REGISTRY, get_species_ids
     species_ids = list(get_species_ids())
@@ -671,60 +677,218 @@ def _init_fauna_distribution(
         print("  [Fauna] No species registered, skipping")
         return
 
-    import math, random
-    random.seed(42)
+    # ── 1. Classify species by trophic role ─────────────────────────
+    herbivores: List[str] = []
+    carnivores: List[str] = []
+    omnivores: List[str] = []
+    for sid in species_ids:
+        sp = FAUNA_REGISTRY.get(sid)
+        if sp is None:
+            continue
+        if sp.diet == "carnivore":
+            carnivores.append(sid)
+        elif sp.diet == "omnivore":
+            omnivores.append(sid)
+        else:
+            herbivores.append(sid)
 
+    # ── 2. Habitat suitability for a single species in a cell ───────
+    def _suitability(sid: str, el: float, tn: float, pn: float,
+                     is_ocean: bool, biomass: float) -> float:
+        sp = FAUNA_REGISTRY.get(sid)
+        if sp is None:
+            return 0.0
+
+        # Aquatic — only in water
+        if sp.habitat_type == "aquatic":
+            if not is_ocean and el >= 0:
+                return 0.0
+            suit = 1.0 - abs(tn - 0.5) * 1.5
+            suit = max(0.1, min(1.0, suit))
+            return suit
+
+        # Terrestrial — only on land
+        if sp.habitat_type == "terrestrial":
+            if is_ocean or el < 0:
+                return 0.0
+            suit = 1.0
+            # Canopy cover
+            suit *= 0.3 + 0.7 * max(0.0, min(1.0, biomass / 50.0))
+            # Temperature
+            if tn < 0.05:
+                suit *= max(0.0, tn / 0.05)
+            if tn > 0.95:
+                suit *= max(0.0, (1.0 - tn) / 0.05)
+            # Precipitation
+            if pn < 0.02:
+                suit *= max(0.0, pn / 0.02)
+            return max(0.0, min(1.0, suit))
+
+        # Amphibious — blend of land + water
+        if sp.habitat_type == "amphibious":
+            land_s = 1.0
+            if is_ocean or el < 0:
+                land_s = 0.0
+            else:
+                land_s *= 0.3 + 0.7 * max(0.0, min(1.0, biomass / 50.0))
+                if tn < 0.05:
+                    land_s *= max(0.0, tn / 0.05)
+                if tn > 0.95:
+                    land_s *= max(0.0, (1.0 - tn) / 0.05)
+                if pn < 0.02:
+                    land_s *= max(0.0, pn / 0.02)
+
+            water_s = 1.0 - abs(tn - 0.5) * 1.5
+            water_s = max(0.0, min(1.0, water_s))
+            if not is_ocean and el >= 0:
+                water_s = 0.0
+
+            return max(land_s, water_s) * 0.5 + min(land_s, water_s) * 0.5
+
+        # Aerial — wide tolerance
+        if sp.habitat_type == "aerial":
+            if tn < 0.01 or tn > 0.99:
+                return 0.0
+            suit = 1.0
+            if tn < 0.03:
+                suit *= tn / 0.03
+            if tn > 0.97:
+                suit *= (1.0 - tn) / 0.03
+            suit *= 0.5 + 0.5 * max(0.0, min(1.0, biomass / 50.0))
+            return max(0.0, min(1.0, suit))
+
+        return 0.0
+
+    # ── 3. Compute per‑cell equilibrium ────────────────────────────
+    fauna_fields: Dict[str, Dict[str, float]] = {}
     n_cells_with_fauna = 0
     for c in cells:
         hid = c.h3_id
         el = elevation.get(hid, 0.0)
-        tn = temperature.get(hid, 0.5)
-        pn = precipitation.get(hid, 0.5)
+        tn = max(0.0, min(1.0, temperature.get(hid, 0.5)))
+        pn = max(0.0, min(1.0, precipitation.get(hid, 0.5)))
         is_ocean = hid in ocean_set
+        biomass_avail = max(0.0, getattr(c, 'biomass_kgm2', 0.0))
 
-        fauna_list = []
-        for sp_id in species_ids:
-            sp = FAUNA_REGISTRY.get(sp_id)
-            if sp is None:
+        # 3a. Suitability for all species
+        suit_cache: Dict[str, float] = {}
+        for sid in species_ids:
+            s = _suitability(sid, el, tn, pn, is_ocean, biomass_avail)
+            if s > 0.01:
+                suit_cache[sid] = s
+
+        if not suit_cache:
+            c.fauna = []
+            continue
+
+        # 3b. Herbivores — capped by total plant consumption
+        herb_densities: Dict[str, float] = {}
+        total_herb_consumption = 0.0
+        for sid in herbivores:
+            if sid not in suit_cache:
                 continue
+            sp = FAUNA_REGISTRY[sid]
+            # Sum all non-prey diet sources (PFT names, plankton, etc.)
+            bio_cons = sum(e for k, e in sp.diet_sources.items()
+                           if k not in FAUNA_REGISTRY and k not in ("scavenge",)) or 0.01
+            ideal = suit_cache[sid] * sp.population_density_max
+            density = ideal
+            total_herb_consumption += density * bio_cons
+            herb_densities[sid] = density
 
-            # Simple habitat suitability (same logic as Fauna._suitability)
-            suit = 1.0
+        # Scale down herbivores if they exceed available biomass
+        if total_herb_consumption > biomass_avail and total_herb_consumption > 0:
+            scale = biomass_avail / total_herb_consumption
+            for sid in herb_densities:
+                herb_densities[sid] *= scale
 
-            if sp.habitat_type == "aquatic":
-                if not is_ocean and el >= 0:
-                    suit = 0.0
-            elif sp.habitat_type in ("terrestrial",):
-                if is_ocean or el < 0:
-                    suit = 0.0
-            elif sp.habitat_type == "amphibious":
-                pass  # can live anywhere
-            elif sp.habitat_type == "aerial":
-                pass  # can live anywhere
+        # 3c. Carnivores — capped by available prey
+        carn_densities: Dict[str, float] = {}
+        # Total prey biomass available (all herbivores)
+        prey_pool: Dict[str, float] = dict(herb_densities)
+        for sid in carnivores:
+            if sid not in suit_cache:
+                continue
+            sp = FAUNA_REGISTRY[sid]
+            ideal = suit_cache[sid] * sp.population_density_max
 
-            if suit > 0:
-                # Temperature penalties
-                if tn < 0.05:
-                    suit *= max(0.0, tn / 0.05)
-                if tn > 0.95:
-                    suit *= max(0.0, (1.0 - tn) / 0.05)
-                # Precipitation penalty for terrestrial
-                if sp.habitat_type != "aquatic" and pn < 0.02:
-                    suit *= max(0.0, pn / 0.02)
+            # Compute how much prey this carnivore can eat
+            total_prey_avail = 0.0
+            for prey_id, rate in sp.diet_sources.items():
+                if prey_id == "scavenge":
+                    continue
+                prey_dens = prey_pool.get(prey_id, 0.0)
+                total_prey_avail += prey_dens * rate
 
-            if suit > 0.01:
-                # Initial density = suitability * max_density * random jitter
-                jitter = 0.7 + random.random() * 0.6  # 0.7–1.3
-                density = suit * sp.population_density_max * jitter * 0.3
-                if density > 0.01:
-                    fauna_list.append((sp_id, density))
+            # Own consumption per individual
+            own_cons = sum(r for k, r in sp.diet_sources.items()
+                           if k != "scavenge") or 0.01
+            max_from_prey = total_prey_avail / own_cons if own_cons > 0 else 0.0
+            density = min(ideal, max_from_prey)
 
-        c.fauna = fauna_list
-        if fauna_list:
+            if density > 0.01:
+                carn_densities[sid] = density
+                # Remove consumed prey from pool
+                for prey_id, rate in sp.diet_sources.items():
+                    if prey_id in prey_pool:
+                        consumed = density * rate / (prey_pool.get(prey_id, 1) or 1)
+                        prey_pool[prey_id] = max(0.0, prey_pool[prey_id] - density * rate)
+
+        # 3d. Omnivores — capped by remaining biomass + remaining prey
+        omn_densities: Dict[str, float] = {}
+        # Remaining biomass after herbivores
+        remaining_biomass = max(0.0, biomass_avail - total_herb_consumption * 0.5)
+        remaining_prey = prey_pool  # prey not consumed by carnivores
+        for sid in omnivores:
+            if sid not in suit_cache:
+                continue
+            sp = FAUNA_REGISTRY[sid]
+            ideal = suit_cache[sid] * sp.population_density_max
+
+            # Resources this omnivore can use
+            # Plant food: sum of PFT / other non-prey sources
+            plant_cons = sum(e for k, e in sp.diet_sources.items()
+                             if k not in FAUNA_REGISTRY and k not in ("scavenge",)) or 0.0
+            prey_cons_total = sum(r for k, r in sp.diet_sources.items()
+                                  if k in FAUNA_REGISTRY) or 0.0
+            total_own_cons = plant_cons + prey_cons_total or 0.01
+
+            # Available resources
+            bio_support = remaining_biomass / plant_cons if plant_cons > 0 else float('inf')
+            prey_support = 0.0
+            for prey_id, rate in sp.diet_sources.items():
+                if prey_id not in FAUNA_REGISTRY or prey_id == "scavenge":
+                    continue
+                prey_support += remaining_prey.get(prey_id, 0.0) * rate / total_own_cons
+            max_resources = bio_support + prey_support
+            density = min(ideal, max_resources)
+
+            if density > 0.01:
+                omn_densities[sid] = density
+                # Consume resources
+                if plant_cons > 0:
+                    remaining_biomass = max(0.0, remaining_biomass - density * plant_cons)
+                for prey_id, rate in sp.diet_sources.items():
+                    if prey_id in remaining_prey:
+                        remaining_prey[prey_id] = max(0.0, remaining_prey[prey_id] - density * rate)
+
+        # 3e. Store densities per species as field dicts
+        for sid, d in herb_densities.items():
+            if d > 0.01:
+                fauna_fields.setdefault(sid, {})[hid] = d
+        for sid, d in carn_densities.items():
+            if d > 0.01:
+                fauna_fields.setdefault(sid, {})[hid] = d
+        for sid, d in omn_densities.items():
+            if d > 0.01:
+                fauna_fields.setdefault(sid, {})[hid] = d
+
+        if any(d > 0.01 for _, d in list(herb_densities.items()) + list(carn_densities.items()) + list(omn_densities.items())):
             n_cells_with_fauna += 1
 
     n_total_species = len(species_ids)
     print(f"  [Fauna] {n_total_species} species, {n_cells_with_fauna}/{len(cells)} cells populated")
+    return fauna_fields
 
 
 # Main entry point  (≤ ~100 lines)
@@ -825,11 +989,11 @@ def generate_world(
     _add_layer1(cells, feature_store)
     _register_wm_concepts(wm_constraints)
 
-    # Phase 7 — Initial fauna distribution
-    _init_fauna_distribution(cells, elevation, temp, precip, ocean_set)
+    # Phase 7 — Initial fauna distribution (returns continuous field dicts)
+    fauna_fields = _init_fauna_distribution(cells, elevation, temp, precip, ocean_set)
 
     print(f"  Feature store: {feature_store.count} total features")
-    return cells, feature_store, flow_acc
+    return cells, feature_store, flow_acc, fauna_fields
 
 
 # ======================================================================

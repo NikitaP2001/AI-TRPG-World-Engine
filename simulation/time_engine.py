@@ -137,6 +137,10 @@ class TimeEngine:
             for _ in range(n_steps):
                 self._step(dt_hours)
                 time = self.db.get_time()
+            # Compute temperature at final time (single call, not 720×)
+            self._update_temperature(time["day_of_year"], time["hour"])
+            # Compute seasonal precipitation for this time of year
+            self._update_precipitation(time["day_of_year"])
             # Sync WS time after hourly loop
             if self._ws is not None:
                 self._ws._time = dict(time)
@@ -149,6 +153,7 @@ class TimeEngine:
             self.db.set_time(tick=new_tick, year=new_year,
                              day_of_year=new_day, hour=new_hour)
             self._update_temperature(new_day, new_hour)
+            self._update_precipitation(new_day)
             time = self.db.get_time()
             # Sync WorldState time cache
             if self._ws is not None:
@@ -156,6 +161,13 @@ class TimeEngine:
 
         # ── L1 daily step: run causal features for total days ──
         self._run_l1_step(dt_days=total_days)
+
+        # Persist WorldState (temperature, fauna, vegetation, water, etc.)
+        if self._ws is not None:
+            from .world_state_db import save_world_state
+            save_world_state(self.db, self._ws)
+            # Sync fauna to legacy fauna_populations table for viewer
+            self._sync_fauna_to_db()
 
         # ── Long-cycle processes at intervals ──
         self._accumulated_days += total_days
@@ -214,7 +226,7 @@ class TimeEngine:
 
         self.db.set_time(tick=new_tick, year=new_year,
                          day_of_year=new_day, hour=new_hour)
-        self._update_temperature(new_day, new_hour)
+        # Temperature updated once after loop, not every hour
 
     def _update_temperature(self, day_of_year: float, hour: float) -> None:
         """Recompute temperature field via continuous elevation + climate model.
@@ -230,24 +242,18 @@ class TimeEngine:
 
         # Sample from discrete elevation data for all H3 cells
         elev_map = ws.get_discrete("elevation")
-        geo_map = ws.get_discrete("geological_type")
+        sea_level = float(ws.get_param("sea_level", "0.0"))
         if not elev_map:
-            # Fall back to DB cells (legacy path)
-            cells = self.db.load_cells()
-            if not cells:
                 return
-            elev_map = {c["h3_id"]: c["elevation"] for c in cells}
-            geo_map = {c["h3_id"]: bool(c["is_ocean"]) for c in cells}
-
         # Compute temperature at every sampled point
         import h3 as _h3_t
         temp_data = {}
         for hid, elev in elev_map.items():
-            if hid not in geo_map:
-                continue
             latlng = _h3_t.cell_to_latlng(hid)
             lat, lon = latlng[0], latlng[1]
-            is_ocean = bool(geo_map.get(hid, 2) == 0)
+            # Water body (ocean or lake): water_depth > 0
+            water_depth = max(0.0, sea_level - elev)
+            is_ocean = water_depth > 0.01
             coastal = not is_ocean and abs(lat) < 60
 
             t_c = instant_temperature(
@@ -257,17 +263,51 @@ class TimeEngine:
                 axial_tilt=axial_tilt,
             )
             from .layer0.climate import TEMP_C_MIN as _TCM, _TEMP_C_RANGE as _TCR
-            t_norm = min(1.0, (t_c - _TCM) / _TCR)
+            t_norm = max(0.0, min(1.0, (t_c - _TCM) / _TCR))
             temp_data[hid] = t_norm
 
-        # Store as continuous field + discrete
+        # Store as continuous field + discrete (in-memory only)
+        # DB save happens once in advance() after the loop completes
         if len(temp_data) > 10:
             ws.set_field("temperature", temp_data)
             ws.set_discrete("temperature", temp_data)
 
-        # Legacy: update cells table for GUI compat
-        from .world_state_db import save_world_state
-        save_world_state(self.db, ws)
+    def _update_precipitation(self, day_of_year: float) -> None:
+        """Compute seasonal precipitation from ITCZ position + base climate.
+
+        Uses the existing precip_seasonality field to modulate mean annual
+        precipitation: cells closer to the ITCZ get more rain, cells farther
+        get less.  The ITCZ follows the solar declination.
+        """
+        ws = self._get_ws()
+        base_precip_map = ws.get_discrete("precipitation")
+        seas_map = ws.get_discrete("precip_seasonality")
+        if not base_precip_map or not seas_map:
+            return
+        axial_tilt = float(ws.get_param("axial_tilt", "23.44"))
+        decl = _solar_declination(day_of_year, axial_tilt)
+        itcz_lat = decl * 0.8  # ITCZ follows declination with ocean thermal lag
+
+        import h3 as _h3_p
+        new_precip = {}
+        for hid, base_p in base_precip_map.items():
+            latlng = _h3_p.cell_to_latlng(hid)
+            lat = latlng[0]
+            seas = seas_map.get(hid, 0.1)
+
+            # Distance from ITCZ (degrees of latitude)
+            dist = abs(lat - itcz_lat)
+            # ITCZ influence: gaussian with ~15 deg half-width
+            itcz_influence = math.exp(-(dist / 15.0) ** 2)
+            # Seasonal anomaly: ±seas relative to baseline
+            # baseline = 0.5 (when ITCZ is far), max = 0.5+seas (when ITCZ overhead)
+            seasonal_factor = 1.0 + seas * (itcz_influence - 0.5) * 2.0
+            p = base_p * seasonal_factor
+            p = max(0.0, min(1.0, p))
+            new_precip[hid] = p
+
+        ws.set_field("precipitation", new_precip)
+        ws.set_discrete("precipitation", new_precip)
 
     def _run_l1_step(self, dt_days: float) -> None:
         """Run one L1 tick: lakes, groundwater, wetlands, vegetation, fauna."""
@@ -303,33 +343,126 @@ class TimeEngine:
         fields = FieldRegistry.from_cells(cells)
         engine = SimEngine(fields)
 
-        # 3. Load fauna population_density fields from DB into MutableFields
-        fauna_rows_all = self.db.load_fauna_populations()
-        fauna_by_species: dict = {}
-        for row in fauna_rows_all:
-            sid = row["species_id"]
-            if sid not in fauna_by_species:
-                fauna_by_species[sid] = []
-            fauna_by_species[sid].append(row)
+        # 2a. Load MutableField _base from WS for persistence between ticks
+        # This ensures canopy_density, PFT biomass, etc. retain previous state
+        for _mf_name in list(fields._mutable_fields.keys()):
+            if ws.has_field(_mf_name):
+                try:
+                    _ws_cf = ws._fields._base_fields.get(_mf_name)
+                    if _ws_cf is not None:
+                        _mf = fields._mutable_fields[_mf_name]
+                        _mf._base = _ws_cf
+                except Exception:
+                    pass
 
+        # 2b. Register PFT biomass MutableFields (populated by Vegetation feature)
+        from .layer0.plant_registry import PFT_REGISTRY as _PFT_REG
+        if _PFT_REG:
+            for _pft_name in _PFT_REG:
+                _pft_fn = f"pft_biomass[{_pft_name}]"
+                if not fields.has(_pft_fn):
+                    from .layer1.fields import MutableField as _MF
+                    _new_mf = _MF(None, default=0.0)
+                    # If WS has this field from a previous advance, use it as _base
+                    if ws.has_field(_pft_fn):
+                        try:
+                            _ws_cf = ws._fields._base_fields.get(_pft_fn)
+                            if _ws_cf is not None:
+                                _new_mf._base = _ws_cf
+                        except Exception:
+                            pass
+                    fields.register_mutable(_pft_fn, _new_mf)
+                else:
+                    # Field already exists — try to set _base from WS
+                    try:
+                        _existing_mf = fields.get_mutable(_pft_fn)
+                        if _existing_mf._base is None and ws.has_field(_pft_fn):
+                            _ws_cf = ws._fields._base_fields.get(_pft_fn)
+                            if _ws_cf is not None:
+                                _existing_mf._base = _ws_cf
+                    except Exception:
+                        pass
+
+        # 3. Load fauna population_density fields into MutableFields
+        # First try from continuous WS fields, fall back to fauna_populations table
         import h3 as _h3_fauna
-        for species_id, rows in fauna_by_species.items():
+        ws_fauna_loaded = 0
+        for species_id in get_species_ids():
             field_name = f"population_density[{species_id}]"
-            if fields.has(field_name):
+            if not fields.has(field_name):
+                continue
+            try:
+                mf = fields.get_mutable(field_name)
+            except KeyError:
+                continue
+            # Try continuous WS field first
+            ws_field_name = f"population_density[{species_id}]"
+            if ws.has_field(ws_field_name):
+                ws_fauna_loaded += 1
+                # Collect points + values to build a proper ContinuousField _base
+                _pts_3d = []
+                _vals = []
+                for cell in cells:
+                    latlng = _h3_fauna.cell_to_latlng(cell.h3_id)
+                    lat, lon = float(latlng[0]), float(latlng[1])
+                    try:
+                        density = max(0.0, ws.field(ws_field_name)(lat, lon))
+                        if density > 1e-8:
+                            mf.add_persistent(lat, lon, radius_deg=2.0, strength=density)
+                            # Also collect for _base
+                            lat_r = math.radians(lat)
+                            lon_r = math.radians(lon)
+                            _pts_3d.append([
+                                math.cos(lat_r) * math.cos(lon_r),
+                                math.sin(lat_r),
+                                math.cos(lat_r) * math.sin(lon_r),
+                            ])
+                            _vals.append(float(density))
+                    except Exception:
+                        pass
+                # Build _base from collected data so Fauna._load_density_from_base can read it
+                if _vals:
+                    import numpy as _np_ws
+                    from scipy.spatial import cKDTree as _cKDTree_ws
+                    from simulation.layer0.contouring import ContinuousField as _CF_ws
+                    _tree_ws = _cKDTree_ws(_np_ws.array(_pts_3d, dtype=_np_ws.float64))
+                    mf._base = _CF_ws(_tree_ws, _np_ws.array(_vals, dtype=_np_ws.float64))
+        if ws_fauna_loaded == 0:
+            # Fallback: load from legacy fauna_populations table
+            fauna_rows_all = self.db.load_fauna_populations()
+            fauna_by_species: dict = {}
+            for row in fauna_rows_all:
+                sid = row["species_id"]
+                fauna_by_species.setdefault(sid, []).append(row)
+            for species_id, rows in fauna_by_species.items():
+                field_name = f"population_density[{species_id}]"
+                if not fields.has(field_name):
+                    continue
                 try:
                     mf = fields.get_mutable(field_name)
                 except KeyError:
                     continue
-                # Set field values via sample points
+                # Build a ContinuousField as base so it survives clear_persistent()
+                points_3d = []
+                vals = []
+                import math as _m
                 for r in rows:
                     try:
-                        latlng = _h3_fauna.cell_to_latlng(r["h3_id"])
-                        lat, lon = float(latlng[0]), float(latlng[1])
-                        density = max(0.0, float(r.get("density", 0.0)))
-                        if density > 1e-8:
-                            mf.add_persistent(lat, lon, radius_deg=2.0, strength=density)
+                        latlng_r = _h3_fauna.cell_to_latlng(r["h3_id"])
+                        lat_r = _m.radians(latlng_r[0])
+                        lon_r = _m.radians(latlng_r[1])
+                        points_3d.append([_m.cos(lat_r)*_m.cos(lon_r),
+                                           _m.sin(lat_r),
+                                           _m.cos(lat_r)*_m.sin(lon_r)])
+                        vals.append(float(r.get("density", 0.0)))
                     except Exception:
                         pass
+                if vals:
+                    import numpy as _np2
+                    from scipy.spatial import cKDTree
+                    from .layer0.contouring import ContinuousField
+                    tree = cKDTree(_np2.array(points_3d, dtype=_np2.float64))
+                    mf._base = ContinuousField(tree, _np2.array(vals, dtype=_np2.float64))
 
         # 4. Add Vegetation
         engine.add_feature(Vegetation())
@@ -365,6 +498,70 @@ class TimeEngine:
         if not has_groundwater:
             engine.add_feature(Groundwater())
 
+        # 5b. Compute water_depth grid from elevation + sea_level + lakes
+        # Injected into _FIELD_GRID_DATA so fauna/plankton can use continuous water depth
+        import simulation.layer1.features.fauna as _fauna_mod
+        _fauna_mod._ensure_grid()
+        _wd_nl = _fauna_mod._NLATS
+        _wd_nlo = _fauna_mod._NLONS
+        _set_wd = _fauna_mod._set_field_grid_data
+        import numpy as _np
+        _wd = _np.zeros((_wd_nl, _wd_nlo), dtype=_np.float64)
+        _elev_f = fields.get("elevation_mean")
+        if _elev_f is not None:
+            _sea_level = float(ws.get_param("sea_level", "0.0"))
+            for _i in range(_wd_nl):
+                _lat = float(_fauna_mod._GRID_LATS[_i])
+                for _j in range(_wd_nlo):
+                    _lon = float(_fauna_mod._GRID_LONS[_j])
+                    _el = _elev_f.base_only(_lat, _lon)
+                    _wd[_i, _j] = max(0.0, _sea_level - _el)
+            # Lake depth: check grid points inside lake polygons
+            for _feat in fs.all_active:
+                if _feat.type == "lake" and _feat.geometry is not None:
+                    _lake_level = float(_feat.properties.get("spill_elevation", 0.1))
+                    if _lake_level <= _sea_level:
+                        continue
+                    from shapely.geometry import Point as _Pt
+                    for _i in range(_wd_nl):
+                        _lat = float(_fauna_mod._GRID_LATS[_i])
+                        for _j in range(_wd_nlo):
+                            if _wd[_i, _j] > 0:
+                                continue
+                            _lon = float(_fauna_mod._GRID_LONS[_j])
+                            if _feat.geometry.contains(_Pt(_lon, _lat)):
+                                _el = _elev_f.base_only(_lat, _lon)
+                                _ld = max(0.0, _lake_level - _el)
+                                if _ld > _wd[_i, _j]:
+                                    _wd[_i, _j] = _ld
+        _set_wd("water_depth", _wd)
+
+        # Save water_depth to WS immediately (before engine.step clears _FIELD_GRID_DATA)
+        # Also register in FieldRegistry so _build_field_grid can re-sample it
+        import h3 as _h3_wd
+        _wd_data = {}
+        for _cell in cells:
+            try:
+                _ll = _h3_wd.cell_to_latlng(_cell.h3_id)
+                _i = int((_ll[0] + 90.0) / 2.0 + 0.5)
+                _j = int((_ll[1] + 180.0) / 2.0 + 0.5)
+                _i = max(0, min(89, _i))
+                _j = max(0, min(179, _j))
+                _v = float(_wd[_i, _j])
+                if _v > 0.001:
+                    _wd_data[_cell.h3_id] = _v
+            except Exception:
+                pass
+        if _wd_data:
+            try:
+                ws.set_field("water_depth", _wd_data)
+                # Register in FieldRegistry so _build_field_grid can sample it
+                _ws_wd_cf = ws._fields._base_fields.get("water_depth")
+                if _ws_wd_cf is not None:
+                    fields.register_base("water_depth", _ws_wd_cf)
+            except Exception:
+                pass
+
         # 6. Compute plankton_density from water temperature (for aquatic species)
         import h3 as _h3_plank
         plank_mf = None
@@ -373,12 +570,24 @@ class TimeEngine:
         except KeyError:
             pass
         if plank_mf is not None:
+            # Use water_depth if already computed, else fall back to elevation
+            _wd_f = _fauna_mod._FIELD_GRID_DATA.get("water_depth")
             for cell in cells:
                 latlng = _h3_plank.cell_to_latlng(cell.h3_id)
                 lat, lon = float(latlng[0]), float(latlng[1])
-                elev_f = fields.get("elevation_mean")
-                elev = elev_f(lat, lon) if elev_f else 0.0
-                if elev >= 0:
+                # Skip land: check if water_depth > 0, or fall back to elevation
+                if _wd_f is not None:
+                    _i = int((lat + 90.0) / 2.0 + 0.5)
+                    _j = int((lon + 180.0) / 2.0 + 0.5)
+                    _i = max(0, min(89, _i))
+                    _j = max(0, min(179, _j))
+                    _wd_val = float(_wd_f[_i, _j])
+                    is_water = _wd_val > 0.01
+                else:
+                    elev_f = fields.get("elevation_mean")
+                    elev = elev_f(lat, lon) if elev_f else 0.0
+                    is_water = elev < 0
+                if not is_water:
                     continue  # land — no plankton
                 temp_f = fields.get("temperature")
                 temp = max(0.0, min(1.0, temp_f(lat, lon))) if temp_f else 0.5
@@ -389,29 +598,28 @@ class TimeEngine:
                 if plank > 1e-6:
                     plank_mf.add_persistent(lat, lon, radius_deg=2.0, strength=plank)
 
-        # 7. Add Fauna features (one per registered species)
+        # 7. Clear shared env cache, add Fauna features, run
+        from .layer1.features.fauna import _clear_env_cache
+        _clear_env_cache()
         for species_id in get_species_ids():
             engine.add_feature(Fauna(species_id))
 
-        # 7. Run for dt_days
+        # 7b. Run for dt_days
         engine.step(dt=float(dt_days))
 
         # 8. Propagate mutable field state back to WorldState discrete data
         import h3 as _h3_prop
         wt_f = fields.get("water_table_depth")
         canopy_f = fields.get("canopy_density")
-        biomass_f = fields.get("biomass")
         soil_mut = fields.get("soil_fertility")
         wt_disc = ws.get_discrete("water_table_depth")
         can_disc = ws.get_discrete("canopy_density")
-        bio_disc = ws.get_discrete("biomass_kgm2")
         soil_disc = ws.get_discrete("soil_fertility")
         for cell in cells:
             latlng = _h3_prop.cell_to_latlng(cell.h3_id)
             lat, lon = float(latlng[0]), float(latlng[1])
             wt_disc[cell.h3_id] = max(0.0, wt_f(lat, lon))
             can_disc[cell.h3_id] = max(0.0, min(1.0, canopy_f(lat, lon)))
-            bio_disc[cell.h3_id] = max(0.0, biomass_f(lat, lon))
             soil_disc[cell.h3_id] = max(0.0, min(1.0, soil_mut(lat, lon)))
 
         # 9. Apply settlement footprint — accumulating deltas to WS fields
@@ -421,24 +629,20 @@ class TimeEngine:
                 sf.apply_to_cells(cells, dt=float(dt_days))
         # Sync settlement-modified cell attrs to WS discrete data
         for cell in cells:
-            for attr in ("canopy_density", "biomass_kgm2", "soil_fertility",
+            for attr in ("canopy_density", "soil_fertility",
                           "water_table_depth", "hazard_level"):
                 val = getattr(cell, attr, None)
                 if val is not None:
                     ws.get_discrete(attr)[cell.h3_id] = val
 
-        # 10. Save fauna population_density fields to DB
-        fauna_save_rows = []
+        # 10. Save fauna population_density fields as continuous fields in WS
+        import h3 as _h3_fauna_save
         for species_id in get_species_ids():
             field_name = f"population_density[{species_id}]"
             try:
                 pop_mf = fields.get_mutable(field_name)
             except KeyError:
                 continue
-            current_tick = 0
-            time = self.db.get_time()
-            if time:
-                current_tick = time.get("tick", 0)
 
             # Apply settlement hunting/suppression deltas
             for sf_feat in engine.features:
@@ -447,34 +651,84 @@ class TimeEngine:
                 deltas = sf_feat.props.get("_hunting_deltas", {})
                 if not deltas:
                     continue
-                # Write hunting deltas to population_density fields
                 for h3_id_str, delta in deltas.items():
                     try:
-                        latlng = _h3_prop.cell_to_latlng(h3_id_str)
+                        latlng = _h3_fauna_save.cell_to_latlng(h3_id_str)
                         lat, lon = float(latlng[0]), float(latlng[1])
                         pop_mf.add_persistent(lat, lon, radius_deg=2.0, strength=delta)
                     except Exception:
                         pass
 
-            # Sample field to get per-cell densities
+            # Build continuous field dict from MutableField
+            # Include zero entries for deep-water cells so the WS
+            # ContinuousField doesn't interpolate from land neighbors.
+            import simulation.layer1.features.fauna as _fauna_wd
+            _wd_grid = _fauna_wd._FIELD_GRID_DATA.get("water_depth")
+            field_data = {}
+            for cell in cells:
+                latlng = _h3_fauna_save.cell_to_latlng(cell.h3_id)
+                lat, lon = float(latlng[0]), float(latlng[1])
+                density = max(0.0, pop_mf(lat, lon))
+                if density > 1e-6:
+                    field_data[cell.h3_id] = density
+                elif _wd_grid is not None:
+                    # Check if this cell is in deep water — include explicit zero
+                    # to prevent KDTree interpolation from land cells.
+                    _i = int((lat + 90.0) / 2.0 + 0.5)
+                    _j = int((lon + 180.0) / 2.0 + 0.5)
+                    _i = max(0, min(89, _i))
+                    _j = max(0, min(179, _j))
+                    if _wd_grid[_i, _j] > 0.02:
+                        field_data[cell.h3_id] = 0.0
+
+            # Register as continuous field in WorldState
+            if field_data:
+                try:
+                    ws.set_field(field_name, field_data)
+                except Exception:
+                    pass
+
+        # 10b. Propagate PFT biomass fields from engine MutableFields to WS
+        for _pft_name in _PFT_REG:
+            _pft_fn = f"pft_biomass[{_pft_name}]"
+            try:
+                _pft_mf = fields.get_mutable(_pft_fn)
+            except KeyError:
+                continue
+            _pft_data = {}
+            for _cell in cells:
+                try:
+                    _ll = _h3_fauna_save.cell_to_latlng(_cell.h3_id)
+                    _v = max(0.0, _pft_mf(_ll[0], _ll[1]))
+                    if _v > 1e-6:
+                        _pft_data[_cell.h3_id] = _v
+                except Exception:
+                    pass
+            if _pft_data:
+                try:
+                    ws.set_field(_pft_fn, _pft_data)
+                except Exception:
+                    pass
+
+        # 11. Build ephemeral per-cell sample for emergence check
+        emergence_rows = []
+        for species_id in get_species_ids():
+            field_name = f"population_density[{species_id}]"
+            try:
+                pop_mf = fields.get_mutable(field_name)
+            except KeyError:
+                continue
             for cell in cells:
                 latlng = _h3_prop.cell_to_latlng(cell.h3_id)
                 lat, lon = float(latlng[0]), float(latlng[1])
                 density = max(0.0, pop_mf(lat, lon))
                 if density > 1e-6:
-                    fauna_save_rows.append({
-                        "h3_id": cell.h3_id,
-                        "lat": lat, "lon": lon,
-                        "species_id": species_id,
+                    emergence_rows.append({
+                        "h3_id": cell.h3_id, "species_id": species_id,
                         "density": density,
-                        "updated_at_tick": current_tick,
                     })
-
-        self.db.save_fauna_populations(fauna_save_rows)
-
-        # 11. Check fauna emergence → feed WM notification queue
         emergence_events = check_fauna_emergence(
-            fauna_save_rows,
+            emergence_rows,
             current_tick=self.db.get_time().get("tick", 0),
         )
         if emergence_events:
@@ -547,6 +801,54 @@ class TimeEngine:
             "temp_mean": sum(temps) / len(temps) if temps else 0,
         }
 
+    # ── Fauna sync to legacy table ──────────────────────────────────
+
+    def _sync_fauna_to_db(self) -> None:
+        """Sample WS continuous fauna fields → fauna_populations table.
+
+        The viewer reads fauna_populations for the info panel.
+        Without this sync, the panel would show stale data after advance().
+        """
+        from .layer1.fauna_registry import get_species_ids
+        import h3 as _h3
+
+        ws = self._ws
+        if ws is None:
+            return
+        h3_ids = self._ws_h3_ids()
+        if not h3_ids:
+            return
+
+        species_ids = list(get_species_ids())
+        fauna_rows = []
+        for species_id in species_ids:
+            field_name = f"population_density[{species_id}]"
+            if not ws.has_field(field_name):
+                continue
+            fa = ws.field(field_name)
+            for hid in h3_ids:
+                latlng = _h3.cell_to_latlng(hid)
+                lat, lon = float(latlng[0]), float(latlng[1])
+                try:
+                    density = max(0.0, fa(lat, lon))
+                except Exception:
+                    density = 0.0
+                # Round to integer individuals when densities are small
+                if density < 100 and density > 0:
+                    import random as _rnd_sync
+                    density = int(density) + (1 if _rnd_sync.random() < density - int(density) else 0)
+                if density > 0.5:
+                    fauna_rows.append({
+                        "h3_id": hid, "species_id": species_id,
+                        "density": density,
+                        "lat": lat, "lon": lon,
+                        "updated_at_tick": self.db.get_time().get("tick", 0),
+                    })
+        if fauna_rows:
+            # Replace entire table (simpler than per-cell diff)
+            self.db.conn.execute("DELETE FROM fauna_populations")
+            self.db.save_fauna_populations(fauna_rows)
+
     # ── Long-cycle processes (continuous fields) ──────────────────
 
     def _run_long_cycle(self) -> None:
@@ -567,36 +869,56 @@ class TimeEngine:
         cc_map = ws.get_discrete("climate_class")
 
         if acc >= _CLIMATE_DRIFT_INTERVAL and temp_map:
-            from .layer0.long_cycle import _drift_climate_continuous
-            n = _drift_climate_continuous(
-                h3_ids, temp_map, precip_map, temp_range_map, cc_map,
-                drift_rate=0.003, rng=self._rng,
-            )
+            # Build ephemeral CellData from WS discrete maps
+            from .layer0.cell_model import CellData
+            _tmp_cells = []
+            for hid in h3_ids:
+                _tmp_cells.append(CellData(
+                    h3_id=hid, resolution=2,
+                    elevation_mean=0.0,
+                    geological_type=2,
+                    temperature=temp_map.get(hid, 0.5),
+                    precipitation=precip_map.get(hid, 0.5),
+                    temp_seasonal_range=temp_range_map.get(hid, 0.2),
+                    climate_class=cc_map.get(hid, "") or "",
+                ))
+            from .layer0.long_cycle import _drift_climate
+            n = _drift_climate(_tmp_cells, drift_rate=0.003, rng=self._rng)
             if n > 0:
                 print(f"  [LongCycle] climate drift: {n} cells changed class")
+            # Write back to WS discrete maps
+            for c in _tmp_cells:
+                temp_map[c.h3_id] = c.temperature
+                precip_map[c.h3_id] = c.precipitation
+                cc_map[c.h3_id] = c.climate_class
             self._accumulated_days -= _CLIMATE_DRIFT_INTERVAL
 
         if acc >= _RESOURCE_EVOLVE_INTERVAL:
-            from .layer0.long_cycle import _evolve_resources_continuous
+            from .layer0.long_cycle import _evolve_resources
             from .layer0.resources import default_resource_types
             rtypes = default_resource_types()
-            flux_map = {hid: [] for hid in h3_ids}  # placeholder
-            _evolve_resources_continuous(flux_map, rtypes, h3_ids, steps=5, rng=self._rng)
+            # Build ephemeral cells with resource flux (use WS data if available)
+            res_cells = ws.to_celldata(h3_ids)
+            _evolve_resources(res_cells, rtypes, steps=5, rng=self._rng)
             self._accumulated_days -= _RESOURCE_EVOLVE_INTERVAL
 
         if acc >= _GEOLOGICAL_EVENT_INTERVAL:
-            from .layer0.long_cycle import _check_geological_events_continuous
-            stress_map = ws.get_discrete("tectonic_stress")
-            elev_map = ws.get_discrete("elevation")
-            hazard_map = ws.get_discrete("hazard_level")
-            geo_map = ws.get_discrete("geological_type")
-
-            events = _check_geological_events_continuous(
-                h3_ids, geo_map, stress_map, elev_map, hazard_map,
+            from .layer0.long_cycle import _check_geological_events
+            geo_cells = ws.to_celldata(h3_ids)
+            events = _check_geological_events(
+                geo_cells,
                 stress_accumulation_rate=0.01, event_threshold=0.8, rng=self._rng,
             )
             if events:
                 print(f"  [LongCycle] {len(events)} geological event(s)")
+                # Write back elevation/stress/hazard changes to WS
+                elev_map = ws.get_discrete("elevation")
+                stress_map = ws.get_discrete("tectonic_stress")
+                hazard_map = ws.get_discrete("hazard_level")
+                for c in geo_cells:
+                    elev_map[c.h3_id] = c.elevation_mean
+                    stress_map[c.h3_id] = c.tectonic_stress
+                    hazard_map[c.h3_id] = c.hazard_level
             self._accumulated_days -= _GEOLOGICAL_EVENT_INTERVAL
 
         # Register updated temperature/precip as continuous fields

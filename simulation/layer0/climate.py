@@ -459,7 +459,7 @@ def compute_temperature(
         # --- 4. Normalise to 0-1 (0 <-> -5 degC, 1 <-> 40 degC) ---
         # No lower clamp — polar cells may go below 0 (e.g. -0.22 for -15 degC)
         t_norm = (t_c - TEMP_C_MIN) / _TEMP_C_RANGE
-        t_norm = min(1.0, t_norm)
+        t_norm = max(0.0, min(1.0, t_norm))
 
         # --- 5. Seasonal range from solstice difference ---
         dq_sum = c["q_sum"] * solar_intensity - c["q_earth"]

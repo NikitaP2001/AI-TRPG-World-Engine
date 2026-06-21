@@ -58,13 +58,10 @@ _VEG_DESERT = (0.8, 0.7, 0.45)
 _VEG_TUNDRA = (0.55, 0.6, 0.65)
 _VEG_GRASSLAND = (0.6, 0.75, 0.4)
 _VEG_SHRUBLAND = (0.65, 0.6, 0.35)
-_VEG_WOODLAND = (0.45, 0.7, 0.35)
-_VEG_MANGROVE = (0.3, 0.6, 0.3)
 _VEG_SAVANNA = (0.7, 0.65, 0.3)
 _VEG_FOREST = (0.2, 0.55, 0.2)
 _VEG_RAINFOREST = (0.1, 0.4, 0.1)
 _VEG_TAIGA = (0.25, 0.45, 0.3)
-_VEG_ICE = (0.85, 0.90, 0.95)
 
 _VEG_MAP = {
     "barren": _VEG_BARREN,
@@ -76,9 +73,7 @@ _VEG_MAP = {
     "forest": _VEG_FOREST,
     "rainforest": _VEG_RAINFOREST,
     "taiga": _VEG_TAIGA,
-    "ice": _VEG_ICE,
-    "woodland": _VEG_WOODLAND,
-    "mangrove": _VEG_MANGROVE,
+    "woodland": _VEG_SAVANNA,
 }
 
 # ── Geology colour palette ─────────────────────────────────────
@@ -107,19 +102,10 @@ def _soil_color(fertility: float) -> Tuple[float, float, float]:
         return _SOIL_RICH
 
 
-def _veg_color(veg_type: str, is_ocean: bool, temp_norm: float = 0.5) -> Tuple[float, float, float]:
-    """Map vegetation type to colour.
-
-    If vegetation is 'barren' and temperature is below freezing,
-    show as tundra or ice instead of brown barren.
-    """
+def _veg_color(veg_type: str, is_ocean: bool) -> Tuple[float, float, float]:
+    """Map vegetation type to colour."""
     if is_ocean:
         return _VEG_OCEAN
-    # Cold override: barren at freezing temps → tundra/ice
-    if veg_type in ("barren",) and temp_norm < 0.0:
-        return _VEG_ICE
-    if veg_type in ("barren",) and temp_norm < 0.05:
-        return _VEG_TUNDRA
     return _VEG_MAP.get(veg_type, _VEG_GRASSLAND)
 
 
@@ -383,88 +369,6 @@ def _contour_color(el: float, is_ocean: bool, temp: float) -> Tuple[float, float
         return _CONTOUR_FLAT
 
 
-def _temp_color(tn: float) -> Tuple[float, float, float]:
-    """Temperature colour — blue (cold) → red (hot)."""
-    t = max(0.0, min(1.0, tn))
-    if t < 0.5:
-        # blue → cyan → green
-        u = t / 0.5
-        return (u * 0.2, u * 0.6, 1.0 - u * 0.3)
-    else:
-        # green → yellow → red
-        u = (t - 0.5) / 0.5
-        return (0.2 + u * 0.8, 1.0 - u * 0.7, 0.5 - u * 0.5)
-
-
-def _precip_color(pn: float) -> Tuple[float, float, float]:
-    """Precipitation colour — yellow (dry) → blue (wet)."""
-    p = max(0.0, min(1.0, pn))
-    if p < 0.3:
-        u = p / 0.3
-        return (0.9 - u * 0.3, 0.8 - u * 0.2, 0.3 + u * 0.1)
-    elif p < 0.7:
-        u = (p - 0.3) / 0.4
-        return (0.6 - u * 0.2, 0.6 - u * 0.1, 0.4 + u * 0.2)
-    else:
-        u = (p - 0.7) / 0.3
-        return (0.4 - u * 0.25, 0.5 - u * 0.2, 0.6 + u * 0.3)
-
-
-def _crustal_age_color(age_myr: float) -> Tuple[float, float, float]:
-    """Crustal age — young (red) → old (blue)."""
-    a = max(0.0, min(1000.0, age_myr)) / 1000.0
-    if a < 0.2:
-        return (0.9, 0.2, 0.1)
-    elif a < 0.5:
-        u = (a - 0.2) / 0.3
-        return (0.9 - u * 0.5, 0.2 + u * 0.3, 0.1 + u * 0.2)
-    else:
-        u = (a - 0.5) / 0.5
-        return (0.4 - u * 0.3, 0.5 - u * 0.1, 0.3 + u * 0.4)
-
-
-def _canopy_color(cd: float) -> Tuple[float, float, float]:
-    """Canopy density — bare (brown) → dense (dark green)."""
-    c = max(0.0, min(1.0, cd))
-    return (0.5 - c * 0.3, 0.3 + c * 0.4, 0.2 + c * 0.1)
-
-
-def _hazard_color(hl: float) -> Tuple[float, float, float]:
-    """Hazard level — none (green) → extreme (red)."""
-    h = max(0.0, min(1.0, hl))
-    return (h * 0.9, (1.0 - h) * 0.8, (1.0 - h) * 0.2)
-
-
-def _ice_cover_color(temp_norm: float, elevation: float = 0.0) -> Tuple[float, float, float]:
-    """Ice cover — temperature-based with elevation influence.
-
-    temp_norm < 0.0: permanent ice/snow (white → light blue)
-    temp_norm 0.0-0.05: tundra (brown-grey)
-    temp_norm > 0.05: no ice (transparent → dark land)
-
-    The color intensity reflects thickness: colder = thicker ice.
-    """
-    t = max(-0.3, min(1.0, temp_norm))
-    if t < 0.0:
-        # Ice: white → light blue gradient by how cold
-        intensity = min(1.0, (-t) * 3.0)  # 0→1 as temp drops below 0
-        return (0.85 + intensity * 0.1,
-                0.85 + intensity * 0.05,
-                0.90 + intensity * 0.05)
-    elif t < 0.05:
-        # Tundra transition zone
-        u = t / 0.05  # 0→1
-        return (0.55 + u * 0.2,
-                0.60 - u * 0.15,
-                0.65 - u * 0.3)
-    else:
-        # No ice — dark land colour
-        u = min(1.0, (t - 0.05) / 0.1)
-        return (0.35 - u * 0.1,
-                0.30 - u * 0.05,
-                0.20 - u * 0.05)
-
-
 class PlanetScene(Scene):
     """Renders a planet as a smooth subdivided icosahedron surface.
 
@@ -539,19 +443,9 @@ class PlanetScene(Scene):
         self._panel_texture_pw = 480
         self._panel_redraw = False
 
-        # WorldState reference (continuous field sampling)
-        self._ws = None
-        # View mode: 0=elevation, 1=soil, 2=vegetation, 3=geology,
-        #            4=temperature, 5=precipitation, 6=runoff,
-        #            7=crustal_age, 8=canopy_density, 9=hazard_level,
-        #            10=ice_cover
+        # View mode: 0=elevation, 1=soil, 2=vegetation, 3=geology, 4=runoff
         self._view_mode = 0
-        self._view_mode_names = [
-            "Elevation", "Soil Fertility", "Vegetation", "Geology",
-            "Temperature", "Precipitation", "Runoff",
-            "Crustal Age", "Canopy Density", "Hazard Level",
-            "Ice Cover",
-        ]
+        self._view_mode_names = ["Elevation", "Soil Fertility", "Vegetation", "Geology", "Runoff"]
 
     def name(self) -> str:
         return "Planet"
@@ -571,6 +465,63 @@ class PlanetScene(Scene):
                 self._ico_rebuild_colors()
             print(f"[PlanetScene] View mode: {self._view_mode_names[self._view_mode]}")
 
+    def rebuild_from_ws(self, ws: "WorldState") -> None:
+        """Update cell data + icosahedron + info panel from WorldState.
+
+        Called after TimeEngine advances to show simulation results.
+        """
+        from simulation.world_state import WorldState
+
+        # Map WorldState discrete field names → CellData attribute names
+        field_map = {
+            "elevation": "elevation_mean",
+            "temperature": "temperature",
+            "precipitation": "precipitation",
+            "soil_fertility": "soil_fertility",
+            "canopy_density": "canopy_density",
+            "biomass_kgm2": "biomass_kgm2",
+            "water_table_depth": "water_table_depth",
+        }
+        discrete_cache = {}
+        for ws_name, cell_attr in field_map.items():
+            d = ws.get_discrete(ws_name)
+            if d:
+                discrete_cache[cell_attr] = d
+
+        updated_cells = 0
+        elev_changed = False
+        for cell in self.cells:
+            h = cell.h3_id
+            for cell_attr, d in discrete_cache.items():
+                if h in d:
+                    setattr(cell, cell_attr, float(d[h]))
+                    updated_cells += 1
+                    if cell_attr == "elevation_mean":
+                        elev_changed = True
+
+        n_cells = len(self.cells)
+        if updated_cells:
+            print(f"  [rebuild] updated {updated_cells} fields across {n_cells} cells")
+
+        # ── Update icosahedron vertex elevations if elevation changed ──
+        if elev_changed and self._ico_vertices_base:
+            import h3 as _h3_rb
+            n = len(self._ico_vertices_base)
+            for i in range(n):
+                x, y, z = self._ico_vertices_base[i]
+                lat = math.degrees(math.asin(max(-1.0, min(1.0, y))))
+                lon = math.degrees(math.atan2(z, x))
+                h = _h3_rb.latlng_to_cell(lat, lon, 2)
+                if h in discrete_cache.get("elevation_mean", {}):
+                    self._ico_vertex_elevs[i] = float(discrete_cache["elevation_mean"][h])
+
+        # ── Rebuild surface colors from updated cell data ──
+        self._ico_rebuild_colors()
+
+        # ── Flag info panel for redraw ──
+        self._panel_dirty = True
+        self._panel_redraw = True
+
     def _get_cell_color(self, cell) -> Tuple[float, float, float]:
         """Get cell color for current view mode."""
         if self._view_mode == 0:  # Elevation
@@ -578,27 +529,12 @@ class PlanetScene(Scene):
         elif self._view_mode == 1:  # Soil
             return _soil_color(cell.soil_fertility)
         elif self._view_mode == 2:  # Vegetation
-            return _veg_color(cell.vegetation_cover, cell.geological_type == 0, cell.temperature)
+            return _veg_color(cell.vegetation_cover, cell.geological_type == 0)
         elif self._view_mode == 3:  # Geology
             return _geo_color(cell.geological_type)
-        elif self._view_mode == 4:  # Temperature
-            return _temp_color(cell.temperature)
-        elif self._view_mode == 5:  # Precipitation
-            return _precip_color(cell.precipitation)
-        elif self._view_mode == 6:  # Runoff
+        elif self._view_mode == 4:  # Runoff
             ro = getattr(cell, 'runoff_ratio', 0.5)
             return _runoff_color(ro)
-        elif self._view_mode == 7:  # Crustal age
-            ca = getattr(cell, 'crustal_age_myr', 100.0)
-            return _crustal_age_color(ca)
-        elif self._view_mode == 8:  # Canopy density
-            cd = getattr(cell, 'canopy_density', 0.0)
-            return _canopy_color(cd)
-        elif self._view_mode == 9:  # Hazard level
-            hl = getattr(cell, 'hazard_level', 0.0)
-            return _hazard_color(hl)
-        elif self._view_mode == 10:  # Ice cover
-            return _ice_cover_color(cell.temperature, cell.elevation_mean)
         return _contour_color(cell.elevation_mean, cell.geological_type == 0, cell.temperature)
 
     def _build_icosahedron_sphere(self, subdivisions: int = 4):
@@ -675,9 +611,6 @@ class PlanetScene(Scene):
 
         Ocean detection uses geological type (geo_type == 0), NOT
         elevation — rift valleys have negative elevation but are land.
-
-        Cells NOT in generated data render as dark 'void' so the
-        user can see which areas have no data.
         """
         import h3
         if not self._ico_vertices_base:
@@ -685,23 +618,18 @@ class PlanetScene(Scene):
         n = len(self._ico_vertices_base)
         verts = []
         cell_geo_map = {}
-        cell_set = set()
         if self.cells:
             cell_geo_map = {cell.h3_id: cell.geological_type for cell in self.cells}
-            cell_set = set(cell_geo_map.keys())
-        _VOID = (0.05, 0.05, 0.08)
         for i in range(n):
             x, y, z = self._ico_vertices_base[i]
             el = self._ico_vertex_elevs[i]
             lat = math.degrees(math.asin(max(-1.0, min(1.0, y))))
             lon = math.degrees(math.atan2(z, x))
+            # Ocean from geological type, not elevation
             h = h3.latlng_to_cell(lat, lon, 2)
-            if h not in cell_set:
-                col = _VOID
-            else:
-                geo_type = cell_geo_map.get(h, 2)
-                is_ocean = (geo_type == 0)
-                col = self._sample_color(lat, lon, el, is_ocean, geo_type)
+            geo_type = cell_geo_map.get(h, 2)
+            is_ocean = (geo_type == 0)
+            col = self._sample_color(lat, lon, el, is_ocean, geo_type)
             self._ico_vertex_colors[i] = col
             verts.append((x, y, z, col[0], col[1], col[2], el))
         arr = np.array(verts, dtype=np.float32)
@@ -775,9 +703,6 @@ class PlanetScene(Scene):
         wetlands, biomes, and rivers are all rendered as part of the
         icosahedron vertex colors, not as floating overlays.
 
-        For continuous-field view modes (temperature, precipitation, etc.)
-        samples from self._ws WorldState directly.
-
         Args:
             lat, lon: vertex position
             elev: vertex elevation
@@ -799,7 +724,22 @@ class PlanetScene(Scene):
                 elif f.type == "biome":
                     bk = f.properties.get("biome_key", "")
                     if bk:
-                        veg = bk  # Use biome as vegetation type
+                        # Map biome_key to a standard veg class for color lookup
+                        _biome_veg_map = {
+                            # Direct matches
+                            "desert": "desert", "tundra": "tundra",
+                            "grassland": "grassland", "shrubland": "shrubland",
+                            "savanna": "savanna", "rainforest": "rainforest",
+                            "taiga": "taiga",
+                            # Close equivalents
+                            "arctic_tundra": "tundra", "alpine_tundra": "tundra",
+                            "boreal_forest": "taiga",
+                            "temperate_deciduous": "forest",
+                            "dry_forest": "woodland",
+                            "forest_steppe": "savanna",
+                            "monsoon_forest": "forest",
+                        }
+                        veg = _biome_veg_map.get(bk, "forest")
                         biome_canopy = f.properties.get("canopy", 0)
 
         # Lake: water color regardless of elevation/view mode
@@ -812,80 +752,19 @@ class PlanetScene(Scene):
         elif self._view_mode == 1:
             if is_lake:
                 return lake_col
-            sf = 0.5
-            if self._ws is not None:
-                try:
-                    sf = self._ws.field("soil_fertility")(lat, lon)
-                except KeyError:
-                    pass
-            return _soil_color(max(0.02, sf))
+            return _soil_color(max(0.02, elev * 0.5 + 0.1))
         elif self._view_mode == 2:
             if is_lake:
                 return lake_col
-            # Sample temperature for cold-region override
-            tn = 0.5
-            if self._ws is not None:
-                try:
-                    tn = self._ws.field("temperature")(lat, lon)
-                except KeyError:
-                    pass
-            return _veg_color(veg, is_ocean, tn)
+            return _veg_color(veg, is_ocean)
         elif self._view_mode == 3:
             if not is_ocean and geo_type == 0:
                 geo_type = 2
             return _geo_color(geo_type)
-        elif self._view_mode == 4:  # Temperature
-            tn = 0.5
-            if self._ws is not None:
-                try:
-                    tn = self._ws.field("temperature")(lat, lon)
-                except KeyError:
-                    pass
-            return _temp_color(tn)
-        elif self._view_mode == 5:  # Precipitation
-            pn = 0.5
-            if self._ws is not None:
-                try:
-                    pn = self._ws.field("precipitation")(lat, lon)
-                except KeyError:
-                    pass
-            return _precip_color(pn)
-        elif self._view_mode == 6:  # Runoff
+        elif self._view_mode == 4:
             if is_lake:
                 return lake_col
             return (0.5, 0.5, 0.5)
-        elif self._view_mode == 7:  # Crustal age
-            ca = 100.0
-            if self._ws is not None:
-                try:
-                    ca = self._ws.field("crustal_age")(lat, lon)
-                except KeyError:
-                    pass
-            return _crustal_age_color(ca)
-        elif self._view_mode == 8:  # Canopy density
-            cd = 0.0
-            if self._ws is not None:
-                try:
-                    cd = self._ws.field("canopy_density")(lat, lon)
-                except KeyError:
-                    pass
-            return _canopy_color(cd)
-        elif self._view_mode == 9:  # Hazard level
-            hl = 0.0
-            if self._ws is not None:
-                try:
-                    hl = self._ws.field("hazard_level")(lat, lon)
-                except KeyError:
-                    pass
-            return _hazard_color(hl)
-        elif self._view_mode == 10:  # Ice cover
-            tn = 0.5
-            if self._ws is not None:
-                try:
-                    tn = self._ws.field("temperature")(lat, lon)
-                except KeyError:
-                    pass
-            return _ice_cover_color(tn, elev)
         return _contour_color(elev, is_ocean, 0.5)
 
     def _find_cell(self, h3_id: str):
@@ -1178,21 +1057,14 @@ void main() {
         from simulation.world_state_db import load_world_state
         db = WorldDB(db_path)
         ws = load_world_state(db)
-        self._ws = ws
-        self._feature_store = ws.features
-        # ── Get H3 IDs from WS discrete data ───────────────────────
+        self._feature_store = db.load_features()
+        # Build CellData from WorldState
         h3_ids = list(ws.get_discrete("elevation").keys())
-        if not h3_ids:
-            h3_ids = list(ws.get_discrete("geological_type").keys())
-        # ── Sample continuous fields as CellData for UI ─────────────
-        # Use to_celldata which samples continuous fields at H3 centroids
         cells = ws.to_celldata(h3_ids)
+        # Ensure all CellData has resolution set
+        for c in cells:
+            c.resolution = 2
         # ── Load fauna populations ──────────────────────────────────
-        # Ensure default fauna species are registered for display
-        from simulation.layer1.default_fauna import register_default_fauna
-        register_default_fauna()
-        from simulation.layer1.fauna_registry import FAUNA_REGISTRY
-        self._fauna_registry = dict(FAUNA_REGISTRY)
         self._fauna_data: dict = {}
         try:
             fauna_rows = db.load_fauna_populations()
@@ -1200,12 +1072,11 @@ void main() {
                 h3_id = row["h3_id"]
                 self._fauna_data.setdefault(h3_id, {})
                 self._fauna_data[h3_id][row["species_id"]] = float(row.get("density", 0.0))
-            print(f"[PlanetScene] Loaded {len(self._fauna_data)} cells with fauna data "
-                  f"({len(self._fauna_registry)} species registered)")
         except Exception:
             self._fauna_data = {}
-            print(f"[PlanetScene] No fauna populations found "
-                  f"({len(self._fauna_registry)} species registered)")
+        print(f"[PlanetScene] Loaded {len(self._fauna_data)} cells with fauna data")
+        print(f"[PlanetScene] Loaded {len(cells)} cells, "
+              f"{self._feature_store.count if self._feature_store else 0} features")
         db.close()
 
         # Print feature summary
@@ -1248,20 +1119,19 @@ void main() {
         # Pre-build cell lookup maps
         cell_elev_map = {cell.h3_id: cell.elevation_mean for cell in cells}
         cell_geo_map = {cell.h3_id: cell.geological_type for cell in cells}
-        cell_set = set(cell_geo_map.keys())
-        _VOID = (0.05, 0.05, 0.08)
         for i, (x, y, z) in enumerate(ico_verts):
             lat = math.degrees(math.asin(max(-1.0, min(1.0, y))))
             lon = math.degrees(math.atan2(z, x))
+            el = _interp_elevation(lat, lon)
+            # Ocean detection from geological type at vertex position
             h = h3.latlng_to_cell(lat, lon, 2)
-            if h not in cell_set:
-                el = 0.0
-                col = _VOID
-            else:
-                el = _interp_elevation(lat, lon)
+            if h in cell_geo_map:
                 geo_type = cell_geo_map[h]
                 is_ocean_cell = (geo_type == 0)
-                col = self._sample_color(lat, lon, el, is_ocean_cell, geo_type)
+            else:
+                geo_type = 2
+                is_ocean_cell = el < -0.015
+            col = self._sample_color(lat, lon, el, is_ocean_cell, geo_type)
             self._ico_vertex_elevs.append(el)
             self._ico_vertex_colors.append(col)
             vertices.append((x, y, z, col[0], col[1], col[2], el))
@@ -1564,16 +1434,9 @@ void main() {
             # ── 5. FAUNA ──
             fauna_rows_local = []
             fauna_at_cell = self._fauna_data.get(cell.h3_id, {})
-            total_species = len(self._fauna_registry)
             if fauna_at_cell:
-                present = sum(1 for v in fauna_at_cell.values() if v > 0)
-                fauna_rows_local.append((f"Species present", f"{present}/{total_species}"))
                 for sp_id, density in sorted(fauna_at_cell.items()):
-                    if density <= 0:
-                        continue
-                    # Use registry name if available
-                    sp_def = self._fauna_registry.get(sp_id)
-                    sp_name = sp_def.name if sp_def else sp_id.replace("_", " ").title()
+                    sp_name = sp_id.replace("_", " ").title()
                     if density >= 1.0:
                         fauna_rows_local.append((sp_name, f"{density:.0f} individuals"))
                     elif density >= 0.1:
@@ -1581,7 +1444,7 @@ void main() {
                     else:
                         fauna_rows_local.append((sp_name, f"{density:.2f}"))
             else:
-                fauna_rows_local.append((f"Not yet populated", f"({total_species} spp. registered)"))
+                fauna_rows_local.append(("(none)", ""))
             add_section("FAUNA", fauna_rows_local)
 
             # ── 6. VEGETATION ──

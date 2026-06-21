@@ -71,7 +71,7 @@ def seed_initial_fauna(
     for cell in cells:
         latlng = h3.cell_to_latlng(cell.h3_id)
         lat, lon = float(latlng[0]), float(latlng[1])
-        is_ocean = cell.elevation_mean <= 0.0 and cell.geological_type == 0
+        is_ocean = cell.geological_type == 0  # match generator's ocean_set definition
         cell_data.append({
             "h3_id": cell.h3_id,
             "lat": lat,

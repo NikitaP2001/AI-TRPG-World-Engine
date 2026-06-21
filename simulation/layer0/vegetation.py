@@ -40,18 +40,17 @@ def compute_vegetation_cell(
     water_table_depth: float = 0.5,
     is_ocean: bool = False,
     day_of_year: float = 172.0,
+    elevation: float = 0.0,
+    soil_depth: float = 0.5,
+    water_depth: float = 0.0,    # standing water depth, 0 = dry land
 ) -> dict:
     """Compute continuous vegetation state for one cell.
 
-    Returns dict:
-        canopy_density:  float  0–1 total canopy cover
-        biomass_kgm2:    float  total above-ground biomass
-        litterfall_rate: float  annual litterfall (fraction)
-        pft_composition: dict   PFT name → biomass_kgm2
-        dominant_pft:    str    name of highest-biomass PFT
-        vegetation_cover: str   human-readable class (backward compat)
+    water_depth: standing water depth (normalised). PFTs with
+        water_depth_max < water_depth cannot grow here.
     """
-    if is_ocean:
+    # Deep water (ocean, deep lake) — no vegetation
+    if water_depth > 0.5:
         return {
             "canopy_density": 0.0,
             "biomass_kgm2": 0.0,
@@ -81,6 +80,10 @@ def compute_vegetation_cell(
     total_litter = 0.0
 
     for name, pft in PFT_REGISTRY.items():
+        # Water depth filter: PFT must tolerate standing water
+        if pft.water_depth_max < water_depth:
+            continue
+
         suit = pft.suitability(temp, precip, soil_fertility, soil_ph)
         if suit < 0.05:
             continue
@@ -94,7 +97,6 @@ def compute_vegetation_cell(
         gf = pft.growth_factor(temp, precip, day_of_year)
 
         # Competition: reduce biomass by total canopy (light competition)
-        # Shade-tolerant PFTs less affected
         competition_factor = math.exp(-total_canopy * (1.0 - pft.shade_tolerance * 0.7))
         biomass = eq_biomass * gf * competition_factor
         if biomass < 0.01:
@@ -105,11 +107,43 @@ def compute_vegetation_cell(
 
         pft_data.append((name, biomass, canopy, litter))
         total_biomass += biomass
-        total_canopy = 1.0 - math.prod(1.0 - c for _, _, c, _ in pft_data)  # probalistic
+        total_canopy = 1.0 - math.prod(1.0 - c for _, _, c, _ in pft_data)
         total_litter += litter
 
     # Cap canopy at 1.0
     total_canopy = min(1.0, total_canopy)
+
+    # Soil depth penalty — trees need root space
+    if soil_depth < 0.05:
+        # Bare rock / scree — no vegetation
+        total_biomass = 0.0
+        total_canopy = 0.0
+        total_litter = 0.0
+        pft_data = []
+    elif soil_depth < 0.2:
+        # Thin soil — only herbs and grasses
+        depth_factor = (soil_depth - 0.05) / 0.15
+        total_biomass *= depth_factor
+        total_canopy *= depth_factor
+        # Filter out trees from composition
+        pft_data = [(n, b, c, l) for n, b, c, l in pft_data
+                    if not (PFT_REGISTRY.get(n) and PFT_REGISTRY[n].growth_form == "tree")]
+        if not pft_data:
+            total_biomass = 0.0
+            total_canopy = 0.0
+
+    # Elevation treeline — trees stop above ~0.2 norm (~3000m)
+    if elevation > 0.2:
+        treeline_factor = max(0.0, (1.0 - (elevation - 0.2) / 0.3))
+        # Only non-tree vegetation survives
+        pft_data = [(n, b, c, l) for n, b, c, l in pft_data
+                    if not (PFT_REGISTRY.get(n) and PFT_REGISTRY[n].growth_form == "tree")]
+        if not pft_data:
+            total_biomass = 0.0
+            total_canopy = 0.0
+        else:
+            total_biomass *= treeline_factor
+            total_canopy *= treeline_factor
 
     # Dominant PFT
     pft_composition = {n: b for n, b, _, _ in pft_data}
@@ -251,6 +285,8 @@ def assign_vegetation(
                 soil_ph=getattr(cell, 'soil_ph', 7.0),
                 water_table_depth=cell.water_table_depth,
                 is_ocean=is_ocean,
+                elevation=cell.elevation_mean,
+                soil_depth=cell.soil_depth,
             )
 
             # Store backward-compat string

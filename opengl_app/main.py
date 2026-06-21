@@ -29,6 +29,8 @@ import numpy as np
 
 from opengl_app.camera import Camera
 from opengl_app.planet_scene import PlanetScene
+from simulation.time_engine import TimeEngine
+from simulation.world_db import WorldDB
 
 
 def _ensure_data(parquet_path: str) -> str:
@@ -105,21 +107,60 @@ def main():
     # ── Scroll callback (set once) — always zoom ──
     glfw.set_scroll_callback(window, lambda w, xo, yo: camera.zoom(-yo * 50))
 
-    # ── Key callback — view mode switching ──
+    # ── Init TimeEngine for in-app simulation ──
+    world_dir = os.path.dirname(parquet_path)
+    db_path = os.path.join(world_dir, "world.sqlite")
+    te = None
+    if os.path.isfile(db_path):
+        from simulation.layer1.default_fauna import register_default_fauna
+        register_default_fauna()
+        te = TimeEngine(WorldDB(db_path))
+        print(f"[App] TimeEngine ready — press M to advance 1 month")
+    else:
+        print(f"[App] No world.sqlite at {db_path} — simulation disabled")
+
+    # ── Key callback — view mode switching + simulation ──
     def _key_cb(w, key, scancode, action, mods):
-        if action == glfw.PRESS:
-            if key == glfw.KEY_1:
-                scene.set_view_mode(0)
-            elif key == glfw.KEY_2:
-                scene.set_view_mode(1)
-            elif key == glfw.KEY_3:
-                scene.set_view_mode(2)
-            elif key == glfw.KEY_4:
-                scene.set_view_mode(3)
-            elif key == glfw.KEY_5:
-                scene.set_view_mode(4)
-            elif key == glfw.KEY_TAB:
-                scene.cycle_view_mode()
+        if action != glfw.PRESS:
+            return
+        if key == glfw.KEY_TAB:
+            scene.cycle_view_mode()
+        elif key == glfw.KEY_1:
+            scene.set_view_mode(0)
+        elif key == glfw.KEY_2:
+            scene.set_view_mode(1)
+        elif key == glfw.KEY_3:
+            scene.set_view_mode(2)
+        elif key == glfw.KEY_4:
+            scene.set_view_mode(3)
+        elif key == glfw.KEY_5:
+            scene.set_view_mode(4)
+        elif key == glfw.KEY_6:
+            scene.set_view_mode(5)
+        elif key == glfw.KEY_7:
+            scene.set_view_mode(6)
+        elif key == glfw.KEY_8:
+            scene.set_view_mode(7)
+        elif key == glfw.KEY_9:
+            scene.set_view_mode(8)
+        elif key == glfw.KEY_0:
+            scene.set_view_mode(9)
+        elif key == glfw.KEY_MINUS:
+            scene.set_view_mode(10)
+        elif key == glfw.KEY_M and te is not None and action == glfw.PRESS:
+            import time as _t
+            t0 = _t.time()
+            print("[Sim] Advancing 30 days...", end=" ", flush=True)
+            try:
+                summary = te.advance(days=30)
+                elapsed = _t.time() - t0
+                print(f"done ({elapsed:.1f}s) — Year {summary.get('year', '?')} Day {summary.get('day_of_year', '?'):.0f}")
+                # Rebuild scene visuals from updated WorldState
+                scene.rebuild_from_ws(te._get_ws())
+            except Exception as e:
+                import traceback
+                print(f"ERROR: {e}")
+                traceback.print_exc()
     glfw.set_key_callback(window, _key_cb)
 
     # ── Main loop ──
@@ -127,7 +168,7 @@ def main():
     frame_count = 0
     fps_timer = 0
 
-    print("[App] Running. Drag to orbit, scroll to zoom. Keys 1-5: view modes, Tab: cycle.")
+    print("[App] Running. Drag to orbit, scroll to zoom. 1-9,0,-: view modes. M: advance 1 month. Tab: cycle.")
 
     while not glfw.window_should_close(window):
         now = time.time()

@@ -77,6 +77,13 @@ class PlantDef:
     leaf_area_index: float = 0.0        # m²/m², 0 = auto from leaf_type
     interception_max: float = 0.0       # max fraction 0-1, 0 = auto from leaf_type
 
+    # ── Water depth tolerance (in normalized units) ──────────────
+    # 0 = strictly terrestrial (oak, pine)
+    # 0.1 = marsh/fen (cattails, sedges)
+    # 0.5 = shallow water (mangrove, rush)
+    # >1 = submerged aquatic (algae, pondweed)
+    water_depth_max: float = 0.0        # max standing water for survival
+
     # ── Rooting ──────────────────────────────────────────────────────
     root_depth_m: float = 1.0
     drought_tolerance: float = 0.3      # 0–1

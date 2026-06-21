@@ -118,6 +118,12 @@ class WorldState:
         else:
             self._fields.register_base(name, cf)
 
+        # Also populate discrete dict for persistence (save_world_state needs it)
+        if isinstance(data, dict) and data:
+            self._discrete_fields.setdefault(name, {}).update(
+                {k: float(v) for k, v in data.items() if v is not None}
+            )
+
     def field(self, name: str) -> FieldAccessor:
         """Get a field evaluator at any (lat, lon)."""
         return self._fields.get(name)
@@ -166,6 +172,79 @@ class WorldState:
 
     def has_field(self, name: str) -> bool:
         return self._fields.has(name)
+
+    @classmethod
+    def from_cell_data(cls, cells: List["CellData"],
+                       params: Optional[dict] = None) -> "WorldState":
+        """Build a WorldState from CellData list (generator output).
+
+        Uses the same field-mapping logic as save_generated_world().
+        """
+        from .world_state_db import save_generated_world
+        # We create an empty WS and populate it via the helper pattern
+        ws = cls()
+        if params:
+            ws._params = dict(params)
+        # Build field dicts from CellData list
+        field_dicts: dict = {}
+        for c in cells:
+            hid = c.h3_id
+            for attr, fname in [
+                ("elevation_mean", "elevation"),
+                ("temperature", "temperature"),
+                ("precipitation", "precipitation"),
+                ("soil_fertility", "soil_fertility"),
+                ("crustal_age_myr", "crustal_age"),
+                ("crustal_thickness_km", "crustal_thickness"),
+                ("thermal_gradient", "thermal_gradient"),
+                ("porosity", "porosity"),
+                ("sediment_thickness", "sediment_thickness"),
+                ("sea_level_offset", "sea_level_offset"),
+                ("bulk_density", "bulk_density"),
+                ("cementation", "cementation"),
+                ("organic_matter", "organic_matter"),
+                ("clay_content", "clay_content"),
+                ("sand_content", "sand_content"),
+                ("silt_content", "silt_content"),
+                ("soil_ph", "soil_ph"),
+                ("cation_exchange", "cation_exchange"),
+                ("soil_depth", "soil_depth"),
+                ("interception_coefficient", "interception_coefficient"),
+                ("runoff_ratio", "runoff_ratio"),
+                ("effective_precip", "effective_precip"),
+                ("canopy_density", "canopy_density"),
+                ("biomass_kgm2", "biomass_kgm2"),
+                ("hazard_level", "hazard_level"),
+                ("water_table_depth", "water_table_depth"),
+            ]:
+                val = getattr(c, attr, None)
+                if val is not None:
+                    field_dicts.setdefault(fname, {})[hid] = float(val)
+            # Discrete-only fields
+            for attr, dname in [
+                ("plate_id", "plate_id"),
+                ("geological_type", "geological_type"),
+                ("distance_to_boundary", "distance_to_boundary"),
+                ("precip_seasonality", "precip_seasonality"),
+            ]:
+                val = getattr(c, attr, None)
+                if val is not None:
+                    ws.get_discrete(dname)[hid] = float(val)
+            # String discrete fields
+            for attr, dname in [
+                ("boundary_type", "boundary_type"),
+                ("climate_class", "climate_class"),
+                ("bedrock_class", "bedrock_class"),
+                ("vegetation_cover", "vegetation_cover"),
+            ]:
+                val = getattr(c, attr, None)
+                if val is not None:
+                    ws.get_discrete(dname)[hid] = val
+        # Register continuous fields
+        for fname, data in field_dicts.items():
+            ws.set_field(fname, data)
+            ws.get_discrete(fname).update(data)
+        return ws
 
     # ── Ephemeral CellData (for legacy layer0 functions) ─────────
 

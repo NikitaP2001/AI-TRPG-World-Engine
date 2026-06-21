@@ -25,90 +25,6 @@ from .layer0.feature_store import Feature, FeatureStore
 # ======================================================================
 
 
-def _init_ws_from_cells(db, ws: WorldState) -> None:
-    """Initialize WorldState from legacy cells table (first run)."""
-    import h3 as _h3
-    rows = db.load_cells()
-    if not rows:
-        return
-
-    # Build field data dicts
-    # Map: (column_name_in_cells_table, field_name_in_world_state)
-    _CONTINUOUS_COLUMNS = [
-        ("elevation", "elevation"),
-        ("temperature_norm", "temperature"),
-        ("precipitation_norm", "precipitation"),
-        ("soil_fertility", "soil_fertility"),
-        ("crustal_age", "crustal_age"),
-        ("crustal_thickness", "crustal_thickness"),
-        ("thermal_gradient", "thermal_gradient"),
-        ("porosity", "porosity"),
-        ("sediment_thickness", "sediment_thickness"),
-        ("sea_level_offset", "sea_level_offset"),
-        ("bulk_density", "bulk_density"),
-        ("cementation", "cementation"),
-        # Soil texture & chemistry
-        ("organic_matter", "organic_matter"),
-        ("clay_content", "clay_content"),
-        ("sand_content", "sand_content"),
-        ("silt_content", "silt_content"),
-        ("soil_ph", "soil_ph"),
-        ("cation_exchange", "cation_exchange"),
-        ("soil_depth", "soil_depth"),
-        ("interception_coefficient", "interception_coefficient"),
-        # Hydrology
-        ("runoff_ratio", "runoff_ratio"),
-        ("effective_precip", "effective_precip"),
-    ]
-    field_dicts: dict = {}
-    for r in rows:
-        hid = r["h3_id"]
-        for col, fname in _CONTINUOUS_COLUMNS:
-            val = r.get(col)
-            if val is not None:
-                field_dicts.setdefault(fname, {})[hid] = float(val)
-        # Discrete fields
-        _DISCRETE_COLUMNS = [
-            ("plate_id", "plate_id"),
-            ("geological_type", "geological_type"),
-            ("boundary_type", "boundary_type"),
-            ("canopy_density", "canopy_density"),
-            ("biomass_kgm2", "biomass_kgm2"),
-            ("hazard_level", "hazard_level"),
-            ("water_table_depth", "water_table_depth"),
-            ("distance_to_boundary", "distance_to_boundary"),
-            ("climate_class", "climate_class"),
-            ("bedrock_class", "bedrock_class"),
-            ("vegetation_cover", "vegetation_cover"),
-            # Also add soil/hydrology as discrete for fast lookup
-            ("organic_matter", "organic_matter"),
-            ("clay_content", "clay_content"),
-            ("sand_content", "sand_content"),
-            ("silt_content", "silt_content"),
-            ("soil_ph", "soil_ph"),
-            ("cation_exchange", "cation_exchange"),
-            ("soil_depth", "soil_depth"),
-            ("interception_coefficient", "interception_coefficient"),
-            ("runoff_ratio", "runoff_ratio"),
-            ("effective_precip", "effective_precip"),
-        ]
-        for col, fname in _DISCRETE_COLUMNS:
-            val = r.get(col)
-            if val is not None:
-                try:
-                    ws.get_discrete(fname)[hid] = float(val)
-                except (ValueError, TypeError):
-                    ws.get_discrete(fname)[hid] = val  # string
-
-    # Register continuous fields
-    for fname, data in field_dicts.items():
-        try:
-            ws.set_field(fname, data)
-            ws.get_discrete(fname).update(data)
-        except Exception:
-            pass
-
-
 def save_world_state(db, ws: WorldState) -> None:
     """Save all WorldState data to an open WorldDB connection."""
 
@@ -152,6 +68,36 @@ def save_world_state(db, ws: WorldState) -> None:
                 "INSERT OR REPLACE INTO field_data VALUES (?, ?, ?, ?)",
                 rows,
             )
+    # Save any additional fields (population_density[species_id], etc.)
+    _saved_above = {
+        "elevation", "temperature", "precipitation",
+        "soil_fertility", "soil_depth",
+        "water_table_depth", "canopy_density", "biomass_kgm2",
+        "crustal_age", "crustal_thickness", "thermal_gradient",
+        "sediment_thickness", "porosity", "bulk_density", "cementation",
+        "sea_level_offset", "hazard_level", "organic_matter",
+        "soil_ph", "cation_exchange",
+        "clay_content", "sand_content", "silt_content",
+        "interception_coefficient", "precip_seasonality",
+    }
+    for fname in list(ws._fields._base_fields.keys()):
+        if fname in _saved_above:
+            continue  # already saved above
+        dmap = ws.get_discrete(fname)
+        if not dmap:
+            continue
+        import h3 as _h3
+        rows = []
+        for hid, val in dmap.items():
+            if val is None:
+                continue
+            latlng = _h3.cell_to_latlng(hid)
+            rows.append((fname, latlng[0], latlng[1], float(val)))
+        if rows:
+            cur.executemany(
+                "INSERT OR REPLACE INTO field_data VALUES (?, ?, ?, ?)",
+                rows,
+            )
 
     # ── 1b. Save discrete-only fields (integers, strings) ────────
     cur.execute("""
@@ -165,7 +111,7 @@ def save_world_state(db, ws: WorldState) -> None:
     cur.execute("DELETE FROM cell_discrete")
     # Numeric discrete fields
     _NUMERIC_DISCRETE = (
-        "geological_type", "plate_id", "boundary_type",
+        "geological_type", "plate_id",
         "hazard_level", "distance_to_boundary",
         "runoff_ratio", "effective_precip",
         "clay_content", "sand_content", "silt_content",
@@ -268,13 +214,6 @@ def load_world_state(db) -> WorldState:
         cf = ContinuousField(tree, np.array(values, dtype=np.float64))
         ws._fields.register_base(fname, cf)
 
-    # ── Fallback: if no field_data, init from cells table ────────
-    if not field_names:
-        try:
-            _init_ws_from_cells(db, ws)
-        except Exception:
-            pass
-
     # ── 1b. Populate discrete fields from field_data ────────────
     for fname in field_names:
         cur.execute(
@@ -351,6 +290,7 @@ def save_generated_world(
     feature_store,
     params_dict: dict,
     time: Optional[dict] = None,
+    fauna_fields: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> None:
     """Save generator output as WorldState (field_data + features + params).
 
@@ -410,31 +350,14 @@ def save_generated_world(
         except Exception:
             pass
 
-    # ── Save initial fauna populations ────────────────────────────
-    fauna_rows = []
-    current_tick = (ws.time or {}).get("tick", 0)
-    for c in cells:
-        fauna_list = getattr(c, "fauna", None)
-        if not fauna_list:
-            continue
-        latlng = None
-        for sp_id, density in fauna_list:
-            if density <= 0:
-                continue
-            if latlng is None:
-                import h3 as _h3_fauna
-                latlng = _h3_fauna.cell_to_latlng(c.h3_id)
-            fauna_rows.append({
-                "h3_id": c.h3_id,
-                "species_id": sp_id,
-                "density": density,
-                "lat": float(latlng[0]),
-                "lon": float(latlng[1]),
-                "updated_at_tick": current_tick,
-            })
-    if fauna_rows:
-        db.save_fauna_populations(fauna_rows)
-        print(f"  [Fauna] saved {len(fauna_rows)} population records")
+    # ── Register fauna as continuous fields ───────────────────────
+    if fauna_fields:
+        n_records = 0
+        for sp_id, data in fauna_fields.items():
+            if data:
+                ws.set_field(f"population_density[{sp_id}]", data)
+                n_records += len(data)
+        print(f"  [Fauna] registered {len(fauna_fields)} species as continuous fields ({n_records} sample points)")
 
     # Save to DB
     save_world_state(db, ws)

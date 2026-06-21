@@ -1,11 +1,13 @@
-"""Layer 0 — Long-cycle tick updates for planetary processes (continuous).
+"""Layer 0 — Long-cycle tick updates for planetary processes.
 
-Runs at configurable intervals to simulate slow planetary changes using
-WorldState continuous fields instead of CellData lists.
+Runs at a configurable interval (typically much slower than entity ticks)
+to simulate slow planetary changes:
 
-  1. Climate drift       — temperature / precipitation noise field
-  2. Resource evolution  — Gray-Scott flux drift (via fields)
+  1. Climate drift       — temperature / precipitation random walk
+  2. Resource evolution  — continued Gray-Scott integration
   3. Geological events   — stress accumulation → terrain events
+
+Design doc § Long-Cycle Tick Updates.
 """
 
 from __future__ import annotations
@@ -13,10 +15,11 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from .cell_model import CellData, GenerationParams
 from .resources import ResourceType
 
 
@@ -42,44 +45,41 @@ class GeologicalEvent:
 # ======================================================================
 
 
-def _drift_climate_continuous(
-    h3_ids: List[str],
-    temp_map: Dict[str, float],
-    precip_map: Dict[str, float],
-    temp_range_map: Dict[str, float],
-    climate_class_map: Dict[str, str],
+def _drift_climate(
+    cells: List[CellData],
     drift_rate: float,
     rng: random.Random,
 ) -> int:
-    """Apply random walk to temperature/precipitation continuous fields.
+    """Apply slow random walk to temperature and precipitation.
 
-    Operates on dicts (h3_id → value), NOT CellData.
-    Updates temp_map, precip_map, climate_class_map in-place.
+    Args:
+        cells: Current cell list (modified in-place).
+        drift_rate: Max change per tick (e.g. 0.01 = 1% drift).
+        rng: Seeded RNG.
 
     Returns:
         Number of cells whose Köppen class changed.
     """
-    from .climate import koppen_classify as _koppen_class
     class_changes = 0
 
-    for hid in h3_ids:
+    for cell in cells:
+        # Small random walk
         dt = rng.gauss(0.0, drift_rate)
         dp = rng.gauss(0.0, drift_rate)
 
-        old_temp = temp_map.get(hid, 0.5)
-        old_precip = precip_map.get(hid, 0.5)
-        temp_range = temp_range_map.get(hid, 0.2)
+        new_temp = max(0.0, min(1.0, cell.temperature + dt))
+        new_precip = max(0.0, min(1.0, cell.precipitation + dp))
 
-        new_temp = max(0.0, min(1.0, old_temp + dt))
-        new_precip = max(0.0, min(1.0, old_precip + dp))
+        cell.temperature = new_temp
+        cell.precipitation = new_precip
 
-        temp_map[hid] = new_temp
-        precip_map[hid] = new_precip
-
+        # Recompute Köppen class if temperature moved significantly
         if abs(dt) > drift_rate * 0.5 or abs(dp) > drift_rate * 0.5:
-            new_class = _koppen_class(new_temp, new_precip, temp_range)
-            if new_class != climate_class_map.get(hid, ""):
-                climate_class_map[hid] = new_class
+            # Import locally to avoid circular dependency at module level
+            from .climate import koppen_classify as _koppen_class
+            new_class = _koppen_class(new_temp, new_precip, cell.temp_seasonal_range)
+            if new_class != cell.climate_class:
+                cell.climate_class = new_class
                 class_changes += 1
 
     return class_changes
@@ -90,38 +90,39 @@ def _drift_climate_continuous(
 # ======================================================================
 
 
-def _evolve_resources_continuous(
-    flux_map: Dict[str, List[float]],
+def _evolve_resources(
+    cells: List[CellData],
     resource_types: List[ResourceType],
-    h3_ids: List[str],
     steps: int,
     rng: random.Random,
 ) -> None:
-    """Drift resource fluxes via continuous field (dict-based).
+    """Run additional Gray-Scott steps on existing resource fields.
 
-    Args:
-        flux_map: h3_id → [flux_r1, flux_r2, ...]
-        resource_types: Resource type definitions.
-        h3_ids: All cell IDs.
-        steps: Number of perturbation steps.
-        rng: Seeded RNG.
+    Requires that special_resource_flux[] was populated during generation.
+    This is a simplified single-step approximation — for proper long-term
+    evolution the full RD would need to be re-run.
     """
-    if not h3_ids or not resource_types or not flux_map:
+    if not cells or not resource_types:
         return
 
     n_resources = len(resource_types)
-    sample = next(iter(flux_map.values()))
-    if len(sample) < n_resources:
+    if not cells[0].special_resource_flux:
         return
 
+    # For each resource type, do approximate decay/regeneration
     for ri, rtype in enumerate(resource_types):
         for _ in range(steps):
-            for hid in h3_ids:
-                fluxes = flux_map.get(hid)
-                if fluxes is None or ri >= len(fluxes):
+            # Simplified: each cell's flux drifts slightly toward a
+            # local equilibrium determined by neighbours and tectonic stress
+            for cell in cells:
+                if ri >= len(cell.special_resource_flux):
                     continue
+                # Mean neighbour flux
+                flux = cell.special_resource_flux[ri]
+                # Small perturbation
                 perturb = rng.gauss(0.0, 0.01 * rtype.feed_rate)
-                fluxes[ri] = max(0.0, min(1.0, fluxes[ri] + perturb))
+                new_flux = max(0.0, min(1.0, flux + perturb))
+                cell.special_resource_flux[ri] = new_flux
 
 
 # ======================================================================
@@ -129,59 +130,55 @@ def _evolve_resources_continuous(
 # ======================================================================
 
 
-def _check_geological_events_continuous(
-    h3_ids: List[str],
-    geo_type_map: Dict[str, int],
-    stress_map: Dict[str, float],
-    elevation_map: Dict[str, float],
-    hazard_map: Dict[str, float],
+def _check_geological_events(
+    cells: List[CellData],
     stress_accumulation_rate: float,
     event_threshold: float,
     rng: random.Random,
 ) -> List[GeologicalEvent]:
-    """Accumulate stress and fire events via continuous dicts.
+    """Accumulate tectonic stress and fire events when threshold exceeded.
 
     Args:
-        h3_ids: All cell IDs.
-        geo_type_map: h3_id → geological_type (0=ocean).
-        stress_map: h3_id → current stress (mutated in-place).
-        elevation_map: h3_id → elevation (mutated on event).
-        hazard_map: h3_id → hazard_level (mutated on event).
-        stress_accumulation_rate: Stress added per tick.
-        event_threshold: Stress level that triggers event.
+        cells: Current cell list (modified in-place for stress).
+        stress_accumulation_rate: How much stress increases per tick.
+        event_threshold: Stress level that triggers an event.
+        rng: Seeded RNG.
 
     Returns:
-        List of GeologicalEvent objects fired this tick.
+        List of GeologicalEvent objects that fired this tick.
     """
     events: List[GeologicalEvent] = []
 
-    for hid in h3_ids:
-        if geo_type_map.get(hid, 2) == 0:
+    for cell in cells:
+        if cell.geological_type == 0:  # ocean
             continue
 
-        old_stress = stress_map.get(hid, 0.0)
-        new_stress = old_stress + rng.random() * stress_accumulation_rate
-        stress_map[hid] = new_stress
+        # Accumulate stress
+        cell.tectonic_stress += rng.random() * stress_accumulation_rate
 
-        if new_stress >= event_threshold:
-            mag = min(1.0, new_stress / (event_threshold * 2.0))
+        if cell.tectonic_stress >= event_threshold:
+            # Fire event
+            mag = min(1.0, cell.tectonic_stress / (event_threshold * 2.0))
             el_delta = rng.gauss(0.0, mag * 0.05)
 
             event_types = ["earthquake", "volcanic_eruption", "landslide", "rift"]
             etype = rng.choice(event_types)
 
-            stress_map[hid] = 0.0
-            elevation_map[hid] = max(0.0, min(1.0, elevation_map.get(hid, 0.5) + el_delta))
-            hazard_map[hid] = min(1.0, hazard_map.get(hid, 0.0) + mag * 0.3)
+            # Reset stress after event
+            cell.tectonic_stress = 0.0
+
+            # Modify elevation
+            cell.elevation_mean = max(0.0, min(1.0, cell.elevation_mean + el_delta))
+            cell.hazard_level = min(1.0, cell.hazard_level + mag * 0.3)
 
             events.append(GeologicalEvent(
                 type=etype,
-                h3_id=hid,
-                affected_cells=[hid],
+                h3_id=cell.h3_id,
+                affected_cells=[cell.h3_id],
                 magnitude=mag,
                 elevation_delta=el_delta,
                 hazard_spike=mag * 0.3,
-                description=f"{etype} (mag={mag:.2f}) at {hid[:8]}...",
+                description=f"{etype} (mag={mag:.2f}) at cell {cell.h3_id[:8]}...",
             ))
 
     return events

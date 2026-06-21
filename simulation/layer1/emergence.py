@@ -28,6 +28,9 @@ _MIN_CONTIGUOUS_CELLS = 10
 # Cooldown ticks before same (species_id, region) can re-emerge
 _EMERGENCE_COOLDOWN_TICKS = 1000
 
+# Track last emergence tick per species to enforce cooldown
+_last_emergence_tick: Dict[str, int] = {}
+
 
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Great-circle distance in km."""
@@ -131,6 +134,12 @@ def check_fauna_emergence(
         if not sp.social_complexity_template:
             continue
 
+        # Enforce cooldown: don't re-emerge same species too often
+        global _last_emergence_tick
+        _last = _last_emergence_tick.get(species_id, 0)
+        if current_tick - _last < _EMERGENCE_COOLDOWN_TICKS:
+            continue
+
         total_pop = sum(r.get("density", 0.0) for r in region)
         if total_pop < sp.emergence_population_threshold:
             continue
@@ -153,5 +162,7 @@ def check_fauna_emergence(
             "event_type": "proto_faction_emergence",
             "tick": current_tick,
         })
+        # Update cooldown: don't re-emerge same species until cooldown elapses
+        _last_emergence_tick[species_id] = current_tick
 
     return events

@@ -98,6 +98,32 @@ class SimEngine:
         # Phase 3: Clear temporary effects (persistent survive for next tick)
         self._fields.clear_all_effects()
 
+        # Phase 3b: Bake persistent effects into _base so they survive next
+        # tick's clear_persistent().  For "replace" fields (PFT, canopy),
+        # rebuild _base from persistent points.  For "accumulate" fields
+        # (water, soil), this is handled by the caller (_run_l1_step).
+        import math as _m
+        for _name, _mf in self._fields._mutable_fields.items():
+            if not _mf._persistent:
+                continue
+            if _name.startswith("pft_biomass[") or _name in ("canopy_density",):
+                # Replace _base with persistent snapshot (Vegetation writes
+                # the complete new state each tick, not a delta).
+                _pts = []
+                _vals = []
+                for _lat, _lon, _rad, _str in _mf._persistent:
+                    _lr = _m.radians(_lat)
+                    _lor = _m.radians(_lon)
+                    _pts.append([_m.cos(_lr)*_m.cos(_lor), _m.sin(_lr), _m.cos(_lr)*_m.sin(_lor)])
+                    _vals.append(_str)
+                if _vals:
+                    import numpy as _np
+                    from scipy.spatial import cKDTree as _cKD
+                    from ..layer0.contouring import ContinuousField as _CF
+                    _mf._base = _CF(_cKD(_np.array(_pts, dtype=_np.float64)),
+                                    _np.array(_vals, dtype=_np.float64))
+                _mf._persistent.clear()
+
         # Phase 4: Remove dissolved features
         for fid, feature in list(self._features.items()):
             if feature.should_dissolve(self._fields):

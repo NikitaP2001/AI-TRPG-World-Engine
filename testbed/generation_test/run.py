@@ -7,6 +7,7 @@ generation and go straight to verification, unless --force is given.
 Usage:
     cd b:\src\llm_world
     .venv\Scripts\python testbed\generation_test\run.py
+    .venv\Scripts\python testbed\generation_test\run.py --extent 0.3
     .venv\Scripts\python testbed\generation_test\run.py --force   # regenerate
     .venv\Scripts\python testbed\generation_test\run.py --view    # 3D viewer after pass
 """
@@ -166,7 +167,7 @@ def verify_features(v: Verifier, wmc, config: dict):
 # Phase 3 — Generate or reuse world
 # ======================================================================
 
-def generate_or_reuse(v: Verifier, config: dict, force: bool):
+def generate_or_reuse(v: Verifier, config: dict, extent: float, force: bool):
     """Generate world into local DB, or reuse existing one."""
     print("\n[Phase 3] World generation...")
 
@@ -196,15 +197,18 @@ def generate_or_reuse(v: Verifier, config: dict, force: bool):
         planet_radius=6371.0, axial_tilt=23.5,
         tectonic_activity=0.5, seed=seed,
     )
+    params.world_extent = extent
     params.derive()
-    print(f"  H3 res={params.h3_resolution}")
+    print(f"  H3 res={params.h3_resolution}, extent={extent}")
 
-    # All H3 IDs (full planet, world_extent removed)
+    # All H3 IDs
     _rng = _random.Random(seed)
     all_ids = []
     for r in list(h3.get_res0_cells()):
         all_ids.extend(h3.cell_to_children(r, params.h3_resolution))
     _rng.shuffle(all_ids)
+    if extent < 1.0:
+        all_ids = all_ids[:int(len(all_ids) * extent)]
     print(f"  Cells: {len(all_ids)}")
 
     # Load + resolve constraints from local wm_state
@@ -225,7 +229,7 @@ def generate_or_reuse(v: Verifier, config: dict, force: bool):
     # Generate
     t0 = time.time()
     try:
-        cells, fs, fa = generate_world(params=params, wm_constraints=wm_c)
+        cells, fs, fa, fauna_fields = generate_world(params=params, wm_constraints=wm_c)
     except Exception as e:
         import traceback
         v.warnings.append(f"Generation error: {e}")
@@ -237,14 +241,28 @@ def generate_or_reuse(v: Verifier, config: dict, force: bool):
 
     v.check(f"generated {len(cells)} cells", len(cells) > 0, f"{elapsed:.1f}s")
 
-    # Save to local DB
+    # Save to local DB via WorldState
     from simulation.world_db import WorldDB
+    from simulation.world_state import WorldState
+    from simulation.world_state_db import save_world_state
+    import h3 as _h3
     db = WorldDB(str(TEST_DB))
-    db.save_cells(cells)
-    db.save_features(fs)
-    db.set_params(**{k: str(v) for k, v in params.__dict__.items()
-                     if not k.startswith("_")})
-    db.init_time(year=1492)
+    ws = WorldState.from_cell_data(cells, params.__dict__)
+    ws.features = fs
+    ws._time = {"tick": 0, "year": 1492, "day_of_year": 0.0, "hour": 0.0}
+    save_world_state(db, ws)
+    # Save fauna populations (WorldState doesn't handle this yet)
+    fauna_rows = []
+    for species_id, cell_densities in fauna_fields.items():
+        for hid, density in cell_densities.items():
+            if density > 0:
+                ll = _h3.cell_to_latlng(hid)
+                fauna_rows.append({"h3_id": hid, "species_id": species_id,
+                                    "density": density, "lat": ll[0], "lon": ll[1],
+                                    "updated_at_tick": 0})
+    if fauna_rows:
+        db.save_fauna_populations(fauna_rows)
+        v.check(f"fauna saved", True, f"{len(fauna_rows)} population records")
     db.close()
 
     size_kb = TEST_DB.stat().st_size // 1024
@@ -272,20 +290,27 @@ def verify_generated(v: Verifier):
         return
 
     from simulation.world_db import WorldDB
+    from simulation.world_state_db import load_world_state
     db = WorldDB(str(TEST_DB))
+    ws = load_world_state(db)
 
-    cells = db.load_cells()
-    v.check_gt("cells count", len(cells), 0)
-    if cells:
-        land = sum(1 for c in cells if not c.get("is_ocean", 1))
-        v.check_gt("land cells", land, 0, f"{land}/{len(cells)}")
+    h3_ids = list(ws.get_discrete("elevation").keys()) if ws.get_discrete("elevation") else []
+    v.check_gt("cells count", len(h3_ids), 0)
+    if h3_ids:
+        elev_map = ws.get_discrete("elevation")
+        land = sum(1 for hid in h3_ids if elev_map.get(hid, 0) > 0)
+        v.check_gt("land cells", land, 0, f"{land}/{len(h3_ids)}")
 
-        temps = [c.get("temperature_norm", 0) for c in cells]
-        mean_t = sum(temps) / len(temps)
-        v.check("temperature populated", mean_t > 0.01, f"mean={mean_t:.3f}")
+        temp_map = ws.get_discrete("temperature")
+        if temp_map:
+            temps = [v for v in temp_map.values() if v is not None]
+            mean_t = sum(temps) / len(temps) if temps else 0
+            v.check("temperature populated", mean_t > 0.01, f"mean={mean_t:.3f}")
 
-        canopy = sum(1 for c in cells if c.get("canopy_density", 0) > 0.01)
-        v.check_gt("vegetation", canopy, 0, f"{canopy} cells")
+        canopy_map = ws.get_discrete("canopy_density")
+        if canopy_map:
+            canopy = sum(1 for v in canopy_map.values() if v and v > 0.01)
+            v.check_gt("vegetation", canopy, 0, f"{canopy} cells")
 
     fs = db.get_feature_store()
     if fs and fs.all_active:
@@ -311,9 +336,12 @@ def launch_viewer():
     if not parquet_path.exists():
         try:
             from simulation.world_db import WorldDB
+            from simulation.world_state_db import load_world_state
             from simulation.layer0.generator import save_cells_parquet
             db = WorldDB(str(TEST_DB))
-            cells = db.load_cells_as_celldata()
+            ws = load_world_state(db)
+            h3_ids = list(ws.get_discrete("elevation").keys())
+            cells = ws.to_celldata(h3_ids)
             db.close()
             save_cells_parquet(cells, parquet_path)
             print(f"  Exported parquet: {parquet_path}")
@@ -340,6 +368,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="World generation test with DB caching",
     )
+    parser.add_argument("--extent", type=float, default=None,
+                        help="Override world_extent (default from config.json)")
     parser.add_argument("--force", action="store_true",
                         help="Force regeneration even if DB exists")
     parser.add_argument("--view", action="store_true",
@@ -347,6 +377,7 @@ def main():
     args = parser.parse_args()
 
     config = load_config()
+    extent = args.extent if args.extent is not None else config.get("world_extent", 0.3)
 
     v = Verifier(config["name"])
 
@@ -360,7 +391,7 @@ def main():
     verify_features(v, wmc, config)
 
     # ── Phase 3 ──
-    generate_or_reuse(v, config, args.force)
+    generate_or_reuse(v, config, extent, args.force)
 
     # ── Phase 4 ──
     verify_generated(v)

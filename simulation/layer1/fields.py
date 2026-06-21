@@ -168,6 +168,20 @@ class MutableField:
                 val += strength * w
 
         # Persistent effects: KDTree if large, linear scan otherwise
+        val += self._eval_persistent(lat, lon)
+
+        return val
+
+    def persistent_only(self, lat: float, lon: float) -> float:
+        """Evaluate only persistent effects (skip base and temporary)."""
+        return self._eval_persistent(lat, lon)
+
+    def _eval_persistent(self, lat: float, lon: float) -> float:
+        """Evaluate persistent effects at (lat, lon)."""
+        val = 0.0
+        if not self._persistent:
+            return val
+
         if len(self._persistent) >= 200 and self._ptree is None:
             self._rebuild_tree()
 
@@ -177,7 +191,6 @@ class MutableField:
             qx = math.cos(lat_r) * math.cos(lon_r)
             qy = math.sin(lat_r)
             qz = math.cos(lat_r) * math.sin(lon_r)
-            # Search radius in 3D: 2 deg ~ 0.035 chord, use 0.06 for safety
             idxs = self._ptree.query_ball_point([qx, qy, qz], r=0.06)
             for i in idxs:
                 elat, elon, radius, strength = self._ptree_data[i]
