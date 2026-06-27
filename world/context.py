@@ -815,3 +815,46 @@ def build_character_info_block(char_dir: Path) -> Optional[str]:
             pass
 
     return "\n\n".join(parts) if parts else None
+
+
+def build_character_info_block_from_entity(entity_id: str) -> Optional[str]:
+    """Build a [character_info] block from entity_store (CompositeBackend).
+
+    Alternative to build_character_info_block for when character data
+    is stored as an entity rather than filesystem files.
+    Uses the same output format for compatibility with PinnedBlockCache.
+    """
+    try:
+        from world_manager.entity_core import _get_backend
+        backend = _get_backend()
+        entity = backend.get(entity_id)
+        if entity is None:
+            return None
+
+        import json as _json
+        parts: List[str] = []
+
+        # facts → Description
+        facts = entity.get("facts", "")
+        if facts:
+            parts.append("## Description\n" + _json.dumps(
+                {"general": facts}, ensure_ascii=False, indent=2))
+
+        # state → State
+        state = entity.get("state", {})
+        if state:
+            parts.append("### State\n" + _json.dumps(state, ensure_ascii=False, indent=2))
+
+        # skills → Skills
+        skills = entity.get("skills", {})
+        if skills:
+            parts.append("### Skills\n" + _json.dumps(skills, ensure_ascii=False, indent=2))
+
+        # equipment → Equipment
+        equip = entity.get("equipment", {})
+        if equip:
+            parts.append("### Equipment\n" + _json.dumps(equip, ensure_ascii=False, indent=2))
+
+        return "\n\n".join(parts) if parts else None
+    except Exception:
+        return None

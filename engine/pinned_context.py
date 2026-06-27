@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 from langchain_core.messages import SystemMessage
 
 from world.story import PinnedBlockCache, build_arc_summaries_block, build_paragraph_summaries_block, build_gm_summaries_block
-from world.context import is_character_active_in_scene, build_character_info_block
+from world.context import is_character_active_in_scene, build_character_info_block, build_character_info_block_from_entity
 
 
 class PinnedContext:
@@ -106,8 +106,38 @@ class PinnedContext:
                 return filtered
         return history_msgs
 
+    def add_sm_summaries(self, history_msgs: Optional[List] = None) -> "PinnedContext":
+        """[sm_summaries] — SM-only, cached. Same pattern as gm_summaries."""
+        block = self._cache.get("sm", self._history_path, build_gm_summaries_block)
+        if block:
+            self._persistent.append(
+                SystemMessage(content=f"[sm_summaries]\n{block}")
+            )
+            if history_msgs is not None:
+                filtered: List = []
+                for m in history_msgs:
+                    content = str(getattr(m, "content", "") or "")
+                    if content.startswith("[sm_summary:"):
+                        continue
+                    filtered.append(m)
+                return filtered
+        return history_msgs
+
+    def add_wm_summaries(self) -> "PinnedContext":
+        """[wm_summaries] — WM-only, cached. Same pattern as gm_summaries."""
+        block = self._cache.get("wm", self._history_path, build_gm_summaries_block)
+        if block:
+            self._persistent.append(
+                SystemMessage(content=f"[wm_summaries]\n{block}")
+            )
+        return self
+
     def add_active_characters(self) -> "PinnedContext":
-        """[character:{name}] — all scene participants, cached per character."""
+        """[character:{name}] — all scene participants, cached per character.
+
+        Reads from entity_store (CompositeBackend) first, falls back to
+        character filesystem files for backward compatibility.
+        """
         try:
             scene = self._world.get_scene()
             if isinstance(scene, dict) and scene.get("state") == "active":
@@ -116,10 +146,12 @@ class PinnedContext:
                     for cname in chars:
                         if not is_character_active_in_scene(self._world, cname):
                             continue
-                        char_dir = self._world._character_dir(cname)
-                        block = self._cache.get(
-                            f"char_{cname}", char_dir, build_character_info_block
-                        )
+                        # Try entity_store first
+                        block = build_character_info_block_from_entity(cname)
+                        if block is None:
+                            # Fallback: filesystem
+                            char_dir = self._world._character_dir(cname)
+                            block = build_character_info_block(char_dir)
                         if block:
                             self._persistent.append(
                                 SystemMessage(content=f"[character:{cname}]\n{block}")

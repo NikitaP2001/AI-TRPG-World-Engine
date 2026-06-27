@@ -1,0 +1,122 @@
+"""Abstract base class for entity backends.
+
+Defines the contract that every storage backend must implement.
+Two implementations: JsonFileBackend (entity_store) and CharacterFileBackend (character files).
+"""
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from typing import Any, Dict, List, Optional
+
+
+class EntityBackend(ABC):
+    """Abstract CRUD interface for entities.
+    
+    Two implementations:
+      - JsonFileBackend: reads/writes game/entity_store/entities.json
+      - CharacterFileBackend: reads/writes game/characters/{name}/*.json
+    """
+
+    @abstractmethod
+    def set(self, id: str, type: str = "", base_type: str = "",
+            facts: str = "", gurps: Optional[Dict[str, Any]] = None,
+            state: Optional[Dict[str, Any]] = None,
+            skills: Optional[Dict[str, Any]] = None,
+            equipment: Optional[Dict[str, Any]] = None,
+            stats: Optional[Dict[str, Any]] = None,
+            tags: Optional[List[str]] = None,
+            position: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Create or fully overwrite an entity. Returns result dict."""
+        ...
+
+    @abstractmethod
+    def get(self, id: str) -> Optional[Dict[str, Any]]:
+        """Read entity by id. Returns full record or None."""
+        ...
+
+    @abstractmethod
+    def get_facts(self, id: str) -> Optional[str]:
+        """Read only the facts field."""
+        ...
+
+    @abstractmethod
+    def set_facts(self, id: str, facts: str) -> Dict[str, Any]:
+        """Update only the facts field."""
+        ...
+
+    @abstractmethod
+    def get_state(self, id: str) -> Optional[Dict[str, Any]]:
+        """Read mechanical state: gurps, state, skills, equipment, stats, effects."""
+        ...
+
+    @abstractmethod
+    def query(self, type_filter: str = "", base_type: str = "",
+              tags: Optional[List[str]] = None,
+              position: Optional[Dict[str, Any]] = None,
+              radius: float = -1.0,
+              facts_search: str = "",
+              include_templates: bool = False,
+              limit: int = 50) -> List[Dict[str, Any]]:
+        """Search entities by type, tags, position, text."""
+        ...
+
+    @abstractmethod
+    def delete(self, id: str, reason: str = "") -> Dict[str, Any]:
+        """Soft-delete an entity."""
+        ...
+
+    @abstractmethod
+    def adjust(self, entity_id: str, *,
+               hp: Optional[int] = None,
+               fp: Optional[int] = None,
+               er: Optional[int] = None,
+               add_condition: str = "",
+               remove_condition: str = "",
+               add_injury: str = "",
+               remove_injury: str = "",
+               add_item: str = "",
+               remove_item: str = "",
+               currency_delta: Optional[Dict[str, int]] = None,
+               add_ability: str = "",
+               remove_ability: str = "",
+               add_skill: str = "",
+               remove_skill: str = "",
+               current_state: str = "") -> Dict[str, Any]:
+        """Targeted runtime mutations — only provided fields change."""
+        ...
+
+    @abstractmethod
+    def add_tags(self, entity_id: str, tags: List[str]) -> Dict[str, Any]:
+        ...
+
+    @abstractmethod
+    def remove_tags(self, entity_id: str, tags: List[str]) -> Dict[str, Any]:
+        ...
+
+    @abstractmethod
+    def set_effect(self, entity_id: str, effect_id: str = "",
+                   stat_deltas: Optional[Dict[str, Any]] = None,
+                   per_tick: bool = True,
+                   duration_ticks: int = -1,
+                   description: str = "",
+                   aura_radius: float = -1.0) -> Dict[str, Any]:
+        ...
+
+    @abstractmethod
+    def remove_effect(self, entity_id: str, effect_id: str) -> Dict[str, Any]:
+        ...
+
+    @abstractmethod
+    def attach_script(self, entity_id: str, script_id: str = "",
+                      trigger_type: str = "",
+                      trigger_params: Optional[Dict[str, Any]] = None,
+                      script: str = "", comment: str = "") -> Dict[str, Any]:
+        ...
+
+    @abstractmethod
+    def detach_script(self, entity_id: str, script_id: str) -> Dict[str, Any]:
+        ...
+
+    def validate_facts(self, facts: str, entity_id: str = "") -> List[str]:
+        """Check facts for mechanical data. Override in subclass."""
+        return []

@@ -24,10 +24,16 @@ from openrouter_langchain_logging import logs_enabled
 from openrouter_llm import build_openrouter_chat_llm, openrouter_logging_callbacks, read_prompt_text
 from world import World, WorldDuration, WorldTime, build_game_master_context_block
 from scene_manager.tools import (
-    answer_character, call_gm as sm_call_gm_tool,
-    turn_narration, correct_character_intents, run_scene,
-    add_character_to_scene, remove_character_from_scene,
-    add_npc_to_scene, remove_npc_from_scene,
+    get_entity_facts,
+    query_events as sm_query_events,
+    record_event as sm_record_event,
+    invoke_self as sm_invoke_self,
+    get_scene as sm_get_scene,
+    get_entity_state,
+    update_entity_stat,
+    adjust_entity as sm_adjust_entity,
+    apply_effect,
+    escalate_to_gm as sm_escalate_to_gm,
 )
 from engine.history_meta import HistoryMeta
 
@@ -230,13 +236,17 @@ class SceneManager:
         """Answer a character's question, optionally escalating to GM.
 
         Gives the SM LLM a targeted choice:
-          - ``answer_character`` — if it knows the answer from world data
-          - ``call_gm`` — if it needs to escalate
+          - ``get_entity_facts`` + ``invoke_self`` — if it knows the answer
+          - ``escalate_to_gm`` — if it needs to escalate
 
         Returns the answer text.
         """
         from openrouter_llm import build_openrouter_chat_llm, openrouter_logging_callbacks
-        from scene_manager.tools import answer_character, call_gm as sm_call_gm_tool
+        from scene_manager.tools import (
+            get_entity_facts as _get_facts,
+            invoke_self as _sm_invoke,
+            escalate_to_gm as _esc_gm,
+        )
 
         llm = build_openrouter_chat_llm(
             temperature=0.5,
@@ -246,17 +256,10 @@ class SceneManager:
             parallel_tool_calls=False,
         )
 
-        from scene_manager.tools import (
-            get_location, get_npc, get_character_detail, read_character_diary,
-        )
-
         tools = [
-            answer_character,
-            sm_call_gm_tool,
-            get_location,
-            get_npc,
-            get_character_detail,
-            read_character_diary,
+            _get_facts,
+            _sm_invoke,
+            _esc_gm,
         ]
 
         callbacks = openrouter_logging_callbacks(scope="scene_manager", label="resolve_character_question")
@@ -272,11 +275,12 @@ class SceneManager:
         task_msg = (
             f"A character named \"{character_name}\" asks:\n"
             f"{questions}\n\n"
-            "You have access to world data tools (get_location, get_npc, "
-            "get_character_detail, read_character_diary).\n"
+            "You have access to world data (get_entity_facts) and can "
+            "escalate to the Game Master (escalate_to_gm).\n"
             "Choose ONE:\n"
-            "  - answer_character — if you can answer from world data\n"
-            "  - call_gm — if you don't know and the GM needs to answer\n"
+            "  - get_entity_facts — to look up entity facts yourself\n"
+            "  - escalate_to_gm — if you don't know and the GM needs to answer\n"
+            "  - invoke_self — if you already know the answer (pass it as comment)\n"
             "Do not call the GM for questions you can answer yourself."
         )
 
@@ -299,11 +303,13 @@ class SceneManager:
             if not isinstance(args, dict):
                 continue
 
-            if name == "answer_character":
-                return str(args.get("content") or "I don't have an answer.").strip()
-            elif name == "call_gm":
-                # Escalate to the real GM
-                notice = str(args.get("notice") or questions).strip()
+            if name in ("invoke_self", "get_entity_facts"):
+                answer = str(args.get("comment") or
+                           args.get("id") or "I don't have an answer.").strip()
+                return f"[stub] {answer}" if name == "get_entity_facts" else answer
+            elif name == "escalate_to_gm":
+                notice = str(args.get("question") or questions).strip()
+                ctx = str(args.get("context") or "").strip()
                 result = self.call_gm(notice)
                 return str(result.get("exit_args") or result.get("thinking") or "No answer.").strip()
 
@@ -431,15 +437,16 @@ class SceneManager:
                 parallel_tool_calls=False,
             )
 
-        from scene_manager.tools import run_scene as sm_run_scene, call_gm as sm_call_gm_tool
+        from scene_manager.tools import get_scene as sm_get_scene, record_event as sm_rec_event, escalate_to_gm as sm_esc_gm
 
         callbacks = openrouter_logging_callbacks(scope="scene_manager", label="describe_scene", stream=True)
         human_msg = (
             f"Players moved to a new location: {location}.\n"
             f"Characters: {', '.join(character_names)}\n"
             f"NPCs present: {', '.join(npc_names or []) or 'none'}\n\n"
-            "Describe this scene using the run_scene tool. "
-            "If you need the Game Master's help for world details, use call_gm."
+            "Describe this scene. Use get_scene(location_id) to read location state, "
+            "record_event(tag='scene') to log it. "
+            "If you need the Game Master's help, use escalate_to_gm."
         )
 
         history_msgs: List[BaseMessage] = []
@@ -462,7 +469,7 @@ class SceneManager:
 
         try:
             bound_llm = llm.bind_tools(
-                [sm_run_scene, sm_call_gm_tool],
+                [sm_get_scene, sm_rec_event, sm_esc_gm],
             ).with_config({"callbacks": callbacks})
         except TypeError:
             bound_llm = llm.bind_tools([sm_run_scene, sm_call_gm_tool]).with_config({"callbacks": callbacks})
@@ -730,7 +737,7 @@ class SceneManager:
             )
 
         callbacks = openrouter_logging_callbacks(scope="scene_manager", label="turn_narration")
-        from scene_manager.tools import turn_narration, correct_character_intents, call_gm as sm_call_gm_tool
+        from scene_manager.tools import record_event as _sm_rec, invoke_self as _sm_inv, escalate_to_gm as _sm_esc
 
         human_msg = self._build_turn_narration_message(payload)
 
@@ -757,11 +764,11 @@ class SceneManager:
 
         try:
             bound_llm = llm.bind_tools(
-                [turn_narration, correct_character_intents, sm_call_gm_tool],
+                [_sm_rec, _sm_esc],
                 tool_choice="required",
             ).with_config({"callbacks": callbacks})
         except TypeError:
-            bound_llm = llm.bind_tools([turn_narration, correct_character_intents, sm_call_gm_tool]).with_config({"callbacks": callbacks})
+            bound_llm = llm.bind_tools([_sm_rec, _sm_esc]).with_config({"callbacks": callbacks})
 
         char_plans = payload.get("character_plans") if isinstance(payload.get("character_plans"), list) else []
         selected_characters = [str(p.get("name") or "").strip() for p in char_plans if str(p.get("name") or "").strip()]
@@ -793,7 +800,7 @@ class SceneManager:
                     print(f"[trace] SM run_turn_narration: no tool call, retrying ({_attempt + 1}/{max_retries})")
                 _append_tool_rejection(
                     messages, out,
-                    "ERROR: You MUST call turn_narration or correct_character_intents."
+                    "ERROR: You MUST call record_event or escalate_to_gm."
                 )
                 continue
 
@@ -808,29 +815,30 @@ class SceneManager:
             if not isinstance(args0, dict):
                 args0 = {}
 
-            if tool_name0 == "correct_character_intents":
-                correction_character = str(args0.get("character_name") or "").strip()
-                correction_notice = str(args0.get("turn_insight") or "").strip()
-                print(f"[debug] SM correction: character={correction_character!r} turn_insight={correction_notice[:100]!r}")
-                if not correction_character or not correction_notice:
+            if tool_name0 == "escalate_to_gm":
+                question = str(args0.get("question") or "").strip()
+                context_str = str(args0.get("context") or "").strip()
+                if not question:
                     if logs_enabled():
-                        print(f"[trace] SM run_turn_narration: invalid correction args, retrying")
+                        print(f"[trace] SM run_turn_narration: empty escalate_to_gm question, retrying")
                     _append_tool_rejection(
                         messages, out,
-                        "ERROR: correct_character_intents requires non-empty character_name and turn_insight.",
+                        "ERROR: escalate_to_gm requires non-empty question.",
                     )
                     continue
                 return {
                     "type": "correction",
-                    "character_name": correction_character,
-                    "turn_insight": correction_notice,
+                    "character_name": question[:50],
+                    "turn_insight": question,
+                    "_context": context_str,
                 }
 
-            if tool_name0 == "call_gm":
-                notice = str(args0.get("notice") or "").strip()
-                if not notice:
+            if tool_name0 == "record_event":
+                # Narration submitted — log it and proceed
+                description = str(args0.get("description") or "").strip()
+                if not description:
                     if logs_enabled():
-                        print(f"[trace] SM run_turn_narration: empty call_gm notice, retrying")
+                        print(f"[trace] SM run_turn_narration: empty description, retrying")
                     _append_tool_rejection(
                         messages, out,
                         "ERROR: call_gm requires non-empty notice.",
@@ -848,10 +856,11 @@ class SceneManager:
                     print(f"[trace] SM run_turn_narration: unexpected tool {tool_name0!r}, retrying")
                 _append_tool_rejection(
                     messages, out,
-                    "ERROR: Use turn_narration or correct_character_intents.",
+                    "ERROR: Use record_event or escalate_to_gm.",
                 )
                 continue
 
+            # Old turn_narration handling — replaced by record_event
             _shared0 = str(args0.get("shared") or "").strip()
             _personal_raw0 = str(args0.get("personal_json") or "").strip()
             duration0 = str(args0.get("duration") or "").strip()
@@ -867,19 +876,15 @@ class SceneManager:
 
             if not _shared0:
                 if logs_enabled():
-                    print(f"[trace] SM run_turn_narration: empty shared, retrying")
-                _append_tool_rejection(messages, out, "ERROR: shared is empty. Provide non-empty shared narration.")
+                    print(f"[trace] SM run_turn_narration: empty description, retrying")
+                _append_tool_rejection(messages, out, "ERROR: description is empty. Provide non-empty description.")
                 continue
 
             _coerced_dur = _coerce_duration(duration0)
             if _coerced_dur is None:
                 if logs_enabled():
-                    print(f"[trace] SM run_turn_narration: invalid duration {duration0!r}, retrying")
-                _append_tool_rejection(
-                    messages, out,
-                    f"ERROR: Invalid duration {duration0!r}. Use plain number+unit, e.g. '5m', '30s'.",
-                )
-                continue
+                    print(f"[trace] SM run_turn_narration: no duration, continuing without")
+                _coerced_dur = "1 turn"
 
             _selected_set0 = set(selected_characters)
             _personal0 = {k: v for k, v in _personal0.items() if k in _selected_set0}

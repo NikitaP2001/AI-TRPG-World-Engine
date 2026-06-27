@@ -107,10 +107,9 @@ class WorldManager:
         characters: List[Dict[str, Any]],
         plot: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Auto-task: generate world setting block based on characters + plot.
+        """Generate world seed: essence, GURPS calibration, initial time, optional player reference.
 
-        Uses a dedicated forced-tool-call, separate from the prompt.
-        Returns the parsed world setting dict, or {} on failure.
+        One forced LLM call (not ReAct loop). Returns parsed dict or {} on failure.
         """
         from world_manager.tools import world_setting_result
 
@@ -125,7 +124,7 @@ class WorldManager:
 
         callbacks = openrouter_logging_callbacks(scope="world_manager", label="create_setting")
 
-        # Build rich context with full character cards + plot text
+        # Build character blocks
         import json as _json
         char_blocks = []
         for c in characters:
@@ -137,23 +136,23 @@ class WorldManager:
         plot_text = str(plot.get("init") or plot.get("premise") or plot.get("description", "") or "").strip()
 
         human_msg = (
-            "Generate the initial world setting for this world.\n"
+            "Generate the world seed for this world.\n"
             "---\n"
             "## Characters\n"
             + ("\n\n".join(char_blocks) if char_blocks else "(none)") + "\n\n"
             "## Plot\n"
             f"{plot_text or '(none)'}\n\n"
-            "Return a JSON object with these three keys:\n\n"
-            "1. world_essence (string):\n"
+            "Return a JSON object with these keys:\n\n"
+            "1. world_essence (string): REQUIRED.\n"
             "   A dense paragraph (3-5 sentences) describing the world's essential nature.\n"
             "   Cover: what the baseline reality is like, the prevailing tech/magic mix,\n"
             "   the general state of civilisation (fragmented, stable, declining, rising),\n"
             "   and the texture of daily life. Use abstract terms only — no proper nouns.\n\n"
-            "2. gurps_calibration (object):\n"
+            "2. gurps_calibration (object): REQUIRED.\n"
             "   A structured reference block defining world setting.\n"
             "   Where:\n"
-            "   - tech_mana_baseline (string): Describe the intersection of technology and\n"
-            "     magic. Use relative terms \n"
+            "   - tech_mana_baseline (string): Describe the intersection of technology\n"
+            "     and magic. Use relative terms.\n"
             "   - power_tiers (array of exactly 3 objects): tiers named \"average\",\n"
             "     \"exceptional\", \"unique\". Each has:\n"
             "       - tier: \"average\" / \"exceptional\" / \"unique\"\n"
@@ -168,7 +167,7 @@ class WorldManager:
             "       - essence: What supernatural forces are — a natural resource? divine\n"
             "         gift? technology? fundamental law?\n"
             "       - ceiling: Abstract bound of power\n"
-            "       - societal_impact: How the supernatural shapes economics, politics,\n"
+            "       - societal_impact: How the supernatural shapes economics, politics.\n"
             "   - social_fabric (object, optional):\n"
             "       - government_types: list of abstract descriptors\n"
             "       - law_level: description of how order is maintained\n"
@@ -179,9 +178,13 @@ class WorldManager:
             "       - deities: active / distant / absent / unknown\n"
             "       - afterlife: known / speculated / unknown / none\n"
             "       - notes: anything else about the cosmos\n"
-            "3. initial_world_time (string):\n"
+            "3. initial_world_time (string): REQUIRED.\n"
             "   EXACT format Y0000-01-01 00:00 (no prose). Must be meaningful,\n"
             "   not year 0000/0001.\n"
+            "4. player_reference (object, optional):\n"
+            "   - location (string): Name of a location where players should start.\n"
+            "     This is a hint — it does not create the location.\n"
+            "   - notes (string): Narrative context for the starting point.\n"
             "Use abstract framing throughout. No proper nouns, no numeric ranges.\n"
         )
 
@@ -267,7 +270,7 @@ class WorldManager:
                 ))
                 continue
 
-            # power_tiers must be an array with at least "average", "exceptional", "unique"
+            # power_tiers must have at least "average" and "unique"
             tiers = gc.get("power_tiers")
             if not isinstance(tiers, list) or len(tiers) < 2:
                 messages.append(out)
@@ -278,8 +281,6 @@ class WorldManager:
             tier_names = set()
             for i, t in enumerate(tiers):
                 if not isinstance(t, dict):
-                    messages.append(out)
-                    messages.append(HumanMessage(content=f"ERROR: power_tiers[{i}] is not an object."))
                     continue
                 name = str(t.get("tier") or "").strip().lower()
                 tier_names.add(name)
@@ -313,11 +314,9 @@ class WorldManager:
 
             # --- Validate initial_world_time ---
             wt = str(parsed.get("initial_world_time") or "").strip()
-            # Auto-prefix "Y" if looks like YYYY-MM-DD
             if wt[:1].isdigit() and len(wt) >= 5 and wt[4:5] == "-":
                 wt = f"Y{wt}"
                 parsed["initial_world_time"] = wt
-            # Fallback: try to extract YYYY from narrative text
             if not wt.startswith("Y") or "-" not in wt:
                 import re as _re
                 _year_m = _re.search(r"(?:^|\D)(\d{4})\s*(?:DR)?(?:\D|$)", wt)
@@ -337,14 +336,12 @@ class WorldManager:
                 messages.append(out)
                 messages.append(HumanMessage(
                     content=f"ERROR: initial_world_time format invalid. "
-                    f"Must be a calendar date/time like \"Y1479-03-15 18:00\" — "
-                    f"do NOT use prose descriptions. Examples: "
-                    f"\"Y1479-03-15 18:00\", \"Y1372-01-01 12:00\". "
+                    f"Must be a calendar date/time like \"Y1479-03-15 18:00\". "
                     f"Current value: {wt!r}"
                 ))
                 continue
 
-            # Save to history
+            # --- Save to history ---
             if self._history_path:
                 limits = limits_from_env()
                 append_message(self._history_path, role="user", content="WORLD_SETTING creation", limits=limits)
@@ -440,47 +437,9 @@ class WorldManager:
                 parallel_tool_calls=False,
             )
 
-        from world_manager.tools import (
-            ready_to_proceed,
-            answer_world_question,
-            read_tool_doc,
-            set_world_orientation,
-            set_player_start,
-            finalize_world_generation,
-            define_world_concept,
-            alter_feature,
-            define_entity,
-            define_faction,
-            define_rule,
-            declare_world_state,
-            subscribe_to_events,
-            query_world_state,
-            resolve_contradiction,
-            post_intent,
-            post_entity_directive,
-            define_relationship,
-        )
+        from world_manager.tool_registry import ToolRegistry
 
-        all_tools = tools or [
-            ready_to_proceed,
-            answer_world_question,
-            read_tool_doc,
-            set_world_orientation,
-            set_player_start,
-            finalize_world_generation,
-            define_world_concept,
-            alter_feature,
-            define_entity,
-            define_faction,
-            define_rule,
-            declare_world_state,
-            subscribe_to_events,
-            query_world_state,
-            resolve_contradiction,
-            post_intent,
-            post_entity_directive,
-            define_relationship,
-        ]
+        all_tools = tools or ToolRegistry.for_wm()
 
         tools_by_name = {t.name: t for t in all_tools}
         llm_with_tools = llm.bind_tools(all_tools).with_config({
@@ -590,9 +549,10 @@ class WorldManager:
             messages,
             llm_with_tools,
             tools_by_name,
-            termination_tools={"ready_to_proceed", "answer_world_question"},
+            termination_tools={"invoke_self", "close_invocation"},
             readonly_tools={
-                "query_world_state", "read_tool_doc",
+                "read_tool_doc", "get_entity", "get_entity_facts",
+                "query_entities", "query_events",
             },
         )
 
@@ -619,13 +579,13 @@ class WorldManager:
 
         # ── Persist to history (only write-tools, not reads) ────────
         WRITE_TOOLS = {
-            "set_world_orientation", "set_player_start",
-            "finalize_world_generation",
-            "define_world_concept", "alter_feature",
-            "define_entity", "define_faction", "define_rule",
-            "declare_world_state", "subscribe_to_events",
-            "resolve_contradiction", "post_intent",
-            "post_entity_directive", "define_relationship",
+            "set_entity", "set_entity_facts",
+            "add_tags", "remove_tags",
+            "record_event",
+            "attach_script", "detach_script",
+            "set_effect", "remove_effect",
+            "set_movement", "delete_entity",
+            "write_correction",
         }
 
         if self._history_path:
@@ -654,26 +614,19 @@ class WorldManager:
                             )
 
             # Save terminal tool result AFTER write-tools (chronological end)
-            if exit_tool_name == "ready_to_proceed":
-                summary = exit_tool_args.get("world_summary", "") or ""
-                if summary:
+            if exit_tool_name == "invoke_self":
+                comment = exit_tool_args.get("comment", "") or ""
+                if comment:
                     append_message(
                         self._history_path, role="assistant",
-                        content=f"[world_summary] {summary}", limits=limits,
+                        content=f"[invoke_self] {comment}", limits=limits,
                     )
-                    self._last_summary = summary
-                else:
+            elif exit_tool_name == "write_correction":
+                msg = exit_tool_args.get("message", "") or ""
+                if msg:
                     append_message(
                         self._history_path, role="assistant",
-                        content="[ready_to_proceed] (no summary)", limits=limits,
-                    )
-            elif exit_tool_name == "answer_world_question":
-                q = exit_tool_args.get("question", "") or ""
-                a = exit_tool_args.get("answer", "") or ""
-                if q and a:
-                    append_message(
-                        self._history_path, role="assistant",
-                        content=f"[qa] Q: {q}  A: {a}", limits=limits,
+                        content=f"[correction] {msg[:200]}", limits=limits,
                     )
 
         # ── Update last_call_tick ───────────────────────────────────

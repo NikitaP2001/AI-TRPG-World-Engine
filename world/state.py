@@ -409,6 +409,38 @@ class World:
         _write_json(self._paths.info_json, info)
 
     def get_locations(self) -> Dict[str, Any]:
+        """Return locations as {name: data} dict.
+        
+        Delegates to entity_store for type="location" entities,
+        falls back to old game/world/locations.json.
+        """
+        try:
+            from world_manager.entity_core import _get_backend
+            backend = _get_backend()
+            entities = backend.query(type_filter="location", include_templates=False, limit=200)
+            if entities:
+                result = {}
+                for e in entities:
+                    name = ""
+                    for tag in e.get("tags", []):
+                        if tag.startswith("name:"):
+                            name = tag[5:]
+                            break
+                    if not name:
+                        name = e.get("id", "unknown")
+                    result[name] = {
+                        "name": name,
+                        "summary": e.get("facts", "")[:200],
+                        "details": e.get("facts", ""),
+                        "parent_location": "",
+                        "sublocations_names": [],
+                        "npcs_present": [],
+                        "last_active": "",
+                    }
+                if result:
+                    return result
+        except Exception:
+            pass
         return _read_json(self._paths.locations_json)
 
     def get_story(self) -> Any:
@@ -636,6 +668,37 @@ class World:
         return loc
 
     def get_npcs(self) -> Dict[str, Any]:
+        """Return NPCs as {name: data} dict.
+
+        Delegates to entity_store for type="npc" entities,
+        falls back to old game/world/npc.json.
+        """
+        try:
+            from world_manager.entity_core import _get_backend
+            backend = _get_backend()
+            entities = backend.query(type_filter="npc", include_templates=False, limit=200)
+            if entities:
+                result = {}
+                for e in entities:
+                    name = ""
+                    for tag in e.get("tags", []):
+                        if tag.startswith("name:"):
+                            name = tag[5:]
+                            break
+                    if not name:
+                        name = e.get("id", "unknown")
+                    result[name] = {
+                        "name": name,
+                        "location": "",
+                        "current_state": e.get("state", {}).get("current_state", ""),
+                        "description": e.get("facts", ""),
+                        "details": "",
+                        "last_acted": "never",
+                    }
+                if result:
+                    return result
+        except Exception:
+            pass
         return _read_json(self._paths.npc_json)
 
     def get_npc(self, name: str) -> Dict[str, Any]:

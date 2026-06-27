@@ -309,8 +309,8 @@ class GameOrchestrator:
         """Parse and execute a user command or turn input.
 
         Handles slash commands:
-          /generate [seed=N] [review]  — finalize world generation
-          /advance N[d|h|m]           — advance simulation time
+          /generate [seed=N] [review]  — finalize world generation (disabled on this branch)
+          /advance N[d|h|m]           — advance simulation (disabled on this branch)
 
         Non-command text is treated as a turn input (calls run_turn).
 
@@ -342,73 +342,41 @@ class GameOrchestrator:
         from turn_runner import run_turn
         from langchain_core.messages import HumanMessage
         run_turn(self, HumanMessage(content=text))
+
+        # ── Process scheduled agent invocations ───────────────────
+        from scheduler_queue import pop_due_invocations as _pop_scheduled
+        world_tick = 0
+        try:
+            from world import WorldTime
+            wt = self.world.get_world_time()
+            if wt:
+                parsed = WorldTime.parse(str(wt))
+                world_tick = parsed.to_seconds()  # approximate
+        except Exception:
+            pass
+        due = _pop_scheduled(world_tick)
+        for inv in due:
+            agent = str(inv.get("agent", "")).strip().lower()
+            comment = str(inv.get("comment", "")).strip()
+            if logs_enabled():
+                print(f"[scheduler] due: agent={agent} comment={comment}")
+            if agent == "wm":
+                self._wm.call_wm(notice=comment or "scheduled")
+            elif agent == "gm":
+                self._game_master.call_gm(notice=comment or "scheduled")
+            elif agent == "sm":
+                self._scene_manager.run_sm_scene(notice=comment or "scheduled")
         return None
 
     def _cmd_generate(self, args: list, debug: bool = False) -> str:
-        """Handle /generate command."""
-        world_seed = 0
-        review_only = False
-        for arg in args:
-            al = arg.lower()
-            if al == "review":
-                review_only = True
-            elif al.startswith("seed="):
-                try:
-                    world_seed = int(al.split("=")[1])
-                except (ValueError, IndexError):
-                    pass
-
-        if debug:
-            print(f"[cmd] /generate seed={world_seed} review={review_only}")
-
-        try:
-            from world_manager.tools import finalize_world_generation
-            result = finalize_world_generation.invoke({
-                "world_seed": world_seed,
-                "review_only": review_only,
-            })
-        except Exception as e:
-            import traceback
-            return f"Generation failed: {e}\n{traceback.format_exc()}"
-
-        if not isinstance(result, dict):
-            return f"Generation returned: {result}"
-
-        status = result.get("world_generation_status", "?")
-        errors = result.get("validation_errors", [])
-        warnings = result.get("warnings", [])
-
-        lines = [f"World generation: {status}"]
-        if result.get("constraint_summary"):
-            cs = result["constraint_summary"]
-            lines.append(f"  Continents: {cs.get('continent_outlines', 0)}")
-            lines.append(f"  Features: {cs.get('named_terrain_features', 0)}")
-            lines.append(f"  Factions: {cs.get('faction_territories', 0)}")
-        lines.append(f"  Cell count: {result.get('generated_features', 0)}")
-        for e in errors:
-            lines.append(f"  ERROR: {e}")
-        for w in warnings:
-            lines.append(f"  WARNING: {w}")
+        """Handle /generate command — simulation stripped from this branch."""
+        return "World generation not available on this branch (simulation removed)."
 
         return "\n".join(lines)
 
     def _cmd_advance(self, args: list, debug: bool = False) -> str:
-        """Handle /advance command — parse time and advance simulation."""
-        from simulation.time_engine import parse_advance_args, TimeEngine
-        from simulation.world_db import WorldDB
-
-        text = "/advance " + " ".join(args)
-        parsed = parse_advance_args(text)
-        if not parsed.get("days") and not parsed.get("hours"):
-            return "Usage: /advance 7d 12h 30m"
-
-        db = WorldDB("game/simulation/world.sqlite")
-        engine = TimeEngine(db)
-        summary = engine.advance(**parsed)
-
-        return (f"Advanced {parsed.get('days', 0)}d {parsed.get('hours', 0)}h "
-                f"— tick {summary['tick']}, Y{summary['year']}, "
-                f"temp {summary['temp_mean']:.1f}°C")
+        """Handle /advance command — simulation removed from this branch."""
+        return "Simulation not available on this branch."
 
     # ── Session state (for webui) ─────────────────────────────────
 

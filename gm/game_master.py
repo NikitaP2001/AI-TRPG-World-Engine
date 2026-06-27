@@ -35,88 +35,29 @@ _WORLD = World()
 
 
 @tool
-def ready_to_proceed() -> str:
-    """Call this when you have finished your planing. Control passes forward.
+def invoke_self_gm(
+    delay_ticks: int = -1,
+    world_time: int = -1,
+    comment: str = "",
+) -> str:
+    """Finish planning and pass control forward.
+
+    Universal scheduling primitive. Exactly one of delay_ticks or
+    world_time must be provided. Use comment to summarise what was done.
 
     This is a termination tool — calling it ends the current invocation.
     """
-    try:
-        info = _WORLD.get_info()
-        chars = info.get("characters") if isinstance(info, dict) else []
-        for ch in chars:
-            if not isinstance(ch, dict):
-                continue
-            pname = str(ch.get("name") or "").strip()
-            if not pname:
-                continue
-            missing = []
-            if not _WORLD.get_character_state(pname):
-                missing.append("state")
-            if not _WORLD.get_character_skills(pname):
-                missing.append("skills")
-            if not _WORLD.get_character_equipment(pname):
-                missing.append("equipment")
-            if missing:
-                tools_hint = ", ".join(f"update_character_{m}(json_pointer='/', ...)" for m in missing)
-                return (
-                    f"ERROR: Character '{pname}' storage not initialized: {', '.join(missing)}. "
-                    f"Call {tools_hint} with complete data first."
-                )
-    except Exception:
-        pass
     return "ok"
 
 
 @tool
-def answer_lore_question(content: str) -> str:
+def answer_lore_question_gm(content: str) -> str:
     """Answer a question or provide lore information.
 
-    If neede plan everything and setup before answering.
-    Use this to respond to specific questions from the caller.
     This is a termination tool — calling it ends the current invocation.
 
     Args:
         content: Your answer or information to provide.
-    """
-    try:
-        info = _WORLD.get_info()
-        chars = info.get("characters") if isinstance(info, dict) else []
-        for ch in chars:
-            if not isinstance(ch, dict):
-                continue
-            pname = str(ch.get("name") or "").strip()
-            if not pname:
-                continue
-            missing = []
-            if not _WORLD.get_character_state(pname):
-                missing.append("state")
-            if not _WORLD.get_character_skills(pname):
-                missing.append("skills")
-            if not _WORLD.get_character_equipment(pname):
-                missing.append("equipment")
-            if missing:
-                tools_hint = ", ".join(f"update_character_{m}(json_pointer='/', ...)" for m in missing)
-                return (
-                    f"ERROR: Character '{pname}' storage not initialized: {', '.join(missing)}. "
-                    f"Call {tools_hint} with complete data first."
-                )
-    except Exception:
-        pass
-    return "ok"
-
-
-# ---------------------------------------------------------------------------
-# GameMaster class
-# ---------------------------------------------------------------------------
-
-
-@tool
-def gm_summary_result(paragraph_name: str, summary: str) -> str:
-    """Submit a story summary paragraph. This is a termination tool.
-
-    Args:
-        paragraph_name: Short title (3-10 words), unique.
-        summary: 5-10 sentence summary of the events covered.
     """
     return "ok"
 
@@ -206,30 +147,17 @@ class GameMaster:
                 parallel_tool_calls=False,
             )
 
-        from gm.tools import (
-            reset_read_tracker,
-            create_location, get_location, update_location,
-            delete_location_path, delete_location,
-            create_npc, get_npc, update_npc, delete_npc_path, delete_npc,
-            get_character_detail, read_character_diary,
-            read_character_diary,
-            update_character_state, update_character_skills, update_character_equipment,
-            get_character_state, get_character_skills, get_character_equipment,
-        )
+        from world_manager.tool_registry import ToolRegistry
 
         all_tools = tools or [
-            ready_to_proceed,
-            answer_lore_question,
-            create_location, get_location, update_location,
-            delete_location_path, delete_location,
-            create_npc, get_npc, update_npc, delete_npc_path, delete_npc,
-            get_character_detail, read_character_diary,
-            update_character_state, update_character_skills, update_character_equipment,
-            get_character_state, get_character_skills, get_character_equipment,
+            invoke_self_gm,
+            answer_lore_question_gm,
+            *ToolRegistry.for_gm(),
         ]
 
         # Reset invocation-scoped state before each GM call.
-        reset_read_tracker()
+        # No read tracker needed — entity_store is stateless per call.
+        
 
         tools_by_name = {t.name: t for t in all_tools}
         llm_with_tools = llm.bind_tools(all_tools).with_config({
@@ -307,8 +235,8 @@ class GameMaster:
             messages,
             llm_with_tools,
             tools_by_name,
-            termination_tools={"ready_to_proceed", "answer_lore_question", "gm_summary_result"},
-            readonly_tools={"get_location", "get_npc", "get_character_detail", "read_character_diary"},
+            termination_tools={"invoke_self_gm", "answer_lore_question_gm", "close_invocation"},
+            readonly_tools={"get_entity", "get_entity_facts", "query_entities", "query_events"},
             pinned_refresh_fn=ctx.rebuild_storage_notice,
         )
 

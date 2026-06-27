@@ -1,11 +1,7 @@
-"""OpenGL Desktop Application — AI World Engine GUI.
-
-Main application framework with scene system for rendering
-3D worlds, planets, and other visualisations using ModernGL.
+"""OpenGL Desktop Application — base window for future webgui-style UI.
 
 Scenes:
     Scene           — base class for all scenes
-    PlanetScene     — H3 hex-cell planet rendering
 
 Usage:
     python -m opengl_app.main
