@@ -19,11 +19,11 @@ DOCS: Dict[str, Dict[str, str]] = {
             "Conventions (not enforced): 'race_template', 'class_template', 'character', "
             "'npc', 'faction', 'location', 'object', 'effect_source', 'political_entity', 'concept'."
         ),
-        "id": (
-            "Unique entity identifier. If empty, auto-generated and returned. "
-            "On update: provide existing id to modify the entity in place. "
-            "Convention: use readable slugs, e.g. 'char_ainz', 'faction_nazarick', "
-            "'tpl_undead', 'loc_e_rantel'. Avoid spaces."
+        "name": (
+            "The entity's name. For named characters (e.g. 'Elena Brightwood'), "
+            "use their full name exactly. For locations and other entities, "
+            "use a descriptive name (e.g. 'tavern_sleeping_dragon'). "
+            "If empty, auto-generates and returns a new identifier."
         ),
         "type": (
             "Entity type string. Required on create; ignored on update. "
@@ -72,8 +72,11 @@ DOCS: Dict[str, Dict[str, str]] = {
             "Where this entity is. Three forms: "
             "{'inside': 'entity_id'} — contained within another entity. "
             "{'near': 'entity_id'} — approximately co-located. "
-            "{'coords': [x, y, z]} — absolute world coordinates. "
-            "Omit for non-spatial entities (laws, alliances, abstract concepts)."
+            "{'coords': [lat, lon]} or [lat, lon, z] — absolute world coordinates "
+            "(latitude -90..90, longitude -180..180). "
+            "Omit for non-spatial entities (laws, alliances, abstract concepts).\n\n"
+            "Validation: coords outside lat/lon range or unknown keys are rejected "
+            "with an error. inside/near must be a non-empty string."
         ),
     },
     # ==================================================================
@@ -83,7 +86,7 @@ DOCS: Dict[str, Dict[str, str]] = {
             "Does not touch stats, tags, or scripts. "
             "Use for targeted fact updates without risk of overwriting other fields."
         ),
-        "id": "Entity identifier. REQUIRED.",
+        "name": "The entity's name (e.g. 'Elena Brightwood'). REQUIRED.",
         "facts": "Complete replacement of the facts field. Keep ≤200 words.",
     },
     # ==================================================================
@@ -92,7 +95,7 @@ DOCS: Dict[str, Dict[str, str]] = {
             "**Read a single entity in full, including scripts.** "
             "Returns all fields, active effects, movement records, and attached scripts."
         ),
-        "id": "Entity identifier. REQUIRED.",
+        "name": "The entity's name (e.g. 'Elena Brightwood'). REQUIRED.",
     },
     # ==================================================================
     "get_entity_facts": {
@@ -100,7 +103,7 @@ DOCS: Dict[str, Dict[str, str]] = {
             "**Read only the prose facts of an entity.** "
             "Used by SM/GM to load NPC context on demand without receiving full mechanical stats."
         ),
-        "id": "Entity identifier. REQUIRED.",
+        "name": "The entity's name (e.g. 'Elena Brightwood'). REQUIRED.",
     },
     # ==================================================================
     "add_tags": {
@@ -306,7 +309,7 @@ DOCS: Dict[str, Dict[str, str]] = {
             "Does not remove the entity from the event log — past events that reference it "
             "remain. Sets a deleted_at_tick marker on the entity record."
         ),
-        "id": "Entity to delete. REQUIRED.",
+        "name": "Entity name to delete (e.g. 'Elena Brightwood'). REQUIRED.",
         "reason": "Why — written to event log.",
     },
     # ==================================================================
@@ -349,6 +352,107 @@ DOCS: Dict[str, Dict[str, str]] = {
         ),
     },
     # ==================================================================
+    # SM-specific tools
+    # ==================================================================
+    "publish_narrative_block": {
+        "_tool": (
+            "**Deliver resolved action to players as immersive prose.** "
+            "This is the ONLY tool that produces player-facing narrative text. "
+            "distinct from record_event which writes structured facts.\n\n"
+            "Call this when you have reviewed the resolved history and are ready "
+            "to describe what happened. The duration determines how much in-game "
+            "time passes."
+        ),
+        "since_event_id": (
+            "The resolved-history event id to start from "
+            "(normally the id after the previous publication). "
+            "You can find event ids in the resolved history provided in your context."
+        ),
+        "narration": (
+            "The assembled narrative text. Should be in Russian, third-person "
+            "objective, novelistic tone. Must match character knowledge — don't "
+            "reveal information the characters couldn't perceive."
+        ),
+        "covers_t_range": (
+            "Timeline range this block covers, format 't_start_sec..t_end_sec' "
+            "as absolute seconds. Example: '5000..5900'."
+        ),
+        "duration": (
+            "How much in-game time this block covers. "
+            "Required. Valid units: s, m, h, d."
+        ),
+    },
+    # ==================================================================
+    "end_scene": {
+        "_tool": (
+            "**Explicitly end the current scene.** "
+            "Use when the scene is narratively complete — characters leave, "
+            "a major time skip occurs, or the story moves to a different "
+            "location and context.\n\n"
+            "Do NOT call this just because nothing happened — the scheduler "
+            "handles structural pauses automatically. Only call this when "
+            "the scene is truly done."
+        ),
+        "reason": "Why the scene ends. Must be a clear narrative justification.",
+        "final_narration": (
+            "Optional final narrative text to conclude the scene. "
+            "If provided, this is the last thing the players see for this scene."
+        ),
+        "duration": (
+            "How much in-game time this conclusion covers. Optional. "
+            "Valid units: s, m, h, d."
+        ),
+        "next_location": (
+            "Hint for where the next scene should take place. "
+            "If empty, the system determines the next scene from character locations."
+        ),
+    },
+    # ==================================================================
+    "manage_intent": {
+        "_tool": (
+            "**Manage a player's intent — remove it entirely or interrupt it mid-execution.** "
+            "Use action='remove' when the intent was impossible, contradictory, "
+            "or misdirected. Use action='interrupt' when the intent was valid "
+            "and partially resolved, but new circumstances override it.\n\n"
+            "Interruption is constrained by the player's absorption declaration: "
+            "'alert' players can be freely interrupted; 'immersed' players only "
+            "for direct physical threat."
+        ),
+        "intent_id": "The intent to manage. You can find intent ids in the declared intents list.",
+        "action": "'remove' to cancel entirely, 'interrupt' to cut short.",
+        "reason": (
+            "Why this action is taken. The player sees this. "
+            "Must reference a specific resolved event when interrupting."
+        ),
+        "interrupt_at_offset": (
+            "Only for action='interrupt'. A duration string for how long the "
+            "intent still runs before being cut off. If empty, the interrupt "
+            "is immediate. Valid units: s, m, h, d."
+        ),
+        "character_name": (
+            "The player who owns this intent. If empty, inferred "
+            "from the current cycle's declared intents."
+        ),
+    },
+    # ==================================================================
+    "update_awareness": {
+        "_tool": (
+            "**Notify players and give them additional context about what is happening.** "
+            "Players are re-invoked with this information added to their turn context. "
+            "Their declared intents stay unchanged."
+        ),
+        "character_names": "Which players to update. List of character names.",
+        "context": "What they need to know about events they may have missed.",
+    },
+    # ==================================================================
+    "proceed_to_narration": {
+        "_tool": (
+            "**Signal that all intents are resolved and SM is ready to narrate.** "
+            "Only available during the resolve phase — call this when you are done "
+            "reviewing intents and want to move to producing narration."
+        ),
+    },
+    # ==================================================================
     "read_tool_doc": {
         "_tool": (
             "**Read detailed parameter documentation for any WM tool.** "
@@ -363,7 +467,9 @@ DOCS: Dict[str, Dict[str, str]] = {
             "add_tags, remove_tags, query_entities, query_events, "
             "record_event, attach_script, detach_script, "
             "set_effect, remove_effect, set_movement, delete_entity, "
-            "invoke_self, write_correction, read_tool_doc."
+            "invoke_self, write_correction, read_tool_doc, " \
+            "publish_narrative_block, end_scene, manage_intent, " \
+            "update_awareness, proceed_to_narration."
         ),
         "parameters": (
             "Optional list of specific parameter names to get docs for. "

@@ -44,7 +44,7 @@ def append_turn_to_story(
             "start_time": "",
             "turns": [],
             "locations": [],
-            "characters": [],
+            "players": [],
             "npcs": [],
         }
 
@@ -60,7 +60,7 @@ def append_turn_to_story(
         "end_time": str(end_time),
         "location": str(location),
         "narration": narration or "",
-        "characters": list(characters or []),
+        "players": list(characters or []),
         "npcs": list(npcs or []),
     }
     turns.append(turn_entry)
@@ -78,7 +78,7 @@ def append_turn_to_story(
         return out
 
     ongoing["locations"] = _merge_unique(ongoing.get("locations"), [location])
-    ongoing["characters"] = _merge_unique(ongoing.get("characters"), list(characters or []))
+    ongoing["players"] = _merge_unique(ongoing.get("players"), list(characters or []))
     ongoing["npcs"] = _merge_unique(ongoing.get("npcs"), list(npcs or []))
 
     arcs[0] = arc0
@@ -116,7 +116,7 @@ def finalize_paragraph(
         "start_time": str(ongoing.get("start_time") or ""),
         "end_time": end_t,
         "locations": ongoing.get("locations") or [],
-        "characters": ongoing.get("characters") or [],
+        "players": ongoing.get("players") or [],
         "npcs": ongoing.get("npcs") or [],
         "summary": str(paragraph_obj.get("summary") or ""),
         "turn_count": len(turns),
@@ -147,7 +147,7 @@ def finalize_paragraph(
             if not isinstance(p, dict):
                 continue
             agg_locations = _merge_unique(agg_locations, list(p.get("locations") or []))
-            agg_characters = _merge_unique(agg_characters, list(p.get("characters") or []))
+            agg_characters = _merge_unique(agg_characters, list(p.get("players") or []))
             agg_npcs = _merge_unique(agg_npcs, list(p.get("npcs") or []))
 
         finalized_arc_name = (
@@ -164,7 +164,7 @@ def finalize_paragraph(
             arc0["start_time"] = str(paras[0].get("start_time") or para.get("start_time") or "")
         arc0["end_time"] = str(para.get("end_time") or "")
         arc0["locations"] = agg_locations
-        arc0["characters"] = agg_characters
+        arc0["players"] = agg_characters
         arc0["npcs"] = agg_npcs
 
         arc0.pop("ongoing_paragraph", None)
@@ -178,7 +178,7 @@ def finalize_paragraph(
                     "start_time": str(end_t),
                     "turns": [],
                     "locations": [],
-                    "characters": [],
+                    "players": [],
                     "npcs": [],
                 },
             },
@@ -188,7 +188,7 @@ def finalize_paragraph(
             "start_time": str(end_t),
             "turns": [],
             "locations": [],
-            "characters": [],
+            "players": [],
             "npcs": [],
         }
         arcs[0] = arc0

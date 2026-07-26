@@ -11,10 +11,10 @@ from __future__ import annotations
 from functools import partial
 from typing import TYPE_CHECKING
 
-from scheduler.core import TickScheduler, Job, TurnCount, ParagraphCount, MemoryEntryCount
+from scheduler.core import TickScheduler, Job, CycleCount, ParagraphCount, MemoryEntryCount
 
 if TYPE_CHECKING:
-    from console_app import GameOrchestrator
+    from engine.orchestrator import GameOrchestrator
 
 
 def register_all_jobs(scheduler: TickScheduler, orch: "GameOrchestrator") -> None:
@@ -30,7 +30,7 @@ def register_all_jobs(scheduler: TickScheduler, orch: "GameOrchestrator") -> Non
 
     scheduler.register(
         Job("paragraph_summary", orch._sm._run_paragraph_summary,
-            trigger=TurnCount(interval=10),
+            trigger=CycleCount(interval=10),
             priority=50,
             ),
         Job("arc_summary", orch._sm._run_arc_summary,
@@ -45,7 +45,7 @@ def register_all_jobs(scheduler: TickScheduler, orch: "GameOrchestrator") -> Non
     # ═══════════════════════════════════════════════════════════════════
 
     try:
-        from character.reflection import get_reflection_interval
+        from player.reflection import get_reflection_interval
         ref_interval = get_reflection_interval()
     except Exception:
         ref_interval = 10

@@ -17,6 +17,19 @@ from world_manager._backend_base import EntityBackend
 
 
 # ---------------------------------------------------------------------------
+# WorldTime helper — returns current game world time as string
+# ---------------------------------------------------------------------------
+def _world_time_str() -> str:
+    """Return current WorldTime as string, or 'unknown' if unavailable."""
+    try:
+        from world import World
+        wt = World().get_world_time()
+        return wt.to_string() if hasattr(wt, 'to_string') else str(wt)
+    except Exception:
+        return "unknown"
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -202,8 +215,8 @@ class JsonFileBackend(EntityBackend):
                 "tags": tags or [],
                 "position": position or {},
                 "scripts": [], "effects": [], "movement": None,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "created_at": _world_time_str(),
+                "updated_at": _world_time_str(),
                 "deleted_at": None,
             }
             if base_type and base_type in store:
@@ -238,7 +251,7 @@ class JsonFileBackend(EntityBackend):
                 entity["tags"] = tags
             if position:
                 entity["position"] = position
-            entity["updated_at"] = datetime.now(timezone.utc).isoformat()
+            entity["updated_at"] = _world_time_str()
             operation = "updated"
 
         self._touch()
@@ -278,7 +291,7 @@ class JsonFileBackend(EntityBackend):
             return {"entity_id": id, "operation": "error", "warnings": ["Entity not found"]}
         fact_warnings = self.validate_facts(facts, id)
         entity["facts"] = facts
-        entity["updated_at"] = datetime.now(timezone.utc).isoformat()
+        entity["updated_at"] = _world_time_str()
         self._touch()
         self._flush()
         result = {"entity_id": id, "operation": "facts_updated"}
@@ -305,7 +318,7 @@ class JsonFileBackend(EntityBackend):
         entity = store.get(id)
         if entity is None:
             return {"entity_id": id, "status": "not_found"}
-        entity["deleted_at"] = datetime.now(timezone.utc).isoformat()
+        entity["deleted_at"] = _world_time_str()
         entity["delete_reason"] = reason
         self._touch()
         self._flush()
@@ -639,7 +652,7 @@ class JsonFileBackend(EntityBackend):
             state_block["current_state"] = current_state
             mutations.append(f"current_state: {current_state}")
 
-        entity["updated_at"] = datetime.now(timezone.utc).isoformat()
+        entity["updated_at"] = _world_time_str()
         self._touch()
         self._flush()
 

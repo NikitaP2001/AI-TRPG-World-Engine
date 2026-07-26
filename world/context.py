@@ -51,11 +51,11 @@ def _prepare_scene_for_qa_context(scene: Dict[str, Any], world_time: "WorldTime"
         if key in scene:
             out[key] = scene[key]
 
-    chars = scene.get("characters")
+    chars = scene.get("players")
     if isinstance(chars, dict):
-        out["characters"] = [str(name) for name in chars.keys() if str(name).strip()]
+        out["players"] = [str(name) for name in chars.keys() if str(name).strip()]
     elif isinstance(chars, list):
-        out["characters"] = [str(name) for name in chars if str(name).strip()]
+        out["players"] = [str(name) for name in chars if str(name).strip()]
 
     npcs = scene.get("npcs")
     if isinstance(npcs, list):
@@ -99,7 +99,7 @@ def _enrich_characters_with_time_behind(
     """
     _LONG_ABSENCE_SECONDS = 8 * 3600  # 8 hours
 
-    chars = info_for_prompt.get("characters")
+    chars = info_for_prompt.get("players")
     if not isinstance(chars, list):
         return
     wt_sec = world_time.to_seconds()
@@ -264,7 +264,7 @@ def _last_paragraph_meta(arcs: List[Any]) -> Optional[Dict[str, Any]]:
                 "start_time": last_para.get("start_time") or "",
                 "end_time": last_para.get("end_time") or "",
                 "locations": _as_str_list(last_para.get("locations")),
-                "characters": _as_str_list(last_para.get("characters")),
+                "players": _as_str_list(last_para.get("players")),
                 "npcs": _as_str_list(last_para.get("npcs")),
                 "turn_count": last_para.get("turn_count") or 0,
                 "summary": last_para.get("summary") or "",
@@ -314,7 +314,7 @@ def _last_n_paragraph_metas(arcs: List[Any], n: int = 10) -> List[Dict[str, Any]
                         "start_time": p.get("start_time") or "",
                         "end_time": p.get("end_time") or "",
                         "locations": _as_str_list(p.get("locations")),
-                        "characters": _as_str_list(p.get("characters")),
+                        "players": _as_str_list(p.get("players")),
                         "npcs": _as_str_list(p.get("npcs")),
                         "turn_count": p.get("turn_count") or 0,
                         "summary": p.get("summary") or "",
@@ -384,7 +384,7 @@ def _last_arc_summary(arcs: List[Any]) -> Optional[Dict[str, Any]]:
             v = str(arc.get(k) or "").strip()
             if v:
                 out[k] = v
-        for k in ("locations", "characters", "npcs"):
+        for k in ("locations", "players", "npcs"):
             v2 = _as_str_list(arc.get(k))
             if v2:
                 out[k] = v2
@@ -406,7 +406,7 @@ def _ongoing_entities(arc: Dict[str, Any]) -> Dict[str, Any]:
         "start_time": str(ongoing.get("start_time") or "").strip(),
         "turn_count": len(_safe_list(ongoing.get("turns"))),
         "locations": _as_str_list(ongoing.get("locations")),
-        "characters": _as_str_list(ongoing.get("characters")),
+        "players": _as_str_list(ongoing.get("players")),
         "npcs": _as_str_list(ongoing.get("npcs")),
     }
 
@@ -432,7 +432,7 @@ def _previous_arc_entities_if_needed(arcs: List[Any]) -> Optional[Dict[str, Any]
             "arc_name": str(prev_arc.get("name") or "").strip(),
             "source": "previous_arc_last_paragraph",
             "locations": _as_str_list(p.get("locations")),
-            "characters": _as_str_list(p.get("characters")),
+            "players": _as_str_list(p.get("players")),
             "npcs": _as_str_list(p.get("npcs")),
         }
 
@@ -442,7 +442,7 @@ def _previous_arc_entities_if_needed(arcs: List[Any]) -> Optional[Dict[str, Any]
         "arc_name": str(prev_arc.get("name") or "").strip(),
         "source": "previous_arc_ongoing_paragraph",
         "locations": _as_str_list(ongoing.get("locations")),
-        "characters": _as_str_list(ongoing.get("characters")),
+        "players": _as_str_list(ongoing.get("players")),
         "npcs": _as_str_list(ongoing.get("npcs")),
     }
 
@@ -499,7 +499,7 @@ def _last_n_turns(arcs: List[Any], n: int = 10) -> List[Dict[str, Any]]:
             "start_time": str(t.get("start_time") or ""),
             "end_time": str(t.get("end_time") or ""),
             "location": str(t.get("location") or ""),
-            "characters": _as_str_list(t.get("characters")),
+            "players": _as_str_list(t.get("players")),
             "npcs": _as_str_list(t.get("npcs")),
             "narration": narration,
         }
@@ -588,7 +588,7 @@ def build_game_master_qa_context(world: Any) -> str:
                 "kind",
                 "scene_type",
                 "mode",
-                "characters",
+                "players",
                 "npcs",
                 "behind_world_time_by",
             }
@@ -631,7 +631,7 @@ def build_game_master_context_block(world: Any) -> str:
 
     # Keep GM world-info compact: scene-pick task message carries dedicated
     # character timing appendix, so avoid duplicating helper timing fields here.
-    for ch in (info_for_prompt.get("characters") or []):
+    for ch in (info_for_prompt.get("players") or []):
         if isinstance(ch, dict):
             ch.pop("time_of_day", None)
             ch.pop("behind_world_time", None)
@@ -666,7 +666,7 @@ def build_game_master_context_block(world: Any) -> str:
     # knows what the characters look like, their traits, equipment, etc.
     if scene_active:
         try:
-            chars = scene.get("characters") if isinstance(scene, dict) else None
+            chars = scene.get("players") if isinstance(scene, dict) else None
             char_details: List[Dict[str, Any]] = []
             if isinstance(chars, dict):
                 for name in chars.keys():
@@ -731,7 +731,7 @@ def build_game_master_context_block(world: Any) -> str:
     try:
         active_scene_names: List[str] = []
         if scene_active and isinstance(scene, dict):
-            chars = scene.get("characters")
+            chars = scene.get("players")
             if isinstance(chars, dict):
                 active_scene_names = [str(x).strip() for x in chars.keys() if str(x).strip()]
         early_story_character_descriptions = _all_character_descriptions_for_context(
@@ -770,7 +770,7 @@ def is_character_active_in_scene(world: Any, name: str) -> bool:
         scene = world.get_scene()
         if not (isinstance(scene, dict) and scene.get("state") == "active"):
             return False
-        chars = scene.get("characters")
+        chars = scene.get("players")
         if not isinstance(chars, dict):
             return False
         return name in chars

@@ -9,10 +9,9 @@
 This document specifies the scene/turn orchestration layer: how character agents
 (player characters and NPCs) and the scene manager are invoked, how their declared
 actions are resolved against each other, and what each agent sees at each
-invocation. This sits above the L0-L3/L2.5 world simulation
-(`wm_tools.md`, `l2_l25_architecture.md`, `l3_specification.md`,
-`l1_completion_design.md`) and governs scene-scale interaction — one location or a
-connected cluster of locations, seconds to hours of in-world time.
+invocation. It sits above the shared entity store and event log described in
+[`architecture.md`](architecture.md) and governs scene-scale interaction — one
+location or a connected cluster of locations, seconds to hours of in-world time.
 
 ---
 
@@ -27,6 +26,22 @@ shared timeline.
 The timeline never rewinds: once a point on the timeline has been resolved, intents
 and their outcomes at that point are fixed. New declarations from any actor apply
 only from the current resolution point forward.
+
+**There is no turn boundary and no fixed order of declaration.** Nothing in this
+design assigns characters an initiative order, a speaking order, or any sequence in
+which they must declare intents relative to one another. Resolution outcome is
+determined entirely by declared `interval` values, `trigger_condition` matches, and
+`trigger_priority` — never by which character's tool call happened to return first.
+Where invocation order does matter (§5), it is driven by a structural condition on
+who currently has an active intent, not by a fixed sequence assigned to characters.
+
+**There is no planning horizon set in advance.** Resolution proceeds continuously,
+segment by segment (§4), without a manager-declared point up to which the scheduler
+commits to resolving before reconsidering. What was previously handled by such a
+horizon — carrying forward intents that outlast the current attention, deciding when
+to reconsider the overall picture — is handled instead by continuous segment
+resolution (§4) plus the publication mechanism (§6), which are driven by accumulated
+content, not by a pre-declared span of world-time.
 
 ## §2 Awareness
 
@@ -61,6 +76,8 @@ manager's own world/NPC actions — use one schema:
   interval: [t_start, t_end | null],  # null t_end = persistent subscription
   is_hostile: bool,            # default false; only valid for action_type == "combat"
   description: str,
+
+  absorption: "immersed" | "alert",  # default "alert" — see §3.6
 
   visibility: "public" | "private",  # default "public"
   detection_difficulty: int | null,  # required if visibility == "private" and
@@ -97,7 +114,7 @@ fields is a schema violation, flagged at resolution.
 ### §3.2 Persistent Subscriptions
 
 `interval: [t, null]` marks a persistent subscription — active across segments and
-across narrative blocks until explicitly cancelled. Has no `on_timeout`. Checked at
+across published blocks until explicitly cancelled. Has no `on_timeout`. Checked at
 §4 step 2 exactly like a bounded-interval intent.
 
 A character agent may cancel any of its own active subscriptions at any invocation by
@@ -125,6 +142,30 @@ unbounded). An actor states the condition once; it is checked mechanically at ev
 subsequent segment until it matches, is cancelled, or (for bounded intents) times
 out.
 
+### §3.6 Absorption
+
+`absorption` states how available a character is to the world beyond their own
+declared `trigger_condition`, for the duration of this intent. The character sets
+this themselves — it is not inferred by the scene manager.
+
+- **`"alert"`** (default): the character is doing this, but retains background
+  awareness of their surroundings. They remain a candidate for `interrupt_intent`
+  (§7.1) on the basis of significant events within their awareness, even without a
+  matching `trigger_condition`. Subject to the invocation condition in §5.
+
+- **`"immersed"`**: the character has deliberately committed their full attention to
+  this action. They are not re-invoked by ordinary events in their awareness, and are
+  not a candidate for `interrupt_intent` except where the interrupting cause is a
+  direct physical threat to the character themself — not merely something happening
+  nearby to someone else. A character who declares `absorption: "immersed"` while
+  reading for eight hours will not notice a distant commotion; they will notice their
+  own door being broken down. This is a deliberate in-fiction choice with a real
+  narrative cost, not a system default to route around.
+
+`absorption` applies to the whole declared interval. A character who wants to spend
+part of a long action alert and part of it immersed declares this as separate
+sequential intents rather than a single interval with a changing value.
+
 ## §4 Segment Resolution
 
 The scheduler processes the timeline in segments. A segment boundary is the nearest
@@ -149,45 +190,115 @@ For each segment:
    - Persistent subscriptions remain active after firing.
 5. For bounded-interval intents whose `interval` ends this segment without a
    matched trigger → apply `on_timeout` if present; otherwise the intent completes
-   as declared.
+   as declared. If the actor has nothing further declared, they become eligible for
+   re-invocation under §5.
 6. Record the segment's resolved state — actor, action, and what each aware
-   character perceived (§2) — into the resolved history.
+   character perceived (§2) — into the resolved history, and add its content to the
+   publication buffer (§6).
 
 Natural-language `trigger_condition`s are translated to the structured form once, at
 the point the actor formulates them. Steps 1, 2, 4, 5, 6 are structural; step 3 is
 the only step that currently requires the scene manager.
 
-## §5 Planning Horizon
+An intent with `interval.t_end` far beyond the current point of resolution is not
+re-elaborated as resolution passes it — it remains an active record on the scheduler,
+carried forward unchanged, until its own `interval` ends, a trigger matches it (step
+4), or it is interrupted (§7.1).
 
-Before each resolution cycle, the scene manager sets a horizon `T` on the shared
-timeline. Character agents declare intents with `interval.t_start` within
-`[t_now, T]`; `interval.t_end` is unrestricted — an action may extend arbitrarily far
-past `T`.
+## §5 Invocation Eligibility
 
-`T` is the point up to which the manager expects the current set of intents and
-subscriptions to resolve without requiring a wider view. It is set from: any
-world/NPC intent the manager intends to introduce this cycle (§7); the nearest point
-at which an existing persistent subscription is likely to match given the current
-trajectory; or a default cap if neither applies.
+Re-invoking every `"alert"` character every time any nearby intent resolves produces
+unmotivated invocations: a character in a quiet location has no reason to be asked
+anything just because an unrelated part of the scene happens to be resolving. The
+following condition governs re-invocation, evaluated continuously per location as
+intents end or new characters become present — not on a fixed cycle:
 
-An intent with `interval.t_end > T` is not re-elaborated when `T` is reached — it
-remains an active record on the scheduler and carries into the next cycle's
-resolution unchanged, unless a trigger match (§4 step 4) interrupts it. Re-invocation
-of an agent happens only on a trigger match, never solely because `T` was reached.
+1. A character with **no currently active intent** (their previous interval just
+   ended per §4 step 5, or they are newly present in the scene) is invoked as soon
+   as this becomes true, independent of order relative to other characters at the
+   same location (§1). They declare their next intent.
+2. If, as a result of step 1, a character at a given location declared a new active
+   intent, `"alert"` characters at the same location whose own interval is still
+   ongoing are then invoked to reconsider — they may react, or confirm their
+   existing intent continues unchanged.
+3. If no character at a location currently has zero active intents — everyone
+   present already has something ongoing declared — no `"alert"` character at that
+   location is invoked. Nothing structurally new has occurred there.
+4. `"immersed"` characters are never invoked by this condition. They are only
+   re-invoked by their own `trigger_condition` match (§4) or by `interrupt_intent`
+   (§7.1).
 
-After resolution reaches `T`, the manager re-evaluates the resolved history and sets
-the next `T`.
+This condition is evaluated independently per location — activity elsewhere in the
+world does not cause re-invocation of characters whose awareness does not reach it.
 
-## §6 Resolved History and Narrative Blocks
+## §6 Resolved History and Publication
 
-Resolved segments (§4 step 6) accumulate as the resolved history. Publishing a
-narrative block — assembling a portion of the resolved history into text for
-players — is independent of the scheduler: the scheduler continues across block
-boundaries with no reset of intervals, subscriptions, or awareness state.
+Resolved segments (§4 step 6) accumulate as the resolved history — a continuously
+growing record, never cleared, never reset. Nothing in this design clears the scene,
+resets declared intents, or wipes accumulated state at any point. An implementation
+that clears scene state after producing narration is not implementing this section —
+it has reintroduced a turn boundary the continuous timeline was built to eliminate.
 
-Older portions of the resolved history may be condensed into summaries for context
-management; the manager's view (§7) always includes at least the unsummarized
-portion since the last `T`.
+### §6.1 Publication Buffer
+
+Each segment's resolved content (§4 step 6) — the substance of what happened, not
+tool-call or reasoning overhead — accumulates in a **publication buffer** from the
+point of the last published block. The buffer's size is measured in the token length
+of this resolved content: primarily the `description` text of `record_event` entries
+generated since the last publication.
+
+### §6.2 Publication Threshold
+
+When the publication buffer's accumulated content reaches the **publication
+threshold**, the scene manager assembles it into a narrative block and publishes it.
+This is the sole ordinary trigger for publication — there is no separate time-based
+or cycle-based schedule.
+
+Starting value: **~600–900 tokens of accumulated resolved-content**, calibrated
+against a target published block length of roughly 200–400 words, assuming a
+resolved-content-to-narration compression ratio of roughly 1.5–2x. This value is a
+starting assumption, expected to be tuned from observed play rather than derived
+formally. Nothing in this design fixes it permanently.
+
+This threshold is deliberately content-driven, not time-driven: a densely-eventful
+hour of combat and a quiet two-hour journey are expected to reach the threshold at
+very different points on the world timeline, and should — a dense scene publishes
+frequently in short world-time spans; a quiet scene publishes rarely, covering long
+world-time spans in a single block.
+
+### §6.3 Session Safety Cap
+
+Independent of the publication buffer, the scene manager's full invocation session
+(including QA exchanges, tool calls, and reasoning — not just resolved content) is
+bounded by a **session safety cap**, starting value **~15,000–20,000 tokens**. If
+this cap is reached before the publication threshold (§6.2) is reached through
+ordinary content accumulation, the manager is forced to publish whatever is in the
+buffer regardless of size, to prevent unbounded session growth. This is a protective
+fallback, not part of the ordinary pacing mechanism, and should fire rarely if the
+publication threshold is well-calibrated.
+
+### §6.4 `publish_narrative_block`
+
+```
+publish_narrative_block(
+    since_event_id: str,   # resolved-history event id to start assembling from
+    narration: str,        # the assembled narrative text delivered to players
+    covers_t_range: [t_from, t_to],  # the timeline range this block narrates
+)
+```
+
+This is the only tool that produces player-facing narrative text. It is distinct
+from `record_event` (architecture.md), which writes structured facts to the entity
+store and is not narrative prose intended for players. Calling this tool clears the
+publication buffer (§6.1) and resets it to accumulate from this point forward. It
+does not reset or clear the scheduler, active intents, or awareness state — resolved
+history continues to accumulate underneath, and the scheduler proceeds unaffected by
+publication.
+
+Older, already-published portions of the resolved history may be condensed into
+summaries for context management; the manager's working context always includes at
+least the unpublished portion accumulated since the last `publish_narrative_block`
+call.
 
 ## §7 Scene Manager as Participant
 
@@ -199,22 +310,55 @@ two distinctions from character agents:
 - Its intents may be authored on behalf of any NPC or world element in the scene, not
   a single character.
 
-The manager's world/NPC intents are posted as part of setting `T` (§5) — based on the
-resolved history available at that point, not on character intents for the cycle
-about to be planned (those do not exist yet when `T` is set). A manager intent
-becomes part of the context character agents receive when declaring intents for
-`[t_now, T]`.
+The manager may post world/NPC intents at any point during resolution, exactly as
+any other actor on the scheduler — there is no separate phase in which manager
+intents must be declared in advance of character intents.
 
 The manager may also hold persistent subscriptions (§3.2) on behalf of NPCs or world
 state — e.g. a standing condition on a class of event ("any combat action",
 "any mention of a specific name") with `actor: "manager"`. When such a subscription
 matches during §4 step 4, its resolution (a new manager-authored intent, or a
-prepared reaction) becomes part of the resolved history feeding the next `T`.
+prepared reaction) becomes part of the resolved history and the publication buffer.
+
+### §7.1 `interrupt_intent`: One-Sided Interruption
+
+Structural trigger matching (§4) only fires on conditions a character explicitly
+declared. This is not sufficient on its own: the world contains events a character
+could not have been expected to anticipate — a companion is unexpectedly attacked
+elsewhere in their awareness, a location floods, an alarm they had no reason to
+predict sounds. An `"alert"` character (§3.6) should be interruptible by such events
+even without having declared a matching `trigger_condition` for them. This is a
+distinct mechanism from trigger matching, and it belongs to the scene manager alone:
+
+```
+interrupt_intent(
+    target_actor: str,
+    reason: str,        # must reference a specific resolved event
+                         # justifying the interruption
+    interrupt_at: t,     # point on the timeline the interruption takes effect,
+                          # normally t_now — not the start of the interval
+)
+```
+
+The portion of the character's interval already resolved before `interrupt_at`
+stands unchanged (§1 — the timeline does not rewind). From `interrupt_at` forward,
+the character is re-invoked with the interrupting information, exactly as if a
+trigger had matched.
+
+`interrupt_intent` is constrained by `absorption` (§3.6): freely available against
+`"alert"` characters for any event within their awareness that the manager judges
+significant; available against `"immersed"` characters only where the cause is a
+direct physical threat to that character specifically, not an event concerning
+someone or something else nearby. `reason` must cite the resolved event that
+justifies the interruption — this is not a narrative-judgment call made from
+nothing, it is a structural response to something that has already happened and
+been recorded.
 
 ## §8 Scene Manager Resolution Calls
 
-Outside of setting `T` and authoring its own intents, the scene manager is invoked
-for two narrow, structural queries:
+Outside of authoring its own intents, deciding publication (§6), and issuing
+interruptions (§7.1), the scene manager is invoked for two narrow, structural
+queries:
 
 - **Perception gate** (§3.3, §4 step 3): observer's relevant skill vs. the matched
   intent's `detection_difficulty`. Only for `"private"`-visibility matches.
@@ -229,22 +373,36 @@ judgments.
 ### §9.1 Character Agent
 
 - Its own active subscriptions and pending intents (bounded and persistent),
-  including those carried from prior cycles, each with an identifier usable in
+  including those carried from prior invocations, each with an identifier usable in
   `cancel_subscription_ids`. Capped in count.
-- The current cycle's horizon `T`.
 - Resolved history since its last invocation, filtered by its awareness (§2). On its
   first invocation in a scene, this includes an awareness snapshot of current
   location/participants rather than only a delta.
-- Any manager-authored intent affecting `[t_now, T]` that falls within its awareness.
+- Any manager-authored intent affecting the current point of resolution that falls
+  within its awareness.
+- If this invocation is the result of `interrupt_intent` (§7.1): the specific
+  interrupting information only — not a full scene re-summary.
+
+A character agent is never given information about what order other characters were
+invoked in, and never given another character's declared intent for the current
+resolution point before that intent has been resolved (§4) and become part of the
+resolved history within this character's awareness.
 
 ### §9.2 Scene Manager
 
 - All participants' active subscriptions and pending intents, unfiltered, with no
-  count cap.
-- The resolved history since the last `T` (unsummarized), plus access to summarized
-  earlier history.
-- The previous cycle's `T` and its outcome — whether an expected trigger matched, or
-  the cycle ran to the default cap with no match — as input to setting the next `T`.
+  count cap, including each character's current `absorption` state.
+- The full accumulated content of the current publication buffer (§6.1) — every
+  question asked and answered, every resolved segment, every intermediate
+  reasoning step since the last published block. Not only the most recent resolved
+  segments — the complete unpublished record. This is what the manager assembles
+  into the next `publish_narrative_block` call, and it must not be lost or
+  implicitly relied upon from raw session history; it is provided as an explicit,
+  structured accumulation for this purpose.
+- The current publication buffer size against the publication threshold (§6.2), and
+  the current session length against the session safety cap (§6.3).
+- The event id of the most recent `publish_narrative_block` call, to determine what
+  portion of the resolved history is unpublished.
 
 ---
 
@@ -266,3 +424,16 @@ derived from `true_intent`.
 Both depend on a reliable compilation step from rule references to structural
 records, and on confirming the `target_type` extension does not require unbounded
 growth of the enum.
+
+A further extension to §5 would generalize the location-based invocation condition
+to account for observable adjacent locations (an alert character on a balcony
+overlooking a courtyard should be invocation-eligible on courtyard activity even
+though they are not co-located with it) rather than exact location match only. Not
+implemented at this stage.
+
+The publication threshold (§6.2) and session safety cap (§6.3) are starting
+assumptions, expected to be recalibrated from observed play — including possibly
+weighting buffer content by number of distinct entities involved, not only by raw
+token length, since a scene with many simultaneous actors may carry more narrative
+weight per token than a single character's uneventful travel. Not implemented at
+this stage.

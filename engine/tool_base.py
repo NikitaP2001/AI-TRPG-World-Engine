@@ -24,18 +24,18 @@ _SCENE = Scene(world=_WORLD)
 
 
 # ---------------------------------------------------------------------------
-# Turn-lock guardrail
+# Cycle-lock guardrail
 # ---------------------------------------------------------------------------
-# After a termination tool finalises a turn, further mutating tool calls
+# After a termination tool finalises a cycle, further mutating tool calls
 # within the same invocation are rejected.
 
-_TURN_LOCKED: bool = False
+_CYCLE_LOCKED: bool = False
 _CONTEXT_CHANGED: bool = False
 
 
-def reset_turn_lock() -> None:
-    global _TURN_LOCKED, _CONTEXT_CHANGED
-    _TURN_LOCKED = False
+def reset_cycle_lock() -> None:
+    global _CYCLE_LOCKED, _CONTEXT_CHANGED
+    _CYCLE_LOCKED = False
     _CONTEXT_CHANGED = False
 
 
@@ -43,8 +43,8 @@ def is_context_changed() -> bool:
     return _CONTEXT_CHANGED
 
 
-def is_turn_locked() -> bool:
-    return _TURN_LOCKED
+def is_cycle_locked() -> bool:
+    return _CYCLE_LOCKED
 
 
 def _signal_context_changed() -> None:
@@ -56,9 +56,9 @@ def _signal_context_changed() -> None:
 signal_context_changed = _signal_context_changed
 
 
-def _require_turn_unlocked() -> None:
-    if _TURN_LOCKED:
-        raise ValueError("Turn already finalised; wait for next user message")
+def _require_cycle_unlocked() -> None:
+    if _CYCLE_LOCKED:
+        raise ValueError("Cycle already finalised; wait for next user message")
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +88,7 @@ def _guard_tool(
         tool_name: Name of the tool being called.
         allowed_tools_fn: Callable returning the list of currently allowed tool
             names.  If ``None`` the permission check is skipped.
-        require_unlocked: If True, also check the turn is not locked.
+        require_unlocked: If True, also check the cycle is not locked.
         extra_hint: Extra text appended to the error message.
 
     Returns:
@@ -113,7 +113,7 @@ def _guard_tool(
 
     if require_unlocked:
         try:
-            _require_turn_unlocked()
+            _require_cycle_unlocked()
         except ValueError as e:
             return _tool_error(str(e))
 

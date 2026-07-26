@@ -26,7 +26,7 @@ from typing import Any, List, Set
 from langchain_core.messages import HumanMessage
 
 # Anchor types maintained for the Storage Assistant.
-SA_ANCHOR_TYPES: tuple = ("locations", "characters", "npcs")
+SA_ANCHOR_TYPES: tuple = ("locations", "players", "npcs")
 
 # Tag prefix shared by all anchor messages.
 _WORLD_SNAPSHOT_PREFIX = "[world_snapshot:"
@@ -132,7 +132,7 @@ def _build_npcs_content(world: Any) -> str:
 def _build_anchor_content(world: Any, anchor_type: str) -> str:
     if anchor_type == "locations":
         return _build_locations_content(world)
-    if anchor_type == "characters":
+    if anchor_type == "players":
         return _build_characters_content(world)
     if anchor_type == "npcs":
         return _build_npcs_content(world)
@@ -186,8 +186,8 @@ def build_gm_world_meta_content(world: Any) -> str:
             pass
         # Include compact player timing info (name + location, not full descriptions).
         try:
-            chars = info.get("characters")
-            if isinstance(chars, list) and chars:
+            chars = world.get_players()
+            if chars:
                 meta["players"] = [
                     {k: v for k, v in c.items() if k in ("name", "location", "last_acted")}
                     for c in chars

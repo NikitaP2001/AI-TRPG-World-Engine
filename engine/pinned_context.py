@@ -141,7 +141,7 @@ class PinnedContext:
         try:
             scene = self._world.get_scene()
             if isinstance(scene, dict) and scene.get("state") == "active":
-                chars = scene.get("characters")
+                chars = scene.get("players")
                 if isinstance(chars, dict):
                     for cname in chars:
                         if not is_character_active_in_scene(self._world, cname):
@@ -172,8 +172,7 @@ class PinnedContext:
         """
         lines: List[str] = []
         try:
-            info = self._world.get_info()
-            for ch in (info.get("characters") if isinstance(info, dict) else []):
+            for ch in self._world.get_players():
                 if not isinstance(ch, dict):
                     continue
                 name = str(ch.get("name") or "").strip()

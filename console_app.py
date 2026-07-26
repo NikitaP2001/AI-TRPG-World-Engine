@@ -1,23 +1,9 @@
-"""Game orchestrator for the LLM World simulation.
+"""Console REPL for the LLM World simulation.
 
-This module orchestrates two LLM agents:
+This module provides the interactive console interface.
+All orchestration logic now lives in engine/orchestrator.py.
 
-1. Game Master (gm/game_master.py):
-    - Narrative agent for world planning, scene descriptions, turn narration
-    - Uses ReAct loop with tools to create/manage world state
-    - Maintains persistent history in game/game_master_messages.json
-
-2. Scene Manager (scene_manager/):
-    - Scene description, character execution, turn narration
-    - Has its own message history and prompt log output
-
-Composed modules:
-  engine/story_tracker.py  — StoryTracker: story progress queries (turns, paragraphs, arc)
-  engine/gm_context.py     — GMContextManager: GM history bootstrap, scene-pick entity injection
-
-Schedule (scheduler/ package):
-  scheduler/core.py  — TickScheduler, Job, Trigger types (TurnCount, ParagraphCount, etc.)
-  scheduler/jobs.py  — Single registry of ALL scheduled tasks (the full schedule at a glance)
+Entry points should import GameOrchestrator from engine.orchestrator.
 """
 
 from __future__ import annotations
@@ -32,370 +18,591 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.messages import AIMessage, HumanMessage
 
-from gm.full_history import gm_max_turns_from_env, load_full_gm_messages, save_full_gm_messages, trim_full_gm_messages
+from gm.full_history import gm_max_cycles_from_env, load_full_gm_messages, save_full_gm_messages, trim_full_gm_messages
 from gm.history_injector import GMHistoryInjector
-from gm.game_master import (
-    GameMaster,
-    parse_game_master_json,
-)
+from gm.game_master import GameMaster, parse_game_master_json
 from world.context import build_game_master_context_block as build_game_master_context, build_game_master_qa_context
-from gm.tools import (
-    reset_turn_lock,
-    is_context_changed,
-    signal_context_changed,
-)
+from gm.tools import reset_cycle_lock, is_context_changed, signal_context_changed
 from gm.injection_models import InjectionProfile, InjectionRule, InjectionEngine
-from gm.injection_builders import (
-    build_world_meta,
-)
-from scheduler import TickScheduler, Job, TurnCount, ParagraphCount, MemoryEntryCount
+from gm.injection_builders import build_world_meta
+from scheduler import TickScheduler, Job, CycleCount, ParagraphCount, MemoryEntryCount
 from scheduler.jobs import register_all_jobs
-from character.agent import run_character_agent, set_scene_manager_for_characters
-from character.reflection import run_reflection
+from player.agent import run_player_agent
+from player.reflection import run_reflection
 from memory_store import HistoryLimits, approx_token_count, limits_from_env, trim_history, load_history
 from backup_storylines import record_turn_snapshot
 from openrouter_langchain_logging import logs_enabled, stream_path
 from stream_watchdog import (
-    InvalidGMOutputError,
-    StreamWatchdog,
-    get_detected_invalid_pattern,
-    clear_detected_invalid_pattern,
-    _clear_watchdog_abort,
-    log_retry_with_correction,
+    InvalidGMOutputError, StreamWatchdog, get_detected_invalid_pattern,
+    clear_detected_invalid_pattern, _clear_watchdog_abort, log_retry_with_correction,
 )
 from bootstrap import initialize_game_dir
-from webui.override_state import OverrideStore
 from scene import Scene
-from world import World, _json_error_snippet
+from world import World, WorldTime, _json_error_snippet
 from world.time import WorldTime
-# scene.context imports removed — auto-advance no longer calls GM for scene picking
-from turn_runner import run_turn
-
+from cycle_runner import run_cycle
 from engine.gm_context import GMContextManager
+from engine.orchestrator import Orchestrator  # ← the real implementation
 from scene_manager import SceneManager
 from world_manager import WorldManager
-
-# Import extracted utilities
 from console_app_utils import (
-    _TURN_RECAPS_FILENAME,
-    _GUI_STREAM_INPUT_LOCK,
-    append_turn_recap,
-    backup_slug,
-    is_invalid_gm_text_output,
-    is_transient_assistant_error_message,
-    strip_tool_error_pairs,
-    log_pseudo_tool_markup_event,
+    _CYCLE_RECAPS_FILENAME, _GUI_STREAM_INPUT_LOCK,
+    append_cycle_recap, backup_slug, is_invalid_gm_text_output,
+    is_transient_assistant_error_message, strip_tool_error_pairs, log_pseudo_tool_markup_event,
 )
 
-class GameOrchestrator:
-    _startup_scene_cleanup_done: bool = False
+# ======================================================================
+# GameOrchestrator — thin delegation wrapper (legacy name kept for compat)
+# ======================================================================
+
+class GameOrchestrator(Orchestrator):
+    """Console REPL orchestrator. Extends Orchestrator with REPL commands.
+
+    All game logic is in engine.orchestrator.Orchestrator.
+    This class only adds the interactive console loop and _cmd_ handlers.
+    """
     _auto_scene_pause: bool = True
 
-    def __init__(self) -> None:
-        self.world = World()
+    # ==================================================================
+    # REPL
+    # ==================================================================
+
+    def run(self) -> int:
+        """Simple console REPL for the game loop.
+
+        Handles user commands in a loop until EOF or 'quit'.
+        """
+        initialize_game_dir()
         self.world.ensure_initialized()
-        if not GameOrchestrator._startup_scene_cleanup_done:
-            self._discard_interrupted_scene_state()
-            GameOrchestrator._startup_scene_cleanup_done = True
 
-        self.limits = limits_from_env()
-        self.max_turns = gm_max_turns_from_env()
-        self._rag_search: Optional[Any] = None
+        print(f"\nLLM World — Console")
+        print(f"Type 'continue' to run one cycle, 'quit' to exit.\n")
 
-        # Game Master (narrative agent) - stores history in game_master_messages.json
-        self.gm_master_history_path = (self.world.game_root / "game_master_messages.json").resolve()
-
-        self._init_plot_injected_this_run: bool = False
-
-        
-        # Game Master (narrative agent) - maintains roleplay identity with persistent history
-        self._game_master = GameMaster(history_path=self.gm_master_history_path)
-        self._gm_injector = GMHistoryInjector(
-            game_master=self._game_master,
-            gm_history_path=self.gm_master_history_path,
-            history_limits=self.limits,
-        )
-        self._gm_ctx = GMContextManager(gm_injector=self._gm_injector, world=self.world)
-        
-        # Set up Game Master for character Q&A
-        set_scene_manager_for_characters(self._sm)
-
-        # Paragraph summarization handled by SM (run_summary_task) via scheduler
-
-        # ── Composed modules ──────────────────────────────────────────
-        from engine.story_tracker import StoryTracker
-
-        self._story_tracker = StoryTracker(
-            story_json_path=self.world.paths.story_json,
-        )
-
-
-
-        self._sm = SceneManager(
-            history_path=(self.world.game_root / "scene_manager_messages.json").resolve(),
-        )
-
-        # ── World Manager (highest-level agent) ──────────────────────
-        self._wm = WorldManager(
-            history_path=self.gm_master_history_path,
-        )
-        # Check if setting exists (no LLM call during startup).
-        # Actual creation is deferred to _maybe_create_world_setting() called from run_turn.
-        self._world_setting_ready = bool(self._wm.load_world_setting())
-
-
-        # ── Injection engines (profile-based, ready for multi-agent expansion) ──
-        # Each agent type gets its own InjectionProfile and InjectionEngine.
-        # The existing HistoryInjector instances (^ above) still handle current
-        # injection logic. The engines below are additive — they can be used
-        # alongside or as a replacement in future refactors.
-        self._engines: Dict[str, InjectionEngine] = {}
-
-        # GM engine — mirrors the injections done by self._gm_injector
-        _gm_loader = lambda: trim_history(load_history(self.gm_master_history_path), limits=self.limits)
-        self._engines["gm"] = InjectionEngine(
-            profile=InjectionProfile("game_master", [
-                InjectionRule("[world_snapshot:world_meta]", build_world_meta, scope="world", priority=100),
-            ]),
-            history_loader=_gm_loader,
-            delta_injector=self._game_master.inject_delta,
-        )
-
-
-        # ── Unified job scheduler ──
-        self._scheduler = TickScheduler(
-            state_path=self.world.game_root / "world" / "scheduler_state.json",
-        )
-
-        # Register periodic jobs.
-        self._register_scheduled_jobs()
-
-        # Live streaming: always write to logs/stream.txt; optionally echo to console.
-        raw_stream = os.getenv("LLM_WORLD_STREAM_ECHO")
-        if raw_stream is None or not raw_stream.strip():
-            # Default: stream echo ON (still optional to toggle via /stream).
-            self.stream_echo = True
-        else:
-            self.stream_echo = raw_stream.strip().lower() in {"1", "true", "yes", "y", "on"}
-        self._apply_stream_env()
-
-    def _apply_stream_env(self) -> None:
-        os.environ["LLM_WORLD_STREAM_ECHO"] = "1" if self.stream_echo else "0"
-
-    def _maybe_create_world_setting(self) -> bool:
-        """Create the world setting block on-demand (called from run_turn, not startup).
-        Returns True if setting is ready, False if creation failed (will retry later).
-        """
-        if self._world_setting_ready:
-            return True
-        try:
-            # Gather characters + plot info
-            characters = []
-            try:
-                info = self.world.get_info()
-                raw_chars = info.get("characters") if isinstance(info, dict) else []
-                if isinstance(raw_chars, list):
-                    for c in raw_chars:
-                        if isinstance(c, dict):
-                            name = str(c.get("name") or "").strip()
-                            if name:
-                                desc = {}
-                                try:
-                                    desc = self.world.get_character_description(name)
-                                except Exception:
-                                    pass
-                                if isinstance(desc, dict):
-                                    characters.append(desc)
-            except Exception:
-                pass
-
-            plot = {}
-            try:
-                from init.plot import load_plot
-                plot = load_plot()
-            except Exception:
-                pass
-
-            setting = self._wm.create_world_setting(
-                characters=characters,
-                plot=plot,
-            )
-            if setting:
-                self._wm.save_world_setting(setting)
-                self._world_setting_ready = True
-                if logs_enabled():
-                    print(f"[trace] World setting created")
-                return True
-            else:
-                if logs_enabled():
-                    print("[trace] World setting creation returned empty — blocking turn")
-                return False
-        except Exception as e:
-            if logs_enabled():
-                print(f"[trace] World setting creation error: {e} — blocking turn")
-            return False
-
-    # ======================================================================
-    # Job scheduler
-    # ======================================================================
-
-    def _register_scheduled_jobs(self) -> None:
-        """Register all periodic jobs via the single registry in scheduler/jobs.py."""
-        register_all_jobs(self._scheduler, self)
-
-    def _run_character_reflection(self, character_name: str) -> None:
-        """Run reflection for one character (scheduler job callback)."""
-        try:
-            from character.reflection import run_reflection
-            try:
-                char_desc = self.world.get_character_description(character_name)
-            except Exception:
-                char_desc = {}
-            run_reflection(character_name=character_name, character_description=char_desc)
-        except Exception as e:
-            import logging
-            logging.exception(f"[scheduler] reflection failed for {character_name}: {e}")
-            raise
-
-    def _run_character_diary(self, character_name: str) -> None:
-        """Run diary for one character (scheduler job callback)."""
-        try:
-            from character.reflection import run_diary
-            run_diary(character_name=character_name)
-        except Exception as e:
-            import logging
-            logging.exception(f"[scheduler] diary failed for {character_name}: {e}")
-            raise
-
-    def _run_character_review(self, character_name: str) -> None:
-        """Run relationship review for one character (scheduler job callback)."""
-        try:
-            from character.relationship_review import run_relationship_review
-            run_relationship_review(
-                character_name=character_name,
-                world=self.world,
-            )
-        except Exception as e:
-            import logging
-            logging.exception(f"[scheduler] review failed for {character_name}: {e}")
-            raise
-
-    def story_progress_and_last_text(self) -> Tuple[int, int, str]:
-        """Return (turns_in_ongoing_paragraph, finalized_paragraphs, last_narration_text)."""
-        return self._story_tracker.full_progress()
-
-    def _scheduler_tick(self) -> None:
-        """Call scheduler.tick() with current game counters."""
-        try:
-            turns, paras, _ = self.story_progress_and_last_text()
-        except Exception:
-            turns, paras = 0, 0
+        from console_app_utils import _GUI_STREAM_INPUT_LOCK, _CYCLE_RECAPS_FILENAME
 
         try:
-            char_names = self.world.list_character_names()
-        except Exception:
-            char_names = []
-
-        self._scheduler.tick(
-            turn_count=turns,
-            paragraph_count=paras,
-            world=self.world,
-            character_names=char_names,
-        )
-
-    # ── Command dispatch (for webui and console) ─────────────────
-
-    def _dispatch_user_input(self, user_text: str, debug_trace: bool = False) -> Optional[str]:
-        """Parse and execute a user command or turn input.
-
-        Handles slash commands:
-          /generate [seed=N] [review]  — finalize world generation (disabled on this branch)
-          /advance N[d|h|m]           — advance simulation (disabled on this branch)
-
-        Non-command text is treated as a turn input (calls run_turn).
-
-        Args:
-            user_text: Raw user input string.
-            debug_trace: If True, print debug info.
-
-        Returns:
-            Optional response text (None for commands that produce no output).
-        """
-        text = user_text.strip()
-        if not text:
-            return None
-
-        # ── Slash commands ────────────────────────────────────────
-        if text.startswith("/"):
-            parts = text[1:].split()
-            cmd = parts[0].lower()
-            args = parts[1:]
-
-            if cmd == "generate":
-                return self._cmd_generate(args, debug_trace)
-            elif cmd == "advance":
-                return self._cmd_advance(args, debug_trace)
-            else:
-                return f"Unknown command: /{cmd}"
-
-        # ── Regular turn input ────────────────────────────────────
-        from turn_runner import run_turn
-        from langchain_core.messages import HumanMessage
-        run_turn(self, HumanMessage(content=text))
-
-        # ── Process scheduled agent invocations ───────────────────
-        from scheduler_queue import pop_due_invocations as _pop_scheduled
-        world_tick = 0
-        try:
-            from world import WorldTime
-            wt = self.world.get_world_time()
-            if wt:
-                parsed = WorldTime.parse(str(wt))
-                world_tick = parsed.to_seconds()  # approximate
+            self._scheduler.start()
         except Exception:
             pass
-        due = _pop_scheduled(world_tick)
-        for inv in due:
-            agent = str(inv.get("agent", "")).strip().lower()
-            comment = str(inv.get("comment", "")).strip()
-            if logs_enabled():
-                print(f"[scheduler] due: agent={agent} comment={comment}")
-            if agent == "wm":
-                self._wm.call_wm(notice=comment or "scheduled")
-            elif agent == "gm":
-                self._game_master.call_gm(notice=comment or "scheduled")
-            elif agent == "sm":
-                self._scene_manager.run_sm_scene(notice=comment or "scheduled")
-        return None
+
+        while True:
+            try:
+                raw = input("> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+
+            if not raw:
+                continue
+
+            args = raw.split()
+            cmd = args[0].lower()
+
+            # ── Quit ──
+            if cmd in ("quit", "exit", "q"):
+                break
+
+            # ── Help ──
+            elif cmd in ("help", "h", "?"):
+                self._cmd_help()
+
+            # ── Continue (run one cycle) ──
+            elif cmd in ("continue", "c", ""):
+                self._cmd_continue(args[1:])
+
+            # ── Advance ──
+            elif cmd == "advance":
+                result = self._cmd_advance(args[1:])
+                if result:
+                    print(result[:2000])
+
+            # ── Generate world ──
+            elif cmd == "generate":
+                result = self._cmd_generate(args[1:])
+                if result:
+                    print(result[:2000])
+
+            # ── Save/load ──
+            elif cmd == "save":
+                self._cmd_save(args[1:] if len(args) > 1 else None)
+            elif cmd == "load":
+                path = args[1] if len(args) > 1 else None
+                if path:
+                    self._cmd_load(path)
+                else:
+                    print("Usage: load <path>")
+
+            # ── Presets ──
+            elif cmd == "presets":
+                self._cmd_list_presets()
+            elif cmd == "load_preset" or cmd == "preset":
+                self._cmd_load_preset(args[1] if len(args) > 1 else "")
+
+            # ── Stream echo toggle ──
+            elif cmd == "stream":
+                self.stream_echo = not self.stream_echo
+                self._apply_stream_env()
+                print(f"Stream echo: {'ON' if self.stream_echo else 'OFF'}")
+
+            # ── Debug ──
+            elif cmd == "debug":
+                debug_mode = args[1].lower() in ("on", "1", "true") if len(args) > 1 else True
+                os.environ["LLM_WORLD_DEBUG"] = "1" if debug_mode else "0"
+                print(f"Debug mode: {'ON' if debug_mode else 'OFF'}")
+
+            elif cmd == "rag":
+                query = " ".join(args[1:])
+                if not self._rag_search:
+                    print("RAG search not available")
+                    continue
+                try:
+                    results = self._rag_search(query)
+                    print(f"RAG results: {results[:2000] if results else '(none)'}")
+                except Exception as e:
+                    print(f"RAG error: {e}")
+
+            # ── Unknown ──
+            else:
+                print(f"Unknown command: {cmd}. Type 'help' for commands.")
+        return 0
+
+    # ==================================================================
+    # Command handlers
+    # ==================================================================
+
+    def _cmd_help(self) -> None:
+        print("""
+Commands:
+  continue, c       Run one cycle
+  advance <years>   Advance world time
+  generate          Generate world
+  load_preset <n>   Load preset
+  presets           List presets
+  save <name>       Save game
+  load <path>       Load game
+  stream            Toggle stream echo
+  debug on/off      Toggle debug mode
+  help, h           Show this help
+  quit, q           Exit
+        """.strip())
+
+    def _cmd_continue(self, args: List[str]) -> None:
+        """Run one cycle."""
+        cycle_count = 0
+        max_cycles = 1
+        if args:
+            try:
+                max_cycles = max(1, int(args[0]))
+            except ValueError:
+                pass
+
+        while cycle_count < max_cycles:
+            try:
+                run_cycle(self, None)
+                cycle_count += 1
+            except InvalidGMOutputError as e:
+                print(f"\n  ⚠ GM output rejected ({e}). Retrying...\n")
+                continue
+            except KeyboardInterrupt:
+                print("\n  ⏹ Interrupted.")
+                break
+            except Exception as e:
+                print(f"\n  ✗ Error: {e}")
+                import traceback
+                traceback.print_exc()
+                break
 
     def _cmd_generate(self, args: list, debug: bool = False) -> str:
-        """Handle /generate command — simulation stripped from this branch."""
-        return "World generation not available on this branch (simulation removed)."
-
-        return "\n".join(lines)
+        """Generate the world using the WM generator pipeline."""
+        from world_manager.tools import finalize_world_generation
+        review_only = "-r" in args or "--review" in args
+        try:
+            result = finalize_world_generation.invoke({
+                "review_only": review_only,
+            })
+            return json.dumps(result, ensure_ascii=False, indent=2) if isinstance(result, dict) else str(result)
+        except Exception as e:
+            return f"Generation error: {e}"
 
     def _cmd_advance(self, args: list, debug: bool = False) -> str:
-        """Handle /advance command — simulation removed from this branch."""
-        return "Simulation not available on this branch."
-
-    # ── Session state (for webui) ─────────────────────────────────
-
-    def _load_session_state(self, show_history_stats: bool = True) -> None:
-        """Load/resume GM history from disk. Called by webui before dispatch."""
-        _ = show_history_stats  # placeholder for future stats display
-        # GM history is loaded lazily by GameMaster on first use.
-
-    def _progress_snapshot(self) -> dict:
-        """Return current game progress snapshot for webui."""
+        """Advance the world simulation by the specified duration."""
+        years_str = args[0] if args else "1"
         try:
-            turns, paras, last_text = self.story_progress_and_last_text()
-        except Exception:
-            turns, paras, last_text = 0, 0, ""
+            years = float(years_str)
+        except ValueError:
+            return f"Invalid years: {years_str}"
+        try:
+            from world_manager.entity_core import tick as engine_tick
+            engine_tick(years=years)
+            return f"Advanced {years} years"
+        except Exception as e:
+            return f"Advance error: {e}"
 
-        return {
-            "turns": turns,
-            "paragraphs": paras,
-            "last_narration": last_text[:200] if last_text else "",
-            "world_setting_ready": self._world_setting_ready,
-        }
+    def _cmd_save(self, name: Optional[str] = None) -> None:
+        if not name:
+            name = datetime.now(timezone.utc).strftime("save_%Y%m%d_%H%M%S")
+        save_dir = self.world.game_root.parent / "saves" / name
+        save_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(str(self.world.game_root), str(save_dir / "game"), dirs_exist_ok=True)
+        print(f"Saved to {save_dir}")
 
+    def _cmd_load(self, path: str) -> None:
+        from world.io import read_json, write_json
+        src = Path(path)
+        if not src.exists():
+            print(f"Save not found: {path}")
+            return
+        game_src = src / "game" if src.name != "game" else src
+        if not game_src.exists():
+            print(f"No game data in {path}")
+            return
+        shutil.rmtree(str(self.world.game_root))
+        shutil.copytree(str(game_src), str(self.world.game_root), dirs_exist_ok=True)
+        info_path = self.world.paths.info_json
+        if info_path.exists():
+            try:
+                info = read_json(info_path)
+                if isinstance(info, dict):
+                    wt = info.get("time", "")
+                    if wt:
+                        print(f"Loaded: time={wt}, last_location={info.get('last_location', '?')}")
+            except Exception:
+                pass
+        print(f"Loaded from {path}")
+
+    def _cmd_list_presets(self) -> None:
+        from world.io import read_json
+        preset_dir = self.world.game_root / "setups"
+        json_files = sorted(preset_dir.glob("*.json"))
+        dirs = sorted(preset_dir.glob("*/"))
+        all_presets = [d.name for d in dirs] + [f.stem for f in json_files if f.is_file()]
+        if all_presets:
+            print("Available presets:")
+            for name in all_presets:
+                print(f"  {name}")
+        else:
+            print("No presets found.")
+
+    def _cmd_load_preset(self, name: str) -> None:
+        """Load a preset — delegates to orchestrator."""
+        if not name:
+            self._cmd_list_presets()
+            return
+        super().load_preset(name)
+
+    # ==================================================================
+    # Delegation methods (for backward compat with turn_runner / tests)
+    # ==================================================================
+
+    def _bootstrap_next_scene(self) -> bool:
+        return self.bootstrap_scene()
+
+    def _finalize_cycle_if_ready(self) -> bool:
+        return self.finalize_cycle()
+
+    def _maybe_create_world_setting(self) -> bool:
+        return self.ensure_world_setting()
+
+
+# ======================================================================
+# Standalone function for finalize logic
+# (called from orchestrator.py's finalize_cycle during migration)
+# ======================================================================
+
+def _finalize_cycle_logic(orch: Orchestrator) -> bool:
+    """Run the full resolution cycle — used by Orchestrator.finalize_cycle()."""
+    scene = orch.world.get_scene()
+    if not isinstance(scene, dict) or scene.get("state") != "active":
+        return False
+
+    chars = scene.get("players") or {}
+    if not chars:
+        return False
+
+    all_acted = all((v or {}).get("acted") is True for v in chars.values())
+    if not all_acted:
+        return False
+
+    location = str(scene.get("location") or "")
+    start_time = str(scene.get("start_time") or "")
+    npcs = scene.get("npcs") or []
+
+    def _char_plans_from(chars_map):
+        out = []
+        for name, entry in chars_map.items():
+            e = entry if isinstance(entry, dict) else {}
+            out.append({
+                "name": name,
+                "intent": str(e.get("last_decision") or "").strip() or "(no decision)",
+                "thoughts": str(e.get("last_thoughts") or "").strip(),
+            })
+        return out
+
+    char_plans = _char_plans_from(chars)
+    all_intents = scene.get("declared_intents") or []
+
+    payload = {
+        "character_plans": char_plans,
+        "location": location,
+        "cycle_start_time": start_time,
+        "npcs": npcs,
+        "declared_intents": all_intents,
+    }
+    context_text = f"Location: {location}\nTime: {start_time}\nCharacters: {[p['name'] for p in char_plans]}"
+
+    if logs_enabled():
+        print(f"[cycle] Resolving cycle at {location} with {len(char_plans)} characters")
+
+    from scheduler.timeline import (
+        Intent, SegmentScheduler, parse_duration_seconds, format_resolved_history_for_sm,
+    )
+    from world.time import WorldTime as _WT
+
+    try:
+        start_sec = _WT.parse(start_time).to_seconds()
+    except Exception:
+        start_sec = orch.world.get_world_time().to_seconds()
+
+    timeline_store = orch.world.get_timeline()
+    carried_dicts = timeline_store.get("intents") or []
+    cursor = max(start_sec, int(timeline_store.get("cursor") or 0))
+
+    DEFAULT_HORIZON_SECONDS = 900
+    MAX_RESOLUTION_ROUNDS = 10
+    all_actors = list(chars.keys()) + [str(n) for n in npcs if str(n).strip()]
+
+    def _awareness_fn(observer, subject):
+        return True
+
+    def _dict_to_intent(d, *, anchor_sec=0):
+        if not isinstance(d, dict) or not str(d.get("actor") or "").strip():
+            return None
+        if "_t_start_raw" in d or "_duration_raw" in d:
+            d = dict(d)
+            t_start = anchor_sec + parse_duration_seconds(d.pop("_t_start_raw", "0s"), default=0)
+            duration_raw = d.pop("_duration_raw", "")
+            t_end = None if not duration_raw else t_start + max(0, parse_duration_seconds(duration_raw, default=0))
+            d["t_start"] = t_start
+            d["t_end"] = t_end
+        return Intent.from_dict(d)
+
+    intents_pool = []
+    for d in carried_dicts:
+        i = _dict_to_intent(d, anchor_sec=cursor)
+        if i is not None and i.status == "active":
+            intents_pool.append(i)
+    for d in all_intents:
+        i = _dict_to_intent(d, anchor_sec=start_sec)
+        if i is not None:
+            intents_pool.append(i)
+
+    horizon = cursor + DEFAULT_HORIZON_SECONDS
+    seen_action_ids = set()
+    cycle_resolved_history = []
+    npc_trigger_notes = []
+    round_num = 0
+    char_reinvokes = {}
+
+    while round_num < MAX_RESOLUTION_ROUNDS:
+        round_num += 1
+        sched = SegmentScheduler(
+            intents_pool, now=cursor, horizon=horizon,
+            perception_gate=orch._sm.perception_check,
+            awareness_fn=_awareness_fn, all_actors=all_actors,
+            seen_action_ids=seen_action_ids,
+        )
+        result = sched.run()
+        cycle_resolved_history.extend(result.resolved_history)
+        seen_action_ids.update(e.intent_id for e in result.resolved_history if e.kind == "action" and e.intent_id)
+        for w in result.warnings:
+            if logs_enabled():
+                print(f"[trace] schema warning: {w}")
+
+        intents_pool = result.carry_over_intents
+        cursor = result.next_cursor
+
+        char_reinvokes = {a: notes for a, notes in result.reinvoke.items() if a in chars}
+        npc_reinvokes = {a: notes for a, notes in result.reinvoke.items() if a not in chars}
+        for a, notes in npc_reinvokes.items():
+            npc_trigger_notes.extend(f"{a}: {n}" for n in notes)
+
+        if not char_reinvokes:
+            break
+
+        if logs_enabled():
+            print(f"[cycle] Resolution round {round_num}: reinvoking {sorted(char_reinvokes)}")
+
+        reinvoke_time_str = _WT.from_seconds(cursor).to_string()
+        newly_declared_before = list(orch.world.get_scene().get("declared_intents") or [])
+
+        for cname, notes in char_reinvokes.items():
+            combined_ctx = "\n".join(f"- {n}" for n in notes) or "New information available."
+            try:
+                from cycle_runner import _run_single_player
+                scene_now = orch.world.get_scene()
+                _run_single_player(
+                    app=orch, player_name=cname, scene_data=scene_now,
+                    location=location, start_time=start_time,
+                    npcs=npcs, players=list(chars.keys()),
+                    gm_notice=combined_ctx,
+                    world_time_override=reinvoke_time_str,
+                )
+            except Exception as e:
+                print(f"  ✗ Re-invoke error for {cname}: {e}")
+
+        scene = orch.world.get_scene()
+        chars = scene.get("players") or chars
+        newly_declared_after = list(scene.get("declared_intents") or [])
+        fresh = newly_declared_after[len(newly_declared_before):]
+        for d in fresh:
+            i = _dict_to_intent(d, anchor_sec=cursor)
+            if i is not None:
+                intents_pool.append(i)
+
+    if round_num >= MAX_RESOLUTION_ROUNDS:
+        raise RuntimeError(
+            f"SegmentScheduler: exhausted {MAX_RESOLUTION_ROUNDS} resolution rounds "
+            f"at {location} — infinite reinvoke loop detected"
+        )
+
+    # ── Push resolved segments to cycle context buffer ──
+    if cycle_resolved_history:
+        orch._sm.add_resolved_segments_to_buffer(cycle_resolved_history)
+
+    # ── Check buffer: ready to publish? ──
+    buffer_ready = orch._sm.is_session_buffer_ready() or orch._sm.is_session_buffer_force()
+
+    # ── STRUCTURAL PAUSE (no content, or not enough buffer yet) ──
+    if not cycle_resolved_history and not char_reinvokes and not npc_trigger_notes:
+        new_cursor = cursor + DEFAULT_HORIZON_SECONDS
+        try:
+            orch.world.set_timeline({
+                "intents": [i.to_dict() for i in intents_pool],
+                "resolved_history": timeline_store.get("resolved_history", []),
+                "cursor": new_cursor,
+                "horizon": new_cursor + DEFAULT_HORIZON_SECONDS,
+            })
+        except Exception as e:
+            if logs_enabled():
+                print(f"[trace] timeline persistence error: {e}")
+        if logs_enabled():
+            print(f"[cycle] Structural pause — T jumped +{DEFAULT_HORIZON_SECONDS}s to {new_cursor}")
+        return True
+
+    # Buffer not full yet — keep accumulating, jump T forward
+    if not buffer_ready:
+        new_cursor = cursor + DEFAULT_HORIZON_SECONDS
+        try:
+            orch.world.set_timeline({
+                "intents": [i.to_dict() for i in intents_pool],
+                "resolved_history": (timeline_store.get("resolved_history", []) +
+                                     [e.to_dict() for e in cycle_resolved_history])[-500:],
+                "cursor": new_cursor,
+                "horizon": new_cursor + DEFAULT_HORIZON_SECONDS,
+            })
+        except Exception as e:
+            if logs_enabled():
+                print(f"[trace] timeline persistence error: {e}")
+        if logs_enabled():
+            print(f"[cycle] Buffer at {orch._sm.session_buffer_chars()} chars — not yet ready, structural pause")
+        return True
+
+    # ── PERSIST TIMELINE ──
+    try:
+        prior_history = timeline_store.get("resolved_history") or []
+        merged_history = (prior_history + [e.to_dict() for e in cycle_resolved_history])[-500:]
+        orch.world.set_timeline({
+            "intents": [i.to_dict() for i in intents_pool],
+            "resolved_history": merged_history,
+            "cursor": cursor,
+            "horizon": horizon,
+        })
+    except Exception as e:
+        if logs_enabled():
+            print(f"[trace] timeline persistence error: {e}")
+
+    char_plans = _char_plans_from(chars)
+    payload["character_plans"] = char_plans
+    # Scene-declared intents + carry-over intents from timeline
+    scene_intents = list(orch.world.get_scene().get("declared_intents") or [])
+    carry_over = timeline_store.get("intents") or []
+    active_carry = [i for i in carry_over if isinstance(i, dict) and str(i.get("status") or "active") == "active"]
+    payload["declared_intents"] = scene_intents + active_carry
+    timeline_text = format_resolved_history_for_sm(cycle_resolved_history, start_sec)
+    if npc_trigger_notes:
+        timeline_text += "\n\nNPC/world triggers:\n" + "\n".join(f"  - {n}" for n in npc_trigger_notes)
+    payload["timeline_text"] = timeline_text
+
+    # ── SM NARRATION ──
+    narration_result = orch._sm.run_narration(payload=payload, context_text=context_text)
+
+    # Clear cycle context buffer after publication
+    orch._sm.clear_session_context_buffer()
+
+    # ── Persist per-player personal narration ──
+    personal_narratives = narration_result.get("personal_narration", {})
+    if personal_narratives:
+        from memory_store import append_message, limits_from_env
+        limits = limits_from_env()
+        for pname, pnarr in personal_narratives.items():
+            if not pnarr.strip():
+                continue
+            pdir = orch.world.game_root / "players" / pname
+            pdir.mkdir(parents=True, exist_ok=True)
+            pfile = pdir / "messages.json"
+            append_message(pfile, role="assistant", content=pnarr.strip(), limits=limits)
+
+    narration_type = str(narration_result.get("type") or "").strip()
+    if narration_type == "correction":
+        print(f"  📞 SM correction: {narration_result.get('turn_insight', '')[:100]}")
+        return False
+
+    if narration_type == "end_scene":
+        reason = str(narration_result.get("reason") or "").strip()
+        end_narration = str(narration_result.get("narration") or "").strip()
+        end_duration = str(narration_result.get("duration") or "").strip()
+        next_location_hint = str(narration_result.get("next_location") or "").strip()
+        if logs_enabled():
+            print(f"[cycle] Scene ended: {reason}")
+        if end_narration:
+            print(f"\n{'='*60}\n📖 SCENE END\n{'='*60}\n{end_narration}\n{'='*60}\n")
+        if next_location_hint:
+            try:
+                info = orch.world.get_info()
+                info["next_scene_hint"] = next_location_hint
+                from world.io import write_json
+                write_json(orch.world.paths.info_json, info)
+            except Exception:
+                pass
+        if end_duration:
+            try:
+                orch._scene.end_with_gm_output(
+                    narration=end_narration, location=location,
+                    cycle_duration=end_duration, keep_scene=False,
+                )
+            except ValueError:
+                pass
+        else:
+            orch.world.clear_scene()
+        return True
+
+    narration = str(narration_result.get("narration") or "").strip()
+    duration = str(narration_result.get("duration") or "").strip()
+    if not duration:
+        raise ValueError("SM narration returned no duration.")
+
+    if narration:
+        print(f"\n{'='*60}\n📖 CYCLE NARRATION\n{'='*60}\n{narration}\n{'='*60}\n")
+
+    try:
+        orch._scene.end_with_gm_output(
+            narration=narration, location=location,
+            cycle_duration=duration, keep_scene=True,
+        )
+        if logs_enabled():
+            print(f"[cycle] Cycle finalized: {location}, duration={duration}, scene active")
+        return True
+    except ValueError as e:
+        if logs_enabled():
+            print(f"[cycle] Error finalizing cycle: {e}")
+        return False

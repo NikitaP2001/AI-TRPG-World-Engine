@@ -48,8 +48,8 @@ def build_world_meta(world: Any, **kwargs: Any) -> str:
         except Exception:
             pass
         try:
-            chars = info.get("characters")
-            if isinstance(chars, list) and chars:
+            chars = world.get_players()
+            if chars:
                 meta["players"] = [
                     {k: v for k, v in c.items() if k in ("name", "location", "last_acted")}
                     for c in chars
@@ -249,7 +249,7 @@ def build_story_summaries(world: Any, **kwargs: Any) -> str:
             if not pname or not psummary or pname == "Summary":
                 continue
             plocs = para.get("locations") if isinstance(para.get("locations"), list) else []
-            pchars = para.get("characters") if isinstance(para.get("characters"), list) else []
+            pchars = para.get("players") if isinstance(para.get("players"), list) else []
             pnpcs = para.get("npcs") if isinstance(para.get("npcs"), list) else []
             pstart = str(para.get("start_time") or "").strip()
             pend = str(para.get("end_time") or "").strip()
@@ -265,7 +265,7 @@ def build_story_summaries(world: Any, **kwargs: Any) -> str:
         asummary = str(arc.get("summary") or "").strip()
         if aname and asummary:
             alocs = arc.get("locations") if isinstance(arc.get("locations"), list) else []
-            achars = arc.get("characters") if isinstance(arc.get("characters"), list) else []
+            achars = arc.get("players") if isinstance(arc.get("players"), list) else []
             anpcs = arc.get("npcs") if isinstance(arc.get("npcs"), list) else []
             astart = str(arc.get("start_time") or "").strip()
             aend = str(arc.get("end_time") or "").strip()

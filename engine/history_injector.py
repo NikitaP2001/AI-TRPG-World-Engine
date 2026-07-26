@@ -160,7 +160,7 @@ class HistoryInjector:
                 para_start_time = str(para.get("start_time") or "").strip()
                 para_end_time = str(para.get("end_time") or "").strip()
                 locations = para.get("locations") if isinstance(para.get("locations"), list) else []
-                characters = para.get("characters") if isinstance(para.get("characters"), list) else []
+                characters = para.get("players") if isinstance(para.get("players"), list) else []
                 npcs = para.get("npcs") if isinstance(para.get("npcs"), list) else []
 
                 loc_common = self._location_common_top_level(world, locations)
@@ -190,7 +190,7 @@ class HistoryInjector:
             arc_start_time = str(arc.get("start_time") or "").strip()
             arc_end_time = str(arc.get("end_time") or "").strip()
             arc_locs = arc.get("locations") if isinstance(arc.get("locations"), list) else []
-            arc_chars = arc.get("characters") if isinstance(arc.get("characters"), list) else []
+            arc_chars = arc.get("players") if isinstance(arc.get("players"), list) else []
             arc_npcs = arc.get("npcs") if isinstance(arc.get("npcs"), list) else []
 
             parts = [f'Arc finalized: "{arc_name}"']

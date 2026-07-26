@@ -57,7 +57,7 @@ def _game_root() -> Path:
 
 
 def _character_dir(name: str) -> Path:
-    return _game_root() / "characters" / name
+    return _game_root() / "players" / name
 
 
 def _append_jsonl(path: Path, row: Dict[str, Any]) -> None:
@@ -476,20 +476,19 @@ def load_relationships(character_name: str) -> List[Dict[str, str]]:
 
 
 def _get_known_entity_names() -> set:
-    """Return lowercase names of all known characters and NPCs from world storage."""
-    game_root = _game_root()
+    """Return lowercase names of all known characters and NPCs from entity store."""
     known: set = set()
     try:
-        info = _read_json(game_root / "world" / "info.json") or {}
-        for entry in (info.get("characters") or []):
-            if isinstance(entry, dict):
-                n = str(entry.get("name") or "").strip()
-                if n:
-                    known.add(n.lower())
+        from world_manager.entity_core import _get_backend
+        backend = _get_backend()
+        for e in backend.query(type_filter="character", include_templates=False, limit=100):
+            n = str(e.get("id") or "").strip()
+            if n:
+                known.add(n.lower())
     except Exception:
         pass
     try:
-        npc_data = _read_json(game_root / "world" / "npc.json") or {}
+        npc_data = _read_json(_game_root() / "world" / "npc.json") or {}
         if isinstance(npc_data, dict):
             for k in npc_data:
                 if k:
@@ -578,17 +577,20 @@ def _get_relevant_relationships(character_name: str) -> List[Dict[str, str]]:
 
     # Step 2: who is currently at those locations (characters + NPCs).
     game_root = _game_root()
-    info = _read_json(game_root / "world" / "info.json") or {}
     npc_data = _read_json(game_root / "world" / "npc.json") or {}
-
     present_keys: set = set()
-    for char_entry in (info.get("characters") or []):
-        if not isinstance(char_entry, dict):
-            continue
-        name = str(char_entry.get("name") or "").strip()
-        loc = str(char_entry.get("location") or "").strip()
-        if name and loc in recent_locs:
-            present_keys.add(name.lower())
+
+    try:
+        from world_manager.entity_core import _get_backend
+        backend = _get_backend()
+        for e in backend.query(type_filter="character", include_templates=False, limit=100):
+            name = str(e.get("id") or "").strip()
+            pos = e.get("position", {}) or {}
+            loc = str(pos.get("inside", pos.get("near", ""))).strip()
+            if name and loc in recent_locs:
+                present_keys.add(name.lower())
+    except Exception:
+        pass
 
     if isinstance(npc_data, dict):
         for npc_name, npc_info in npc_data.items():
@@ -627,19 +629,22 @@ def _get_recently_met_names(character_name: str, exclude_name: str = "") -> List
         return []
 
     game_root = _game_root()
-    info = _read_json(game_root / "world" / "info.json") or {}
     npc_data = _read_json(game_root / "world" / "npc.json") or {}
 
     names: List[str] = []
     exclude_lower = str(exclude_name or "").strip().lower()
 
-    for char_entry in (info.get("characters") or []):
-        if not isinstance(char_entry, dict):
-            continue
-        name = str(char_entry.get("name") or "").strip()
-        loc = str(char_entry.get("location") or "").strip()
-        if name and loc in recent_locs and name.lower() != exclude_lower:
-            names.append(name)
+    try:
+        from world_manager.entity_core import _get_backend
+        backend = _get_backend()
+        for e in backend.query(type_filter="character", include_templates=False, limit=100):
+            name = str(e.get("id") or "").strip()
+            pos = e.get("position", {}) or {}
+            loc = str(pos.get("inside", pos.get("near", ""))).strip()
+            if name and loc in recent_locs and name.lower() != exclude_lower:
+                names.append(name)
+    except Exception:
+        pass
 
     if isinstance(npc_data, dict):
         for npc_name, npc_info in npc_data.items():
@@ -705,7 +710,7 @@ def run_reflection(
     # 6. Build messages: core prompt as system, then character history for tone continuity,
     #    then the reflection task as a human message
     workspace_root = Path(__file__).resolve().parent.parent
-    history_path = (workspace_root / "game" / "characters" / character_name / "messages.json").resolve()
+    history_path = (workspace_root / "game" / "players" / character_name / "messages.json").resolve()
 
     def _history_to_messages(history):
         from langchain_core.messages import AIMessage
@@ -1201,5 +1206,5 @@ def run_diary(character_name: str) -> None:
     Called by the scheduler (char_diary jobs).
     """
     workspace_root = Path(__file__).resolve().parent.parent
-    messages_path = (workspace_root / "game" / "characters" / character_name / "messages.json").resolve()
+    messages_path = (workspace_root / "game" / "players" / character_name / "messages.json").resolve()
     _run_diary_summary(character_name=character_name, messages_path=messages_path)

@@ -441,6 +441,9 @@ class WorldManager:
 
         all_tools = tools or ToolRegistry.for_wm()
 
+        from world_manager.tool_registry import reset_doc_read_tracker, clear_current_agent
+        reset_doc_read_tracker("wm")
+
         tools_by_name = {t.name: t for t in all_tools}
         llm_with_tools = llm.bind_tools(all_tools).with_config({
             "callbacks": openrouter_logging_callbacks(scope="world_manager", label="call_wm"),
@@ -628,6 +631,8 @@ class WorldManager:
                         self._history_path, role="assistant",
                         content=f"[correction] {msg[:200]}", limits=limits,
                     )
+
+        clear_current_agent()
 
         # ── Update last_call_tick ───────────────────────────────────
         if context and context.get("current_tick"):

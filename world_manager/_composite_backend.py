@@ -1,10 +1,11 @@
-"""CompositeBackend — auto-routes each entity_id to JsonFileBackend or CharacterFileBackend.
+"""CompositeBackend — auto-routes each entity_id to correct backend.
 
 Lookup order:
-  1. Is entity_id a key in JsonFileBackend's cache? → use JsonFileBackend
-  2. Is entity_id a character folder name? → use CharacterFileBackend
-  3. Is there a tag "name:<entity_id>" in JsonFileBackend? → use JsonFileBackend
-  4. Default: JsonFileBackend (let it create)
+  1. Is entity_id a key in LocationFileBackend (type="location")? → use LocationFileBackend
+  2. Is entity_id a key in JsonFileBackend's cache? → use JsonFileBackend
+  3. Is entity_id a character folder name? → use CharacterFileBackend
+  4. Is there a tag "name:<entity_id>" in JsonFileBackend? → use JsonFileBackend
+  5. Default: JsonFileBackend (let it create)
 """
 from __future__ import annotations
 
@@ -15,44 +16,58 @@ from world_manager._backend_base import EntityBackend
 
 class CompositeBackend(EntityBackend):
     """Routes each operation to the correct backend based on entity_id.
-    
-    Writes go to ONE backend. Reads from JsonFileBackend first, falls back
-    to CharacterFileBackend.
+
+    Three backends:
+      - JsonFileBackend (entity_store/entities.json) — default
+      - CharacterFileBackend (characters/{name}/*.json)
+      - LocationFileBackend (world/locations.json)
     """
 
-    def __init__(self, json_backend: EntityBackend, char_backend: EntityBackend):
+    def __init__(self, json_backend: EntityBackend, char_backend: EntityBackend, loc_backend: EntityBackend):
         self._json = json_backend
         self._char = char_backend
+        self._loc = loc_backend
 
-    def _resolve(self, id: str) -> tuple[EntityBackend, str]:
-        """Returns (backend, resolved_id). Backend is always JsonFileBackend
-        for creation (lets it auto-generate id if needed).
+    def _resolve(self, id: str, type_hint: str = "") -> tuple[EntityBackend, str]:
+        """Returns (backend, resolved_id).
+        If type_hint is "location", routes directly to LocationFileBackend.
         """
         if not id:
             return (self._json, id)
         id_stripped = id.strip()
-        # 1. Check JSON store (by exact key)
+
+        # 0. type hint overrides all
+        if type_hint == "location":
+            return (self._loc, id_stripped)
+
+        # 1. Check location store
+        if self._loc.get(id_stripped) is not None:
+            return (self._loc, id_stripped)
+
+        # 2. Check JSON store (by exact key)
         if self._json.get(id_stripped) is not None:
             return (self._json, id_stripped)
-        # 2. Check character folders
+        # 3. Check character folders
         if self._char.get(id_stripped) is not None:
             return (self._char, id_stripped)
-        # 3. Check name tags in JSON store
+        # 4. Check name tags in JSON store
         try:
-            # query with tag filter — uses JsonFileBackend's own query
             matches = self._json.query(tags=[f"name:{id_stripped}"], include_templates=False, limit=1)
             if matches:
                 return (self._json, matches[0]["id"])
         except Exception:
             pass
-        # 4. Default: JSON store
+        # 5. Default: JSON store
         return (self._json, id_stripped)
 
     def _resolve_read(self, id: str) -> tuple[EntityBackend, str]:
-        """For reads, check both backends. JSON first."""
+        """For reads, check all backends."""
         if not id:
             return (self._json, id)
         id_stripped = id.strip()
+        loc_entity = self._loc.get(id_stripped)
+        if loc_entity is not None:
+            return (self._loc, id_stripped)
         json_entity = self._json.get(id_stripped)
         if json_entity is not None:
             return (self._json, id_stripped)
@@ -62,7 +77,8 @@ class CompositeBackend(EntityBackend):
         return (self._json, id_stripped)
 
     def set(self, id: str = "", **kwargs) -> Dict[str, Any]:
-        backend, rid = self._resolve(id or "")
+        type_hint = kwargs.get("type", "")
+        backend, rid = self._resolve(id or "", type_hint=type_hint)
         return backend.set(id=rid, **kwargs)
 
     def get(self, id: str) -> Optional[Dict[str, Any]]:
@@ -82,10 +98,19 @@ class CompositeBackend(EntityBackend):
         return backend.get_state(rid)
 
     def query(self, **kwargs) -> List[Dict[str, Any]]:
-        """Query both backends and merge results."""
+        """Query all backends and merge results."""
         results = []
+        # Location backend first (for type="location" queries)
+        loc_results = self._loc.query(**kwargs)
+        for lr in loc_results:
+            if not any(r.get("id") == lr.get("id") for r in results):
+                results.append(lr)
+        # JSON store
         json_results = self._json.query(**kwargs)
-        results.extend(json_results)
+        for jr in json_results:
+            if not any(r.get("id") == jr.get("id") for r in results):
+                results.append(jr)
+        # Character files
         char_results = self._char.query(**kwargs)
         for cr in char_results:
             if not any(r.get("id") == cr.get("id") for r in results):

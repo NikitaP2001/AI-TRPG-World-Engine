@@ -1,7 +1,7 @@
 """ToolRegistry — single source of truth for all agent tools.
 
 Every tool is defined ONCE here. Each agent gets a subset via classmethods:
-  ToolRegistry.for_wm() → List[Tool]  (19 tools)
+  ToolRegistry.for_wm() → List[Tool]  (18 tools, no set_entity)
   ToolRegistry.for_gm() → List[Tool]  (18 tools)
   ToolRegistry.for_sm() → List[Tool]  (11 tools)
 
@@ -40,13 +40,90 @@ from news_queue import close_invocation as _ci
 
 
 # ======================================================================
+# Close-invocation validation hook
+# ======================================================================
+# Set by GM's call_gm() to prevent exit until character files are complete.
+CLOSE_VALIDATION_HOOK = None  # Callable[[], Optional[str]]
+
+
+def set_close_validation_hook(fn):
+    global CLOSE_VALIDATION_HOOK
+    CLOSE_VALIDATION_HOOK = fn
+
+
+# ======================================================================
+# Doc-read tracker: prevents agents from re-reading docs already in context
+# ======================================================================
+# Reset at start of each agent invocation. Keyed by agent name ("wm", "gm", "sm").
+_DOC_READ_TRACKER: dict = {}  # agent_key -> set[tool_name]
+_CURRENT_AGENT: str = ""
+
+
+def reset_doc_read_tracker(agent_key: str) -> None:
+    """Call at the start of an agent invocation. Clears tracker and sets agent context."""
+    global _DOC_READ_TRACKER, _CURRENT_AGENT
+    _DOC_READ_TRACKER[agent_key] = set()
+    _CURRENT_AGENT = agent_key
+
+
+def clear_current_agent() -> None:
+    """Call after agent invocation ends."""
+    global _CURRENT_AGENT
+    _CURRENT_AGENT = ""
+
+
+# ======================================================================
+# Position validation
+# ======================================================================
+
+
+def _validate_position(position: Dict[str, Any]) -> Optional[str]:
+    """Check position format. Returns error string or None if valid.
+
+    Valid formats:
+      {"coords": [lat, lon]} or [lat, lon, z] — absolute, lat=-90..90, lon=-180..180
+      {"inside": entity_id} — relative, inside another entity
+      {"near": entity_id} — relative, near another entity
+    """
+    if not position:
+        return None  # empty = no spatial location (valid for non-spatial entities)
+
+    valid_keys = {"inside", "near", "coords", "offset"}
+    extra = set(position.keys()) - valid_keys
+    if extra:
+        return f"Unknown position key(s): {', '.join(sorted(extra))}. Use: inside, near, or coords."
+
+    # coords: absolute lat/lon
+    if "coords" in position:
+        coords = position["coords"]
+        if not isinstance(coords, (list, tuple)) or len(coords) < 2:
+            return "coords must be a list of [lat, lon] or [lat, lon, z]."
+        lat, lon = coords[0], coords[1]
+        if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+            return "coords values must be numbers."
+        if lat < -90 or lat > 90:
+            return f"Latitude must be between -90 and 90, got {lat}."
+        if lon < -180 or lon > 180:
+            return f"Longitude must be between -180 and 180, got {lon}."
+
+    # inside/near: must reference an existing entity_id
+    for key in ("inside", "near"):
+        if key in position:
+            ref = position[key]
+            if not isinstance(ref, str) or not ref.strip():
+                return f"{key} must be a non-empty entity_id (string)."
+
+    return None
+
+
+# ======================================================================
 # 1.  Entity tools (WM + GM)
 # ======================================================================
 
 
 @tool
 def set_entity(
-    id: str = "",
+    name: str = "",
     type: str = "",
     base_type: str = "",
     facts: str = "",
@@ -63,25 +140,35 @@ def set_entity(
     Works for NPCs, characters, locations, factions, items — anything.
     Entity types are strings defined by the WM; no reserved types.
 
-    On create (empty id): auto-generates and returns a new id.
-    On update (existing id): merges gurps/stats, replaces state/skills/equipment.
+    On create (empty name): auto-generates and returns a new identifier.
+    On update (existing name): merges gurps/stats, replaces state/skills/equipment.
 
     Inheritance via base_type: facts, gurps, stats, tags cascade from template.
 
     Args:
-        id: Unique identifier. Empty = auto-generated.
+        name: The entity's name. For named characters, use their full name
+            (e.g. "Elena Brightwood"). For locations, use a descriptive slug
+            (e.g. "tavern_sleeping_dragon"). Empty = auto-generates a new id.
         type: Entity type (e.g. "npc", "character", "location", "faction").
         base_type: Template entity_id to inherit from.
         facts: Static narrative identity. NOT for mechanical data.
         gurps: GURPS stat block. Keys: ST, DX, IQ, HT, HP, Will, Per, FP, etc.
         stats: Free-form numeric properties.
         tags: Structured labels "namespace:value" for queries.
-        position: Where: {"inside": id}, {"near": id}, {"coords": [x,y,z]}.
+        position: Where the entity is. Three valid formats:
+            {"coords": [lat, lon]} — absolute position (lat: -90..90, lon: -180..180).
+            {"inside": entity_id} — inside another entity.
+            {"near": entity_id} — approximately co-located.
         state: Dynamic state block {hp, fp, conditions, injuries}.
         skills: Skills block {ST, DX, IQ, HT, passive_abilities, cached_skills}.
         equipment: Equipment block {signature, inventory, currency}.
     """
-    kwargs = dict(id=id, type=type, base_type=base_type, facts=facts,
+    # Validate position before writing
+    err = _validate_position(position)
+    if err:
+        return {"status": "error", "error": f"Invalid position: {err}"}
+
+    kwargs = dict(id=name, type=type, base_type=base_type, facts=facts,
                   gurps=gurps, stats=stats, tags=tags, position=position)
     if state is not None:
         kwargs["state"] = state
@@ -93,37 +180,47 @@ def set_entity(
 
 
 @tool
-def set_entity_facts(id: str, facts: str) -> Dict[str, Any]:
+def set_entity_facts(name: str, facts: str) -> Dict[str, Any]:
     """Update only the prose facts of an entity.
 
     Does not touch gurps, stats, tags, state, skills, or equipment.
+
+    Args:
+        name: The entity's name (e.g. "Elena Brightwood").
+        facts: Complete replacement of the facts text.
     """
-    return _store_set_entity_facts(id=id, facts=facts)
+    return _store_set_entity_facts(id=name, facts=facts)
 
 
 @tool
-def get_entity(id: str) -> Dict[str, Any]:
+def get_entity(name: str) -> Dict[str, Any]:
     """Read a single entity in full, including all blocks.
 
     Returns all fields: facts, gurps, state, skills, equipment, stats,
     tags, position, scripts, effects, movement.
+
+    Args:
+        name: The entity's name (e.g. "Elena Brightwood").
     """
-    result = _store_get_entity(id)
+    result = _store_get_entity(name)
     if result is None:
-        return {"error": f"Entity '{id}' not found"}
+        return {"error": f"Entity '{name}' not found"}
     return result
 
 
 @tool
-def get_entity_facts(id: str) -> str:
+def get_entity_facts(name: str) -> str:
     """Read only the prose facts of an entity.
 
     Lightweight — does not return mechanical stats.
     Use for loading NPC/character context on demand.
+
+    Args:
+        name: The entity's name (e.g. "Elena Brightwood").
     """
-    result = _store_get_entity_facts(id)
+    result = _store_get_entity_facts(name)
     if result is None:
-        return f"Entity '{id}' not found"
+        return f"Entity '{name}' not found"
     return result
 
 
@@ -422,6 +519,15 @@ def close_invocation(
     """
     if not summary or not summary.strip():
         return {"status": "error", "error": "summary is required"}
+    # Check validation hook (GM character file completeness, etc.)
+    global CLOSE_VALIDATION_HOOK
+    if CLOSE_VALIDATION_HOOK is not None:
+        try:
+            err_msg = CLOSE_VALIDATION_HOOK()
+            if err_msg:
+                return {"status": "error", "error": err_msg}
+        except Exception as e:
+            return {"status": "error", "error": f"Validation error: {e}"}
     return _ci(summary=summary, news=news, invoke_self=invoke_self)
 
 
@@ -431,13 +537,17 @@ def close_invocation(
 
 
 @tool
-def delete_entity(id: str, reason: str = "") -> Dict[str, Any]:
+def delete_entity(name: str, reason: str = "") -> Dict[str, Any]:
     """Permanently remove an entity. WM-only.
 
     Past events that reference it remain in the event log.
     Sets a deleted_at marker — the entity record is not physically removed.
+
+    Args:
+        name: The entity's name (e.g. "Elena Brightwood").
+        reason: Why — written to event log.
     """
-    return _store_delete_entity(id=id, reason=reason)
+    return _store_delete_entity(id=name, reason=reason)
 
 
 @tool
@@ -490,6 +600,9 @@ def write_correction(
 def read_tool_doc(name: str = "", parameter: str = "") -> str:
     """Read documentation for any tool or parameter.
 
+    Once read, the documentation stays in your conversation context.
+    Re-reading the same tool returns a reminder instead — look up.
+
     Args:
         name: Tool name (e.g. "set_entity"). Empty = list all tools.
         parameter: Specific parameter name. Empty = full tool doc.
@@ -497,6 +610,14 @@ def read_tool_doc(name: str = "", parameter: str = "") -> str:
     from world_manager.tool_docs_data import DOCS as _DOCS
     if not name:
         return "Available tools:\n" + "\n".join(f"  - {k}" for k in sorted(_DOCS.keys()))
+    # Track reads per invocation per agent
+    global _CURRENT_AGENT, _DOC_READ_TRACKER
+    if _CURRENT_AGENT and name:
+        tracker = _DOC_READ_TRACKER.setdefault(_CURRENT_AGENT, set())
+        if name in tracker:
+            return (f"[already read] Documentation for '{name}' was already retrieved "
+                    f"earlier in this invocation — see above in your conversation.")
+        tracker.add(name)
     doc = _DOCS.get(name)
     if doc is None:
         return f"Tool '{name}' not found."
@@ -597,24 +718,23 @@ def get_scene(location_id: str) -> Dict[str, Any]:
 
 
 @tool
-def escalate_to_gm(question: str, context: str, blocking: bool = True) -> str:
-    """Request Game Master involvement. SM-only.
+def escalate_to_gm(question: str, context: str = "") -> str:
+    """Request Game Master involvement, or in other words ask GM a question.
 
     Use when scene requires new persistent entities or facts
-    beyond SM authority.
+    beyond your authority, or you want to clarify some fact or information
+    you are unsure with.
 
     Args:
-        question: What SM needs from GM.
+        question: What you need from GM.
         context: Relevant scene state.
-        blocking: Almost always True for SM.
     """
     import json
     from pathlib import Path
     path = Path("game") / "entity_store" / "gm_questions.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(str(path), "a", encoding="utf-8") as f:
-        f.write(json.dumps({"question": question, "context": context,
-                            "blocking": blocking}, ensure_ascii=False) + "\n")
+        f.write(json.dumps({"question": question, "context": context}, ensure_ascii=False) + "\n")
     return f"[stub] GM notified: {question[:100]}"
 
 
@@ -649,7 +769,11 @@ class ToolRegistry:
     @classmethod
     def for_wm(cls) -> list:
         return [
-            *cls._ENTITY_TOOLS,
+            set_entity,
+            set_entity_facts, adjust_entity,
+            get_entity, get_entity_facts, get_entity_state,
+            query_entities,
+            add_tags, remove_tags,
             *cls._EFFECT_TOOLS,
             *cls._SCRIPT_TOOLS,
             *cls._EVENT_TOOLS,

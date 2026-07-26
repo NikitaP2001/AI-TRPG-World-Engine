@@ -78,6 +78,10 @@ class WorldPaths:
     def scene_json(self) -> Path:
         return self.root / "scene.json"
 
+    @property
+    def timeline_json(self) -> Path:
+        return self.root / "timeline.json"
+
 
 class World:
     """Owns persistent world state under game/world/.*json.
@@ -91,7 +95,7 @@ class World:
     K_LOCATIONS = "locations"
     K_LAST_LOCATION = "last_location"
     K_STORY_ARCS = "story_arcs"
-    K_CHARACTERS = "characters"
+    K_PLAYERS = "players"
 
     # character list entry keys in info.json
     CK_NAME = "name"
@@ -133,7 +137,7 @@ class World:
                             "start_time": "",
                             "turns": [],
                             "locations": [],
-                            "characters": [],
+                            "players": [],
                             "npcs": [],
                         },
                     }
@@ -144,6 +148,14 @@ class World:
         else:
             # Scene duration is finalized at gm_output_turn time; do not enforce turn_duration on persisted scenes.
             pass
+
+        if not self._paths.timeline_json.exists():
+            _write_json(self._paths.timeline_json, {
+                "intents": [],
+                "resolved_history": [],
+                "cursor": 0,
+                "horizon": 0,
+            })
 
         # Ensure scene schema fields exist (state, acted, etc.) and migrate legacy fields.
         ensure_scene_schema_v2(scene_json=self._paths.scene_json)
@@ -186,7 +198,7 @@ class World:
                 self.K_LOCATIONS: [],
                 self.K_LAST_LOCATION: "",
                 self.K_STORY_ARCS: ["Ongoing Arc"],
-                self.K_CHARACTERS: self._build_character_entries(),
+                self.K_PLAYERS: self._build_character_entries(),
             }
             _write_json(self._paths.info_json, info)
         else:
@@ -196,7 +208,7 @@ class World:
         """Best-effort read of init/plot.json (or legacy init/characters/plot.json)."""
 
         init_plot_path = (self._workspace / "init" / "plot.json").resolve()
-        alt_plot_path = (self._workspace / "init" / "characters" / "plot.json").resolve()
+        alt_plot_path = (self._workspace / "init" / "players" / "plot.json").resolve()
         path = init_plot_path if init_plot_path.exists() else alt_plot_path
         if not path.exists():
             return None
@@ -306,7 +318,7 @@ class World:
             "start_time": "",
             "end_time": "",
             "locations": [],
-            "characters": [],
+            "players": [],
             "npcs": [],
             "summary": init_text,
             "turn_count": 0,
@@ -324,7 +336,7 @@ class World:
     def _character_dir(self, name: str) -> Path:
         if not name:
             raise ValueError("Character name is required")
-        return (self._game_root / "characters" / name).resolve()
+        return (self._game_root / "players" / name).resolve()
 
     def _character_description_path(self, name: str) -> Path:
         return self._character_dir(name) / "description.json"
@@ -342,7 +354,7 @@ class World:
         return self._character_dir(name) / "metadata.json"
 
     def list_character_names(self) -> List[str]:
-        chars_dir = (self._game_root / "characters").resolve()
+        chars_dir = (self._game_root / "players").resolve()
         if not chars_dir.exists():
             return []
         return sorted([p.name for p in chars_dir.iterdir() if p.is_dir()], key=str.lower)
@@ -390,7 +402,7 @@ class World:
         info = self.get_info()
         if not isinstance(info, dict):
             return
-        info[self.K_CHARACTERS] = self._build_character_entries()
+        info[self.K_PLAYERS] = self._build_character_entries()
         if self.K_TIME not in info:
             info[self.K_TIME] = self.DEFAULT_TIME
         _write_json(self._paths.info_json, info)
@@ -442,6 +454,48 @@ class World:
         except Exception:
             pass
         return _read_json(self._paths.locations_json)
+
+    def get_players(self) -> List[Dict[str, str]]:
+        """Return player list from entity store: [{name, location, last_acted}].
+
+        Replaces the old info.json['players'] source. Each player is a character
+        entity with position and metadata. Falls back to _stripped.json for
+        location if the entity doesn't have a position yet (startup path).
+        """
+        try:
+            from world_manager.entity_core import _get_backend
+            backend = _get_backend()
+            entities = backend.query(type_filter="character", include_templates=False, limit=50)
+            result = []
+            for e in entities:
+                name = e.get("id", "").strip()
+                if not name:
+                    continue
+                # Extract location from position field (stored in state.json.location)
+                position = e.get("position", {}) or {}
+                loc = position.get("inside", position.get("near", ""))
+                if not loc:
+                    coords = position.get("coords")
+                    if coords:
+                        loc = f"coords:{coords[0]},{coords[1]}"
+                # Read last_acted from metadata
+                last_acted = "never"
+                try:
+                    meta = _read_json(self._character_dir(name) / "metadata.json")
+                    last_acted = str(meta.get("last_acted", "never"))
+                except Exception:
+                    pass
+                result.append({
+                    "name": name,
+                    "location": loc if loc else "no location specified",
+                    "last_acted": last_acted,
+                })
+            return result
+        except Exception:
+            pass
+        # Fallback to old info.json if entity store fails
+        info = self.get_info()
+        return info.get(self.K_PLAYERS, []) if isinstance(info, dict) else []
 
     def get_story(self) -> Any:
         return _read_json(self._paths.story_json)
@@ -900,6 +954,19 @@ class World:
         except Exception:
             pass
 
+        # Merge back fields that were stripped to _stripped.json during
+        # ensure_initialized (location, equipment, skills, status, appearance).
+        # This ensures get_character_description returns complete data.
+        try:
+            stripped_path = self._character_dir(name) / "_stripped.json"
+            if stripped_path.exists():
+                stripped = _read_json(stripped_path)
+                for field in ("location", "equipment", "skills", "status", "appearance"):
+                    if field in stripped and not data.get(field):
+                        data[field] = stripped[field]
+        except Exception:
+            pass
+
         return data
 
     # ------------------------------------------------------------------
@@ -1123,3 +1190,30 @@ class World:
 
     def clear_scene(self) -> None:
         _write_json(self._paths.scene_json, {"state": ""})
+
+    # ------------------------------------------------------------------
+    # Timeline store (scheduler/timeline.py) — independent of scene
+    # lifecycle. Carries active intents/persistent subscriptions and the
+    # accumulated resolved history across scene/narrative-block boundaries
+    # (docs/scene_design.md §3.2, §6).
+    # ------------------------------------------------------------------
+
+    def get_timeline(self) -> Dict[str, Any]:
+        if not self._paths.timeline_json.exists():
+            return {"intents": [], "resolved_history": [], "cursor": 0, "horizon": 0}
+        data = _read_json(self._paths.timeline_json)
+        if not isinstance(data, dict):
+            return {"intents": [], "resolved_history": [], "cursor": 0, "horizon": 0}
+        data.setdefault("intents", [])
+        data.setdefault("resolved_history", [])
+        data.setdefault("cursor", 0)
+        data.setdefault("horizon", 0)
+        return data
+
+    def set_timeline(self, timeline: Dict[str, Any]) -> None:
+        _write_json(self._paths.timeline_json, timeline)
+
+    def clear_timeline(self) -> None:
+        _write_json(self._paths.timeline_json, {
+            "intents": [], "resolved_history": [], "cursor": 0, "horizon": 0,
+        })

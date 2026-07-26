@@ -5,14 +5,14 @@ and character/reflection.py with a single scheduler.  Every tick checks
 all registered jobs and fires those whose trigger conditions are met.
 
 Trigger types:
-  TurnCount        — every N turns since last fire
-  ParagraphCount   — every N paragraphs since last fire
-  MemoryEntryCount — every N memory entries for a specific character
-  WallClock        — every N seconds of real time
-  WorldTime        — at an exact world datetime
-  AfterJob         — once after another job completes
+  CycleCount        вЂ” every N turns since last fire
+  ParagraphCount   вЂ” every N paragraphs since last fire
+  MemoryEntryCount вЂ” every N memory entries for a specific character
+  WallClock        вЂ” every N seconds of real time
+  WorldTime        вЂ” at an exact world datetime
+  AfterJob         вЂ” once after another job completes
 
-Moved from gm/scheduler.py — lives here because jobs span all agents
+Moved from gm/scheduler.py вЂ” lives here because jobs span all agents
 (GM, SA, character), not just the GM.
 """
 
@@ -31,8 +31,8 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 
 @dataclass(frozen=True)
-class TurnCount:
-    """Fire every N turns since last execution."""
+class CycleCount:
+    """Fire every N cycles since last execution."""
     interval: int
     offset: int = 0
 
@@ -68,7 +68,7 @@ class AfterJob:
     after: str
 
 
-Trigger = Union[TurnCount, ParagraphCount, MemoryEntryCount, WallClock, WorldTime, AfterJob]
+Trigger = Union[CycleCount, ParagraphCount, MemoryEntryCount, WallClock, WorldTime, AfterJob]
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +107,7 @@ class Job:
 @dataclass
 class JobState:
     """Persisted per-job counters and status."""
-    last_fired_at_turn: int = 0
+    last_fired_at_cycle: int = 0
     last_fired_at_para: int = 0
     last_fired_at_entry: int = 0
     last_fired_wall: float = 0.0
@@ -129,7 +129,7 @@ class TickScheduler:
         scheduler = TickScheduler(state_path)
         scheduler.register(job1, job2, ...)
         # After each turn:
-        scheduler.tick(turn_count=info["turns"], para_count=info["paragraphs"],
+        scheduler.tick(cycle_count=info["cycles"], para_count=info["paragraphs"],
                        world=world, character_names=[...])
     """
 
@@ -188,7 +188,7 @@ class TickScheduler:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
             data = {
                 jid: {
-                    "last_fired_at_turn": js.last_fired_at_turn,
+                    "last_fired_at_cycle": js.last_fired_at_cycle,
                     "last_fired_at_para": js.last_fired_at_para,
                     "last_fired_at_entry": js.last_fired_at_entry,
                     "last_fired_wall": js.last_fired_wall,
@@ -212,7 +212,7 @@ class TickScheduler:
 
     @dataclass
     class TickContext:
-        turn_count: int
+        cycle_count: int
         paragraph_count: int
         character_entry_counts: Dict[str, int]
         world_time_str: str = ""
@@ -220,7 +220,7 @@ class TickScheduler:
     def _build_context(
         self,
         *,
-        turn_count: int,
+        cycle_count: int,
         paragraph_count: int,
         world: Any = None,
         character_names: List[str] = None,
@@ -229,7 +229,7 @@ class TickScheduler:
         if character_names and world is not None:
             for name in character_names:
                 try:
-                    from character.reflection import count_memory_entries
+                    from player.reflection import count_memory_entries
                     entry_counts[name] = count_memory_entries(name) or 0
                 except Exception:
                     entry_counts[name] = 0
@@ -243,7 +243,7 @@ class TickScheduler:
                 pass
 
         return TickScheduler.TickContext(
-            turn_count=turn_count,
+            cycle_count=cycle_count,
             paragraph_count=paragraph_count,
             character_entry_counts=entry_counts,
             world_time_str=world_time,
@@ -256,8 +256,8 @@ class TickScheduler:
     def _trigger_fired(self, job: Job, ctx: TickContext, js: JobState) -> bool:
         t = job.trigger
 
-        if isinstance(t, TurnCount):
-            return (ctx.turn_count - js.last_fired_at_turn) >= t.interval
+        if isinstance(t, CycleCount):
+            return (ctx.cycle_count - js.last_fired_at_cycle) >= t.interval
 
         if isinstance(t, ParagraphCount):
             return (ctx.paragraph_count - js.last_fired_at_para) >= t.interval
@@ -286,8 +286,8 @@ class TickScheduler:
 
     def _update_counters(self, job: Job, ctx: TickContext, js: JobState) -> None:
         t = job.trigger
-        if isinstance(t, TurnCount):
-            js.last_fired_at_turn = ctx.turn_count
+        if isinstance(t, CycleCount):
+            js.last_fired_at_cycle = ctx.cycle_count
         elif isinstance(t, ParagraphCount):
             js.last_fired_at_para = ctx.paragraph_count
         elif isinstance(t, MemoryEntryCount):
@@ -306,7 +306,7 @@ class TickScheduler:
     def tick(
         self,
         *,
-        turn_count: int,
+        cycle_count: int,
         paragraph_count: int,
         world: Any = None,
         character_names: List[str] = None,
@@ -318,7 +318,7 @@ class TickScheduler:
         self._load_state()
 
         ctx = self._build_context(
-            turn_count=turn_count,
+            cycle_count=cycle_count,
             paragraph_count=paragraph_count,
             world=world,
             character_names=character_names,
@@ -354,7 +354,7 @@ class TickScheduler:
             if not self._trigger_fired(job, ctx, js):
                 continue
 
-            # ── Execute ──
+            # в”Ђв”Ђ Execute в”Ђв”Ђ
             js.status = "running"
             self._update_counters(job, ctx, js)
             self._save_state()
@@ -386,3 +386,4 @@ class TickScheduler:
             for jid in self._state:
                 self._state[jid] = JobState()
         self._save_state()
+

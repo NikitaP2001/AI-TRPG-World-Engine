@@ -59,8 +59,8 @@ def _write_json(path: Path, data: Any) -> None:
     tmp.replace(path)
 
 
-def gm_max_turns_from_env() -> int:
-    raw = (os.getenv("LLM_WORLD_GM_MAX_TURNS") or "").strip()
+def gm_max_cycles_from_env() -> int:
+    raw = (os.getenv("LLM_WORLD_GM_MAX_CYCLES") or "").strip()
     if not raw:
         # Disabled by default. When set (>0), keeps only the last N turns
         # before token sliding-window trimming.
@@ -179,7 +179,7 @@ def trim_full_gm_messages(
     """
 
     lim = limits or limits_from_env()
-    mt = max_turns if isinstance(max_turns, int) else gm_max_turns_from_env()
+    mt = max_turns if isinstance(max_turns, int) else gm_max_cycles_from_env()
 
     # Separate pinned world-snapshot anchor messages so they are never evicted
     # by token-budget trimming.  Anchors are HumanMessages whose content starts

@@ -113,10 +113,10 @@ step — only when something requires authority the Scene Manager doesn't have.
 encountered in play. Creates and updates these through typed tools. It is not called
 every turn; it is called when something happens that requires its authority.
 
-**World Master** — authors the rules the simulation runs on. Registers species,
-factions, physical laws, economic parameters. Works at a time scale and a level of
-abstraction entirely separate from the active scene. Never participates in scene
-resolution.
+**World Manager** — authors world-scale structure and templates (species, factions,
+long-horizon interests). Works at a time scale and level of abstraction separate
+from the active scene. Never narrates scenes; wakes from subscriptions and
+scheduled self-invokes.
 
 This split enforces context isolation structurally: a character agent genuinely does
 not have access to another character's reasoning, because that reasoning never enters
@@ -167,15 +167,12 @@ re-examines known relationships every ten turns. Two characters who know the sam
 can have genuinely different assessments of them, because the assessments are stored
 separately and updated from separate experiences.
 
-**Simulation memory** is different in kind from both. The world simulation generates
-continuous streams of non-narrative events: population changes, creature movements,
-resource extraction, climate effects. These are not sentences — they are numbers and
-effects, queryable by where and when. A four-dimensional spatial-temporal index
-(position in x, y, z, and simulation tick) stores these events so any query can ask
-"what happened in this region between these two points in time" and receive causally
-attributed records. This is not what summarization is for, and not what semantic
-search is for. The queries are geometric: give me everything that occurred within
-this spatial boundary during this time range.
+**World / event memory** is different in kind from both. Agents write structured
+records (entities, tags, mechanical state) and append causally attributed events
+to an event log indexed by place and time. Later queries ask "what happened here
+between then and now" and receive records, not regenerated prose. This is not what
+summarization is for: summaries index the story; tools retrieve the chapters and
+the world facts.
 
 ---
 
@@ -219,14 +216,13 @@ something has already happened, an agent declares in advance what it finds
 significant, and is invoked when those conditions are met — not to react to a
 request, but because the thing it was watching for has occurred.
 
-The World Master, between sessions, is not waiting to be asked. It has registered
-interest in certain classes of events: a faction's food supply crossing a critical
-threshold, a significant entity dying, a forbidden technology being researched. When
-the simulation tick produces one of those events, the WM is invoked on its own
-initiative and acts — extending the world, creating consequences, setting new
-conditions in motion. It is playing its own game, which happens to produce a world
-that feels alive because it is advancing along its own logic, not in response to
-player observation.
+The World Manager, between sessions, is not waiting to be asked. It has registered
+interest in certain classes of events: a faction crossing a threshold, a significant
+entity dying, a sealed location being opened. When those conditions fire — via
+scripts, event queries, or scheduled self-invokes — the WM acts on its own
+initiative: extending the world, creating consequences, setting new conditions in
+motion. It is playing its own game, which produces a world that feels alive because
+it advances along its own logic, not in response to player observation.
 
 The Game Master works the same way at a smaller scale. It is not called when players
 ask questions — the Scene Manager handles those from the world record. The GM is
@@ -244,8 +240,8 @@ and the scene resolution invokes them when it matches, not before.
 
 This model has an important consequence that sounds paradoxical at first: most of the
 time, in most places, nothing happens. If no one has subscribed to events in a
-particular tavern on a particular night, nothing occurs there. The simulation runs,
-the tick advances, and the log for that location remains empty. When players later
+particular tavern on a particular night, nothing occurs there. Time can advance
+and the log for that location remains empty. When players later
 ask the Scene Manager what happened there last night, it checks the log, finds
 nothing, and answers: nothing happened. Not "I imagine the tavern was quiet" — but
 genuinely nothing, because the world does not generate events that no agent has
@@ -259,60 +255,32 @@ arrived, not in response to their arrival — is a world that exists independent
 
 ---
 
-## The World Master: authoring rules, not facts
+## The World Manager: authoring structure, not scenes
 
-The World Master's relationship to the world is different in kind from the Game
-Master's. The GM creates facts: this NPC exists, this location looks like this, this
-event occurred. The WM creates rules: this species has these behavioral parameters,
-this faction has these economic flows, this region has these climate properties.
+The World Manager's (WM; code: `WorldManager`) relationship to the world is
+different in kind from the Game Master's. The GM creates facts encountered in
+play: this NPC exists, this location looks like this, this event occurred. The WM
+authors longer-horizon structure: race and class templates, factions, world-scale
+movement, corrections that bind the GM, and standing interests that wake it when
+something matters.
 
-Facts are created when scenes need them. Rules are created before the world runs,
-and they produce facts autonomously afterward.
+Facts for the active story are written when scenes need them — through typed
+tools into a persistent entity store and event log. Later invocations read those
+records. The system is narrative-only: there is no separate numeric geology /
+ecology / civilization simulation underneath. Simple automation (entity scripts,
+effects, subscriptions) handles what does not need an LLM.
 
-When the WM establishes that a region has a certain population with certain resource
-constraints under certain political tensions, those are parameters fed into a
-simulation. The simulation runs forward and produces events: a drought reduces food
-supply, which creates migration pressure, which strains relations between neighboring
-factions, which produces a border skirmish. The GM narrating a scene in that region
-months later reads this history from the world record. It did not generate these
-events. They happened because the parameters said they would.
+Because the WM's tool vocabulary can be large, detailed documentation for each
+tool is retrieved on demand. The working context stays focused on what the
+current task requires.
 
-The WM's tools are correspondingly different from the GM's: not "create location"
-and "create NPC" but "define faction with these economic parameters," "register
-creature species with these behavioral rules," "establish that this historical fact
-must remain true regardless of what the simulation would otherwise produce." These
-are not tools for narrating — they are tools for authoring a system that narrates
-itself.
-
-Because the WM's tool vocabulary is large and detailed, it is not loaded into context
-all at once. Detailed documentation for each tool is retrieved on demand, when the
-WM is about to use that specific capability. The working context stays focused on
-what the current task requires.
-
----
-
-## The simulation underneath
-
-The simulation the WM authors is layered. Geological and climate processes run at
-the base: terrain, temperature, precipitation, soil fertility. Ecology runs on top:
-vegetation, animal populations, predator-prey dynamics, the lasting marks that
-settlements leave on the land around them — deforestation, depleted water tables,
-suppressed wildlife that persist after the settlement is gone. Civilization runs on
-top of ecology: population fed by food supply, technology unlocked by research, trade
-routes shaped by terrain, armies whose outcomes come from equations applied to
-registered strengths. Individual entities run on top of civilization as rule-driven
-instances — each with needs, behaviors, and effects that write into the world record
-as they fire.
-
-All of this is indexed in the four-dimensional event store: every effect, every
-resource change, every population shift, tagged with location and time. The world's
-history is a query, not a narration.
+The full agent/tool architecture is in [`docs/architecture.md`](docs/architecture.md).
 
 ---
 
 ## Scene resolution: the problem with sequential turns
 
-Even with a simulation producing real history and agents with isolated contexts, the
+Even with agents that have isolated contexts and a persistent world record, the
 active scene has its own structural problem.
 
 The current system processes characters sequentially: character A submits a decision,
@@ -349,19 +317,17 @@ plainly.
 Character agents know what their character has perceived, their own memory and
 relationship records, and what the Scene Manager tells them about the current
 situation — filtered by what their character could observe. They do not know what
-other characters are thinking, what the GM has written about NPCs, or what the
-simulation has computed for distant regions.
+other characters are thinking, or what the GM/WM have written off-screen.
 
 The Scene Manager knows everything in the active scene — all character decisions,
-the scene location, relevant world data for this place. It does not know the WM's
-simulation parameters or distant world history. When something exceeds its authority,
-it escalates — rarely, as a last resort, not as a routine step.
+the scene location, relevant world data for this place. It does not know distant
+world structure the WM is authoring. When something exceeds its authority, it
+escalates — rarely, as a last resort, not as a routine step.
 
 The Game Master knows the persistent world record for places and NPCs encountered in
-play. It participates when its own subscriptions fire, not when the scene asks for
-help. It creates facts once; every subsequent reference reads from that creation.
+play. It participates when its own subscriptions fire or when the Scene Manager
+escalates. It creates facts once; every subsequent reference reads from that creation.
 
-The World Master knows the simulation's parameters and global world state. It does
-not participate in active scenes. It acts when its subscriptions fire — when the
-simulation produces something it registered interest in — and is otherwise building
-the world at its own pace, playing its own game.
+The World Manager knows world-scale structure and templates. It does not participate
+in active scenes. It acts when its subscriptions fire, and is otherwise building the
+world at its own pace, playing its own game.

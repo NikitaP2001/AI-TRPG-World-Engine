@@ -5,11 +5,18 @@ from engine.tool_base import _guard_tool
 from world_manager.tool_registry import (
     get_entity_facts, get_entity_state, get_scene, adjust_entity,
     record_event, query_events,
-    invoke_self, close_invocation,
+    close_invocation,
     set_effect, remove_effect,
     escalate_to_gm,
+    read_tool_doc,
 )
 from world_manager.entity_core import _get_backend
+
+# SM-specific tools (implemented in sm_tools.py)
+from scene_manager.sm_tools import (
+    proceed_to_narration, publish_narrative_block, end_scene,
+    manage_intent, update_awareness,
+)
 
 # Deprecated — kept for backward compat. Use adjust_entity instead.
 @tool
@@ -50,10 +57,15 @@ def apply_effect(entity_id: str, effect_id: str = "", stat_deltas: dict = {},
                       duration_ticks=duration_ticks, description=description)
 
 __all__ = [
+    # From world_manager.tool_registry
     "get_entity_facts", "query_events", "record_event",
-    "invoke_self", "close_invocation",
+    "close_invocation",
     "get_scene", "get_entity_state",
     "update_entity_stat", "adjust_entity",
     "apply_effect", "set_effect", "remove_effect",
     "escalate_to_gm",
+    "read_tool_doc",
+    # From scene_manager.sm_tools
+    "proceed_to_narration", "publish_narrative_block", "end_scene",
+    "manage_intent", "update_awareness",
 ]

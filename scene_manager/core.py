@@ -1,4 +1,4 @@
-"""Scene Manager agent: reactive, GM-dependent scene lifecycle.
+﻿"""Scene Manager agent: reactive, GM-dependent scene lifecycle.
 
 Receives a pre-chosen scene from the Game Master and handles:
 - World planning (pre-establish hidden facts)
@@ -7,7 +7,7 @@ Receives a pre-chosen scene from the Game Master and handles:
 - Paragraph summarization
 
 Has its own message history and prompt log output.
-Does NOT pick scenes — the Game Master does that.
+Does NOT pick scenes РІР‚вЂќ the Game Master does that.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import tool
 
 from memory_store import append_message, load_history, limits_from_env
 from openrouter_langchain_logging import logs_enabled
@@ -27,7 +28,6 @@ from scene_manager.tools import (
     get_entity_facts,
     query_events as sm_query_events,
     record_event as sm_record_event,
-    invoke_self as sm_invoke_self,
     get_scene as sm_get_scene,
     get_entity_state,
     update_entity_stat,
@@ -160,7 +160,19 @@ def _append_tool_rejection(messages: List, out: Any, error_text: str) -> None:
         messages.append(HumanMessage(content=error_text))
 
 
-def _context_for_turn_narration(context_text: str) -> str:
+def _format_intent_interval(di: Dict[str, Any]) -> str:
+    """Render an intent's timing for display РІР‚вЂќ supports both the legacy free-text
+    ``interval`` field and the current numeric ``t_start``/``t_end`` (Р’В§1/Р’В§3.2)."""
+    if di.get("t_start") is not None or di.get("t_end") is not None:
+        t_start = di.get("t_start")
+        t_end = di.get("t_end")
+        if t_end is None:
+            return f"starts +{t_start}s (persistent subscription)"
+        return f"+{t_start}s..+{t_end}s"
+    return str(di.get("interval", "")).strip()
+
+
+def _context_for_narration(context_text: str) -> str:
     return str(context_text or "")
 
 
@@ -186,6 +198,100 @@ def _prune_context_sections(context_text: str, *, drop_titles: List[str]) -> str
     return (pruned + "\n") if pruned else ""
 
 
+def _parse_perspectives(text: str, character_names: List[str]) -> tuple:
+    """Parse SM scene description into per-character perspectives + shared intro.
+
+    Tries multiple section-header formats (``## Name``, ``**Name**``, ``--- Name ---``).
+    Returns (personal, shared) on success, or ({}, text) if parsing fails — caller
+    then falls back to using the full text as shared.
+
+    Validation: every character_name must have a non-empty, unique perspective.
+    """
+    char_set = set(str(n).strip() for n in character_names if str(n).strip())
+    if not char_set:
+        return {}, text
+
+    lines = text.split("\n")
+    current_name: Optional[str] = None
+    current_lines: List[str] = []
+    personal: Dict[str, str] = {}
+    shared_lines: List[str] = []
+    in_section = False
+
+    # Detect heading markers: ##, **, ---
+    heading_chars = ('#', '*', '-')
+
+    def _is_header(line: str) -> Optional[str]:
+        s = line.strip()
+        if not s:
+            return None
+        # Exact header match
+        for cn in char_set:
+            if s in (f"**{cn}**", f"--- {cn} ---", f"## {cn}", f"## {cn} —", cn):
+                return cn
+        # Lines with heading markers: try substring match
+        if any(c in s for c in heading_chars):
+            candidates = [cn for cn in char_set if cn in s]
+            if len(candidates) == 1:
+                return candidates[0]
+            # Try positional match: count ## headers and map to char_set order
+            if '##' in s:
+                # Will be handled by positional fallback below
+                return None
+        return None
+
+    # First pass: try exact/header match
+    for line in lines:
+        header_name = _is_header(line)
+        if header_name:
+            if current_name and current_lines:
+                personal[current_name] = "\n".join(current_lines).strip()
+            current_name = header_name
+            current_lines = []
+            in_section = True
+        elif in_section:
+            current_lines.append(line)
+        else:
+            shared_lines.append(line)
+
+    if current_name and current_lines:
+        personal[current_name] = "\n".join(current_lines).strip()
+
+    shared = "\n".join(shared_lines).strip()
+
+    # Validation: all chars present, non-empty, no duplicates
+    if personal and char_set.issubset(set(personal.keys())):
+        vals = [v for v in personal.values() if v]
+        if len(vals) == len(char_set) and len(vals) == len(set(vals)):
+            return personal, shared
+
+    # Fallback: positional match by heading-like lines.
+    # Counts ## or deeper (not single # which is shared scene title).
+    # Also detects **...** and --- patterns.
+    heading_lines = []
+    for i, l in enumerate(lines):
+        s = l.strip()
+        if not s:
+            continue
+        # H2+ (## or more), or bold (**), or horizontal rule (---)
+        if s.startswith('##') or (s.startswith('**') and s.endswith('**')) or s.startswith('---'):
+            heading_lines.append((i, l))
+    if len(heading_lines) == len(char_set):
+        ordered_names = sorted(char_set)
+        personal = {}
+        shared_lines = lines[:heading_lines[0][0]] if heading_lines else []
+        for idx, (line_i, hline) in enumerate(heading_lines):
+            content_start = line_i + 1
+            content_end = heading_lines[idx + 1][0] if idx + 1 < len(heading_lines) else len(lines)
+            body = "\n".join(lines[content_start:content_end]).strip()
+            personal[ordered_names[idx]] = body
+        shared = "\n".join(shared_lines).strip()
+        if personal and all(v for v in personal.values()):
+            return personal, shared
+
+    return {}, text
+
+
 class SceneManager:
     """Scene Manager agent: scene lifecycle execution.
 
@@ -203,12 +309,98 @@ class SceneManager:
         self._prompt_text = read_prompt_text(prompt_path)
         self._temperature = temperature
         self._history_path = history_path
-        self._turn_qa_buffer: List[Dict[str, str]] = []
+        self._session_context_buffer: List[Dict[str, Any]] = []
+        # Thresholds: session buffer content before forcing publish
+        self._session_buffer_publish_chars: int = 3000    # ~600-900 tokens
+        self._session_buffer_force_chars: int = 60000     # ~15-20K tokens session safety cap
+        self._session_messages: List[BaseMessage] = []
+        self._session_llm: Any = None
         self._world = World()
         self._meta = HistoryMeta(
             (self._history_path.parent / "scene_manager_meta.json")
             if self._history_path else Path("scene_manager_meta.json"),
         )
+
+    def begin_session(self) -> None:
+        """Start a new session. All SM ops share one context."""
+        self._session_messages = [
+            SystemMessage(content=self._prompt_text),
+            *self._pinned_summaries(),
+        ]
+        self._session_llm = None
+
+    def end_session(self) -> None:
+        """End session. Clears transient state."""
+        self._session_messages = []
+        self._session_llm = None
+
+    def _get_session_llm(self):
+        """Lazy-create the session-level LLM (no tool binding)."""
+        if self._session_llm is None:
+            from openrouter_llm import build_openrouter_chat_llm
+            self._session_llm = build_openrouter_chat_llm(
+                temperature=float(self._temperature),
+                streaming=True,
+                title_suffix="-scene-manager",
+                max_tokens=2000,
+                parallel_tool_calls=False,
+            )
+        return self._session_llm
+    def perception_check(self, matched_intent: Any, observer: str) -> bool:
+        """Р’В§3.3 / Р’В§8 perception gate РІР‚вЂќ narrow structured query, NOT open narrative judgment.
+
+        Called by the segment scheduler (``scheduler/timeline.py``) only for structural
+        matches on a ``visibility == "private"`` intent. ``matched_intent`` is a
+        ``scheduler.timeline.Intent``. Returns True if ``observer`` perceives the
+        concealed action.
+        """
+        actor = str(getattr(matched_intent, "actor", "") or "").strip()
+        description = str(getattr(matched_intent, "description", "") or "").strip()
+        dd = getattr(matched_intent, "detection_difficulty", None)
+        dd_val = dd if dd is not None else 10
+
+        @tool
+        def perception_result(detected: bool) -> str:
+            """Report whether the observer notices the concealed action.
+
+            Args:
+                detected: True if the observer would plausibly notice this action
+                    given the scene and its detection_difficulty.
+            """
+            return "ok"
+
+        human_msg = (
+            "Perception check РІР‚вЂќ structural query, answer with the tool only.\n"
+            f"Observer: {observer}\n"
+            f"Concealed actor: {actor}\n"
+            f"Concealed action: {description[:200]}\n"
+            f"detection_difficulty: {dd_val}\n"
+
+        )
+        callbacks = openrouter_logging_callbacks(scope="scene_manager", label="perception_check")
+        try:
+            bound = self._get_session_llm().bind_tools(
+                [perception_result], tool_choice="required",
+            ).with_config({"callbacks": callbacks})
+        except TypeError:
+            bound = self._get_session_llm().bind_tools([perception_result]).with_config({"callbacks": callbacks})
+
+        messages = list(self._session_messages) + [HumanMessage(content=human_msg)]
+        for _attempt in range(10):
+            try:
+                out = bound.invoke(messages)
+            except Exception:
+                if _attempt == 9:
+                    raise
+                continue
+            tcs = _extract_tool_calls(out)
+            if tcs:
+                args = tcs[0].get("args") if isinstance(tcs[0], dict) else {}
+                if isinstance(args, dict) and "detected" in args:
+                    return bool(args.get("detected"))
+        raise RuntimeError("perception_check: exhausted 10 attempts without valid tool call")
+        return False  # conservative default: concealment holds when the check can't run
+
     def call_gm(self, notice: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Invoke the Game Master on-demand via ReAct loop.
 
@@ -220,100 +412,152 @@ class SceneManager:
             Dict with exit_tool, exit_args, thinking from the GM.
         """
         from gm.game_master import GameMaster
-        # Use a fresh GameMaster instance — history is loaded from disk.
+        # Use a fresh GameMaster instance РІР‚вЂќ history is loaded from disk.
         gm = GameMaster(
             history_path=self._history_path.parent / "game_master_messages.json"
             if self._history_path else None,
         )
         return gm.call_gm(notice=notice, context=context)
 
-    def resolve_character_question(
+    def resolve_player_question(
         self,
         *,
-        character_name: str,
+        player_name: str,
         questions: str,
     ) -> str:
-        """Answer a character's question, optionally escalating to GM.
+        """Answer a player's question from the scene."""
+        from world_manager.tool_registry import reset_doc_read_tracker
+        reset_doc_read_tracker("sm")
 
-        Gives the SM LLM a targeted choice:
-          - ``get_entity_facts`` + ``invoke_self`` — if it knows the answer
-          - ``escalate_to_gm`` — if it needs to escalate
-
-        Returns the answer text.
-        """
         from openrouter_llm import build_openrouter_chat_llm, openrouter_logging_callbacks
         from scene_manager.tools import (
-            get_entity_facts as _get_facts,
-            invoke_self as _sm_invoke,
-            escalate_to_gm as _esc_gm,
+            get_entity_facts, get_entity_state, get_scene, adjust_entity,
+            record_event, query_events,
+            close_invocation,
+            set_effect, remove_effect,
+            escalate_to_gm,
+            read_tool_doc,
         )
+        from scene_manager.tools import manage_intent, update_awareness, proceed_to_narration
 
         llm = build_openrouter_chat_llm(
             temperature=0.5,
             streaming=True,
             title_suffix="-scene-manager-qa",
             max_tokens=1000,
-            parallel_tool_calls=False,
+            parallel_tool_calls=True,
         )
 
         tools = [
-            _get_facts,
-            _sm_invoke,
-            _esc_gm,
+            get_entity_facts, get_entity_state, get_scene, adjust_entity,
+            record_event, query_events,
+            close_invocation,
+            set_effect, remove_effect,
+            escalate_to_gm,
+            read_tool_doc,
+            manage_intent, update_awareness, proceed_to_narration,
         ]
 
-        callbacks = openrouter_logging_callbacks(scope="scene_manager", label="resolve_character_question")
+        callbacks = openrouter_logging_callbacks(scope="scene_manager", label="resolve_player_question")
 
         try:
             bound = llm.bind_tools(
                 tools,
-                tool_choice="required",
             ).with_config({"callbacks": callbacks})
         except TypeError:
             bound = llm.bind_tools(tools).with_config({"callbacks": callbacks})
 
         task_msg = (
-            f"A character named \"{character_name}\" asks:\n"
-            f"{questions}\n\n"
-            "You have access to world data (get_entity_facts) and can "
-            "escalate to the Game Master (escalate_to_gm).\n"
-            "Choose ONE:\n"
-            "  - get_entity_facts — to look up entity facts yourself\n"
-            "  - escalate_to_gm — if you don't know and the GM needs to answer\n"
-            "  - invoke_self — if you already know the answer (pass it as comment)\n"
-            "Do not call the GM for questions you can answer yourself."
+            f"Player \"{player_name}\" asks the scene:\n{questions}"
         )
 
-        for _attempt in range(3):
+        # Append to turn conversation
+        self._session_messages.append(HumanMessage(content=task_msg))
+
+        has_pending_ids = "[observe:" in questions or "[recall:" in questions
+
+        for _attempt in range(10):
             try:
-                out = bound.invoke([
-                    SystemMessage(content=self._prompt_text),
-                    *self._pinned_summaries(),
-                    HumanMessage(content=task_msg),
-                ])
+                out = bound.invoke(self._session_messages)
             except Exception:
+                if _attempt == 9:
+                    raise
                 continue
 
             tcs = getattr(out, "tool_calls", None) or []
             if not tcs:
-                continue
-            tc = tcs[0]
-            name = str(tc.get("name") or "").strip()
-            args = tc.get("args") if isinstance(tc, dict) else {}
-            if not isinstance(args, dict):
+                # SM answered in text directly РІР‚вЂќ use that
+                text = str(getattr(out, "content", "") or "").strip()
+                if text:
+                    self._session_messages.append(AIMessage(content=text))
+                    self._session_context_buffer.append({
+                        "type": "qa",
+                        "content": f"{player_name}: {questions}\nAnswer: {text[:500]}",
+                    })
+                    if has_pending_ids:
+                        # Return as structured dict: extract pending_ids from questions
+                        ids = re.findall(r'\[(observe|recall):([^\]]+)\]', questions)
+                        return json.dumps({pid: text for _, pid in ids}, ensure_ascii=False)
+                    return text
                 continue
 
-            if name in ("invoke_self", "get_entity_facts"):
-                answer = str(args.get("comment") or
-                           args.get("id") or "I don't have an answer.").strip()
-                return f"[stub] {answer}" if name == "get_entity_facts" else answer
-            elif name == "escalate_to_gm":
-                notice = str(args.get("question") or questions).strip()
-                ctx = str(args.get("context") or "").strip()
-                result = self.call_gm(notice)
-                return str(result.get("exit_args") or result.get("thinking") or "No answer.").strip()
+            # Process all tool calls in the batch (parallel_tool_calls=True support)
+            final_answer = None
 
-        return "I could not resolve your question right now."
+            for tc in tcs:
+                name = str(tc.get("name") or "").strip()
+                args = tc.get("args") if isinstance(tc, dict) else {}
+                if not isinstance(args, dict):
+                    continue
+
+                if name == "escalate_to_gm":
+                    notice = str(args.get("question") or questions).strip()
+                    result = self.call_gm(notice)
+                    gm_answer = str(result.get("exit_args") or result.get("thinking") or "No answer.").strip()
+                    self._session_messages.append(AIMessage(content=gm_answer))
+                    self._session_context_buffer.append({
+                        "type": "qa",
+                        "content": f"{player_name}: {questions}\nAnswer: {gm_answer[:500]}",
+                    })
+                    if has_pending_ids:
+                        ids = re.findall(r'\[(observe|recall):([^\]]+)\]', questions)
+                        return json.dumps({pid: gm_answer for _, pid in ids}, ensure_ascii=False)
+                    return gm_answer
+
+                _qa_tool_map = {
+                    "get_entity_facts": get_entity_facts,
+                    "get_entity_state": get_entity_state,
+                    "get_scene": get_scene,
+                    "adjust_entity": adjust_entity,
+                    "record_event": record_event,
+                    "query_events": query_events,
+                    "close_invocation": close_invocation,
+                    "set_effect": set_effect,
+                    "remove_effect": remove_effect,
+                    "manage_intent": manage_intent,
+                    "update_awareness": update_awareness,
+                    "proceed_to_narration": proceed_to_narration,
+                }
+                fn = _qa_tool_map.get(name)
+                if fn:
+                    try:
+                        tool_result = fn.invoke(args)
+                        result_str = json.dumps(tool_result, ensure_ascii=False) if isinstance(tool_result, dict) else str(tool_result)
+                    except Exception as e:
+                        result_str = f"Tool error: {e}"
+                    tc_id = str(tc.get("id") or f"qa_{_attempt}") if isinstance(tc, dict) else f"qa_{_attempt}"
+                    self._session_messages.append(AIMessage(content=str(getattr(out, "content", "") or ""), tool_calls=[tc]))
+                    self._session_messages.append(ToolMessage(content=result_str, tool_call_id=tc_id, name=name))
+                    continue
+
+            # If some tools were executed, continue the loop for more SM processing
+            continue
+
+        self._session_context_buffer.append({
+            "type": "qa",
+            "content": f"{player_name}: {questions} [exhausted retries вЂ” no answer]",
+        })
+        raise RuntimeError(f"resolve_player_question: exhausted 10 attempts for player '{player_name}'")
 
     def get_entities_at_location(self, location: str) -> Dict[str, List[str]]:
         """Return {characters: [...], npcs: [...]} at this location.
@@ -337,78 +581,77 @@ class SceneManager:
                         npcs.append(nname)
         except Exception:
             pass
-        return {"characters": chars, "npcs": npcs}
+        return {"players": chars, "npcs": npcs}
 
     def determine_next_scene(self, last_scene_location: str) -> Dict[str, Any]:
-        """Determine next scene after a turn ends, without calling GM.
+        """Find all characters who need a scene (haven't acted) and group them.
 
+        Scene = characters who need to act. No location validation.
         Returns:
             {"type": "auto", "location": str, "character_names": [str],
              "npc_names": [str], "scene_description": ""}
-            or {"type": "needs_gm", "reason": "...", ...}
             or {"type": "no_scene", "reason": "..."}
         """
         try:
-            info = self._world.get_info()
-            chars = info.get("characters") if isinstance(info, dict) else []
+            chars = self._world.get_players()
             wt = self._world.get_world_time()
             wt_sec = wt.to_seconds()
 
-            # Find catch-up candidates (12h+ behind)
-            catch_up = None
+            # Check for next_scene_hint from end_scene tool
+            next_hint = str(self._world.get_info().get("next_scene_hint") or "").strip()
+            if next_hint:
+                # Clear the hint so it's only used once
+                try:
+                    from world.io import write_json
+                    info["next_scene_hint"] = ""
+                    write_json(self._world.paths.info_json, info)
+                except Exception:
+                    pass
+                # Try to find this location
+                locs = self._world.get_locations()
+                if next_hint in locs:
+                    # Gather all characters at or near this location
+                    all_at_loc = self.get_entities_at_location(next_hint)
+                    all_names = all_at_loc["players"]
+                    if all_names:
+                        return {
+                            "type": "auto",
+                            "location": next_hint,
+                            "character_names": all_names,
+                            "npc_names": all_at_loc["npcs"],
+                            "scene_description": "",
+                        }
+
+            # Group characters by location
+            location_groups: Dict[str, List[str]] = {}
             for ch in chars:
                 if not isinstance(ch, dict):
                     continue
                 name = str(ch.get("name") or "").strip()
                 loc = str(ch.get("location") or "").strip()
-                la = str(ch.get("last_acted") or "").strip()
                 if not name or not loc:
                     continue
-                if not la or la == "never":
-                    catch_up = (name, loc)
-                    break
-                try:
-                    la_wt = WorldTime.parse(la)
-                    gap_h = (wt_sec - la_wt.to_seconds()) / 3600
-                    if gap_h >= 12:
-                        catch_up = (name, loc)
-                        break
-                except Exception:
-                    continue
+                location_groups.setdefault(loc, []).append(name)
 
-            if catch_up:
-                pname, ploc = catch_up
-                # Check if location exists
-                try:
-                    self._world.get_location(ploc)
-                except Exception:
-                    return {
-                        "type": "needs_gm",
-                        "reason": "unknown_location",
-                        "player_name": pname,
-                        "missing_location": ploc,
-                    }
-                entities = self.get_entities_at_location(ploc)
-                return {
-                    "type": "auto",
-                    "location": ploc,
-                    "character_names": entities["characters"],
-                    "npc_names": entities["npcs"],
-                    "scene_description": "",
-                }
+            if not location_groups:
+                return {"type": "no_scene", "reason": "no_characters"}
 
-            # No catch-up needed: continue at same location
-            try:
-                self._world.get_location(last_scene_location)
-            except Exception:
-                return {"type": "no_scene", "reason": "no_valid_location"}
+            # Pick the largest group (all characters at the same location resume together)
+            target_loc = max(location_groups, key=lambda k: len(location_groups[k]))
+            target_chars = location_groups[target_loc]
 
-            entities = self.get_entities_at_location(last_scene_location)
+            # Include other entities at this location
+            all_at_loc = self.get_entities_at_location(target_loc)
+            all_char_names = list(dict.fromkeys(target_chars + all_at_loc["players"]))
+
+            if not all_char_names:
+                return {"type": "no_scene", "reason": "no characters available"}
+
             return {
                 "type": "auto",
-                "location": last_scene_location,
-                "character_names": entities["characters"],
-                "npc_names": entities["npcs"],
+                "location": target_loc,
+                "character_names": all_char_names,
+                "npc_names": all_at_loc["npcs"],
                 "scene_description": "",
             }
 
@@ -421,106 +664,62 @@ class SceneManager:
         location: str,
         character_names: List[str],
         npc_names: Optional[List[str]] = None,
-        llm: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Produce a scene description when players move to a new location.
 
         Calls the SM's LLM with a minimal scene description request.
         Returns dict with shared, personal_json, etc.
         """
-        if llm is None:
-            llm = build_openrouter_chat_llm(
-                temperature=float(self._temperature),
-                streaming=True,
-                title_suffix="-scene-manager",
-                max_tokens=1500,
-                parallel_tool_calls=False,
-            )
+        from scene_manager.tools import get_scene as sm_get_scene
 
-        from scene_manager.tools import get_scene as sm_get_scene, record_event as sm_rec_event, escalate_to_gm as sm_esc_gm
+        # Pre-fetch location data so SM has everything it needs РІР‚вЂќ no tool binding needed
+        location_data: Dict[str, Any] = {}
+        try:
+            location_data = sm_get_scene.invoke({"location_id": location})
+        except Exception:
+            pass
+
+        import json as _json
+        location_json = _json.dumps(location_data, ensure_ascii=False, indent=2)[:2000]
 
         callbacks = openrouter_logging_callbacks(scope="scene_manager", label="describe_scene", stream=True)
         human_msg = (
-            f"Players moved to a new location: {location}.\n"
+            f"Location: {location}\n"
             f"Characters: {', '.join(character_names)}\n"
             f"NPCs present: {', '.join(npc_names or []) or 'none'}\n\n"
-            "Describe this scene. Use get_scene(location_id) to read location state, "
-            "record_event(tag='scene') to log it. "
-            "If you need the Game Master's help, use escalate_to_gm."
+            f"Location data:\n{location_json}\n\n"
+            f"Describe this scene from each character's perspective."
         )
 
-        history_msgs: List[BaseMessage] = []
-        if self._history_path and self._history_path.exists():
-            history = load_history(self._history_path)
-            for h in history:
-                role = (h.get("role") or "").strip().lower()
-                content = str(h.get("content") or "")
-                if role == "user":
-                    history_msgs.append(HumanMessage(content=content))
-                elif role == "assistant":
-                    history_msgs.append(AIMessage(content=content))
+        # Append to turn conversation so SM sees context
+        self._session_messages.append(HumanMessage(content=human_msg))
 
-        messages = [
-            SystemMessage(content=self._prompt_text),
-            *self._pinned_summaries(),
-            *history_msgs,
-            HumanMessage(content=human_msg),
-        ]
-
-        try:
-            bound_llm = llm.bind_tools(
-                [sm_get_scene, sm_rec_event, sm_esc_gm],
-            ).with_config({"callbacks": callbacks})
-        except TypeError:
-            bound_llm = llm.bind_tools([sm_run_scene, sm_call_gm_tool]).with_config({"callbacks": callbacks})
-
-        import json as _json
-        for _attempt in range(3):
+        for _attempt in range(10):
             try:
-                out = bound_llm.invoke(messages)
+                out = self._get_session_llm().with_config({"callbacks": callbacks}).invoke(self._session_messages)
             except Exception:
+                if _attempt == 9:
+                    raise
                 continue
 
-            tool_calls = getattr(out, "tool_calls", None) or []
-            if not tool_calls:
-                continue
+            # Parse per-character descriptions from SM output
+            thinking = str(getattr(out, "content", "") or "").strip()
+            if thinking:
+                # Persist SM response in turn conversation
+                self._session_messages.append(AIMessage(content=thinking))
 
-            tc = tool_calls[0]
-            name = str(tc.get("name") or "").strip()
-            args = tc.get("args") if isinstance(tc, dict) else {}
-            if not isinstance(args, dict):
-                args = {}
+                personal, _shared = _parse_perspectives(thinking, character_names)
+                if personal:
+                    # Per-character descriptions only — no shared (avoids meta leaks)
+                    combined = "\n\n".join(
+                        f"{desc}" for name in character_names
+                        for desc in [personal.get(name, "")] if desc
+                    )
+                    return {"personal": personal, "combined": combined, "horizon_t": "15m"}
+                # Parsing failed — fall back to first valid personal if possible
+                return {"personal": {}, "combined": "", "horizon_t": "15m"}
 
-            if name == "call_gm":
-                notice = str(args.get("notice") or "").strip()
-                if notice:
-                    gm_result = self.call_gm(notice)
-                    messages.append(HumanMessage(
-                        content=f"[GM response]\n{gm_result.get('thinking', gm_result.get('exit_args', 'No response.'))}"
-                    ))
-                continue
-
-            shared = str(args.get("shared") or "").strip()
-            personal_raw = str(args.get("personal_json") or "").strip()
-            personal: Dict[str, str] = {}
-            if personal_raw:
-                try:
-                    obj = _json.loads(personal_raw)
-                    if isinstance(obj, dict):
-                        personal = {str(k): str(v).strip() for k, v in obj.items() if str(v).strip()}
-                except Exception:
-                    pass
-
-            if shared:
-                return {
-                    "shared": shared,
-                    "personal": personal,
-                    "combined": shared + ("\n\n" + "\n\n".join(
-                        f"[{n}]\n{t}" for n, t in personal.items()
-                    ) if personal else ""),
-                }
-
-        return {"shared": "", "personal": {}, "combined": ""}
+        raise RuntimeError(f"describe_scene: exhausted 10 attempts for location '{location}'")
 
     def run_summary_task(
         self,
@@ -532,7 +731,7 @@ class SceneManager:
         """Run a summarization task: paragraph or arc.
 
         Builds a request referencing only interaction entries since last summary.
-        No big context dump — the model already has full details in its history.
+        No big context dump РІР‚вЂќ the model already has full details in its history.
 
         Args:
             task_type: "paragraph" or "arc"
@@ -715,17 +914,44 @@ class SceneManager:
         except Exception:
             return []
 
-    def clear_turn_qa_buffer(self) -> None:
-        self._turn_qa_buffer.clear()
+    def add_resolved_segments_to_buffer(self, resolved_entries: List[Any]) -> None:
+        """Push scheduler-resolved segments into the cycle context buffer.
 
-    def run_turn_narration(
+        Args:
+            resolved_entries: list of ResolvedEntry from SegmentScheduler.run().
+                              Each entry has .actor, .action_type, .description,
+                              .t_start, .t_end, .kind, .perceivers.
+        """
+        for entry in resolved_entries:
+            desc = str(getattr(entry, "description", "") or "").strip()
+            if not desc:
+                continue
+            actor = str(getattr(entry, "actor", "?") or "?")
+            atype = str(getattr(entry, "action_type", "?") or "?")
+            target = str(getattr(entry, "target", "?") or "?")
+            kind = str(getattr(entry, "kind", "action") or "action")
+            content = f"{actor}: [{atype}] -> {target}: {desc[:300]}"
+            self._session_context_buffer.append({
+                "type": "segment",
+                "kind": kind,
+                "content": content,
+            })
+
+    def clear_session_context_buffer(self) -> None:
+        """Clear the session context buffer after publication."""
+        self._session_context_buffer.clear()
+
+    def run_narration(
         self,
         *,
         payload: Dict[str, Any],
         context_text: str,
         llm: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        """Run TURN_NARRATION using tool calls that return narrations and duration."""
+        """Run narration using tool calls that return narrations and duration."""
+        from world_manager.tool_registry import reset_doc_read_tracker, clear_current_agent
+        reset_doc_read_tracker("sm")
+
         if llm is None:
             from openrouter_llm import build_openrouter_chat_llm
             llm = build_openrouter_chat_llm(
@@ -737,54 +963,52 @@ class SceneManager:
             )
 
         callbacks = openrouter_logging_callbacks(scope="scene_manager", label="turn_narration")
-        from scene_manager.tools import record_event as _sm_rec, invoke_self as _sm_inv, escalate_to_gm as _sm_esc
+        from scene_manager.tools import (
+            get_entity_facts, get_entity_state, get_scene, adjust_entity,
+            record_event, query_events,
+            close_invocation,
+            set_effect, remove_effect,
+            escalate_to_gm,
+            read_tool_doc,
+        )
+        from scene_manager.tools import manage_intent, update_awareness, publish_narrative_block, end_scene
 
-        human_msg = self._build_turn_narration_message(payload)
+        human_msg = self._build_narration_message(payload)
 
-        history_msgs: List[BaseMessage] = []
-        if self._history_path and self._history_path.exists():
-            history = load_history(self._history_path)
-            for h in history:
-                role = (h.get("role") or "").strip().lower()
-                content = str(h.get("content") or "")
-                if role == "user":
-                    history_msgs.append(HumanMessage(content=content))
-                elif role == "assistant":
-                    history_msgs.append(AIMessage(content=content))
-
-        task_context = _context_for_turn_narration(context_text)
+        task_context = _context_for_narration(context_text)
         ctx_note = ("\n\n---\n" + task_context.strip()) if task_context and task_context.strip() else ""
 
-        messages = [
-            SystemMessage(content=self._prompt_text),
-            *self._pinned_summaries(),
-            *history_msgs,
-            HumanMessage(content=human_msg + ctx_note),
+        self._session_messages.append(HumanMessage(content=human_msg + ctx_note))
+
+        narration_tools = [
+            publish_narrative_block, end_scene, escalate_to_gm,
+            get_entity_facts, get_entity_state, get_scene, adjust_entity,
+            record_event, query_events,
+            close_invocation,
+            set_effect, remove_effect,
+            manage_intent, update_awareness,
+            read_tool_doc,
         ]
 
         try:
-            bound_llm = llm.bind_tools(
-                [_sm_rec, _sm_esc],
-                tool_choice="required",
-            ).with_config({"callbacks": callbacks})
+            bound_llm = self._get_session_llm().bind_tools(narration_tools).with_config({"callbacks": callbacks})
         except TypeError:
-            bound_llm = llm.bind_tools([_sm_rec, _sm_esc]).with_config({"callbacks": callbacks})
+            bound_llm = self._get_session_llm().bind_tools(narration_tools).with_config({"callbacks": callbacks})
 
         char_plans = payload.get("character_plans") if isinstance(payload.get("character_plans"), list) else []
         selected_characters = [str(p.get("name") or "").strip() for p in char_plans if str(p.get("name") or "").strip()]
 
-        narrations: Dict[str, str] = {}
         _coerced_dur: Optional[str] = None
         _shared_narration: str = ""
         _personal_narration: Dict[str, str] = {}
 
-        max_retries = 3
+        max_retries = 10
         for _attempt in range(max_retries):
             try:
-                out = bound_llm.invoke(messages)
+                out = bound_llm.invoke(self._session_messages)
             except Exception as exc:
                 if logs_enabled():
-                    print(f"[trace] SM run_turn_narration: LLM error, retrying: {exc}")
+                    print(f"[trace] SM run_narration: LLM error, retrying: {exc}")
                 continue
 
             # Capture thinking text (not saved to messages) for stream visibility.
@@ -797,10 +1021,10 @@ class SceneManager:
             tool_calls = _extract_tool_calls(out)
             if not tool_calls:
                 if logs_enabled():
-                    print(f"[trace] SM run_turn_narration: no tool call, retrying ({_attempt + 1}/{max_retries})")
+                    print(f"[trace] SM run_narration: no tool call, retrying ({_attempt + 1}/{max_retries})")
                 _append_tool_rejection(
-                    messages, out,
-                    "ERROR: You MUST call record_event or escalate_to_gm."
+                    self._session_messages, out,
+                    "ERROR: You MUST call publish_narrative_block or escalate_to_gm."
                 )
                 continue
 
@@ -820,47 +1044,111 @@ class SceneManager:
                 context_str = str(args0.get("context") or "").strip()
                 if not question:
                     if logs_enabled():
-                        print(f"[trace] SM run_turn_narration: empty escalate_to_gm question, retrying")
+                        print(f"[trace] SM run_narration: empty escalate_to_gm question, retrying")
                     _append_tool_rejection(
-                        messages, out,
+                        self._session_messages, out,
                         "ERROR: escalate_to_gm requires non-empty question.",
                     )
                     continue
+                # Actually call GM and get the answer
+                if logs_enabled():
+                    print(f"[trace] SM escalate_to_gm: {question[:120]}")
+                gm_result = self.call_gm(question, context={"scene_context": context_str} if context_str else None)
+                gm_answer = str(gm_result.get("exit_args") or gm_result.get("thinking") or "No answer from GM.").strip()
+                if logs_enabled():
+                    print(f"[trace] GM answer: {gm_answer[:200]}")
+                # Append GM response to turn messages so SM can use it
+                self._session_messages.append(AIMessage(content=f"[GM answer]\n{gm_answer}"))
+                # Continue the loop РІР‚вЂќ SM can now publish with the GM's answer incorporated
+                continue
+
+            if tool_name0 == "publish_narrative_block":
+                # Primary narration path РІР‚вЂќ SM submits narrative block via this tool.
+                narration = str(args0.get("narration") or "").strip()
+                if not narration:
+                    if logs_enabled():
+                        print(f"[trace] SM run_narration: empty narration, retrying")
+                    _append_tool_rejection(
+                        self._session_messages, out,
+                        "ERROR: narration is empty.",
+                    )
+                    continue
+                raw_duration = str(args0.get("duration") or "").strip()
+                if not raw_duration:
+                    if logs_enabled():
+                        print(f"[trace] SM run_narration: no duration, retrying")
+                    _append_tool_rejection(
+                        self._session_messages, out,
+                        "ERROR: duration is required. Specify how much in-game time this block covers (format: number + unit).",
+                    )
+                    continue
+                _coerced_dur = _coerce_duration(raw_duration)
+                if _coerced_dur is None:
+                    if logs_enabled():
+                        print(f"[trace] SM run_narration: unparseable duration {raw_duration!r}, retrying")
+                    _append_tool_rejection(
+                        self._session_messages, out,
+                        f"ERROR: duration '{raw_duration}' is not valid. Use format like '15m', '2h', '30s'.",
+                    )
+                    continue
+                _shared0 = narration
+                _selected_set0 = set(selected_characters)
+                _shared_narration = _shared0
+                _personal_narration = {}
+                break
+
+            if tool_name0 == "end_scene":
+                # SM explicitly ends the scene РІР‚вЂќ scene clears, next cycle bootstraps.
+                reason = str(args0.get("reason") or "").strip()
+                final_narration = str(args0.get("final_narration") or "").strip()
+                raw_duration = str(args0.get("duration") or "").strip()
+                coerced_dur = _coerce_duration(raw_duration) if raw_duration else None
                 return {
-                    "type": "correction",
-                    "character_name": question[:50],
-                    "turn_insight": question,
-                    "_context": context_str,
+                    "type": "end_scene",
+                    "reason": reason,
+                    "narration": final_narration,
+                    "duration": coerced_dur or "",
+                    "next_location": str(args0.get("next_location") or "").strip(),
                 }
 
             if tool_name0 == "record_event":
-                # Narration submitted — log it and proceed
+                # Legacy fallback РІР‚вЂќ prefer publish_narrative_block instead.
                 description = str(args0.get("description") or "").strip()
                 if not description:
                     if logs_enabled():
-                        print(f"[trace] SM run_turn_narration: empty description, retrying")
+                        print(f"[trace] SM run_narration: empty description, retrying")
                     _append_tool_rejection(
-                        messages, out,
-                        "ERROR: call_gm requires non-empty notice.",
+                        self._session_messages, out,
+                        "ERROR: description is empty.",
                     )
                     continue
-                gm_result = self.call_gm(notice)
-                # Inject GM response back into the conversation so the SM can continue
-                messages.append(HumanMessage(
-                    content=f"[GM response]\n{gm_result.get('thinking', gm_result.get('exit_args', 'No response.'))}"
-                ))
-                continue
+                raw_duration = str(args0.get("tag") or "").strip()
+                _coerced_dur = _coerce_duration(raw_duration) if raw_duration else None
+                if _coerced_dur is None:
+                    if logs_enabled():
+                        print(f"[trace] SM run_narration: record_event without duration, retrying")
+                    _append_tool_rejection(
+                        self._session_messages, out,
+                        "ERROR: record_event requires a duration in the 'tag' field. "
+                        "Prefer publish_narrative_block instead.",
+                    )
+                    continue
+                _shared0 = description
+                _selected_set0 = set(selected_characters)
+                _shared_narration = _shared0
+                _personal_narration = {}
+                break
 
             if tool_name0 != "turn_narration":
                 if logs_enabled():
-                    print(f"[trace] SM run_turn_narration: unexpected tool {tool_name0!r}, retrying")
+                    print(f"[trace] SM run_narration: unexpected tool {tool_name0!r}, retrying")
                 _append_tool_rejection(
-                    messages, out,
-                    "ERROR: Use record_event or escalate_to_gm.",
+                    self._session_messages, out,
+                    "ERROR: Use publish_narrative_block or escalate_to_gm.",
                 )
                 continue
 
-            # Old turn_narration handling — replaced by record_event
+            # Old turn_narration handling РІР‚вЂќ prefer publish_narrative_block instead.
             _shared0 = str(args0.get("shared") or "").strip()
             _personal_raw0 = str(args0.get("personal_json") or "").strip()
             duration0 = str(args0.get("duration") or "").strip()
@@ -876,15 +1164,19 @@ class SceneManager:
 
             if not _shared0:
                 if logs_enabled():
-                    print(f"[trace] SM run_turn_narration: empty description, retrying")
-                _append_tool_rejection(messages, out, "ERROR: description is empty. Provide non-empty description.")
+                    print(f"[trace] SM run_narration: empty description, retrying")
+                _append_tool_rejection(self._session_messages, out, "ERROR: description is empty. Provide non-empty description.")
                 continue
 
             _coerced_dur = _coerce_duration(duration0)
             if _coerced_dur is None:
                 if logs_enabled():
-                    print(f"[trace] SM run_turn_narration: no duration, continuing without")
-                _coerced_dur = "1 turn"
+                    print(f"[trace] SM run_narration: no duration, retrying")
+                _append_tool_rejection(
+                    self._session_messages, out,
+                    "ERROR: duration is required. Prefer publish_narrative_block.",
+                )
+                continue
 
             _selected_set0 = set(selected_characters)
             _personal0 = {k: v for k, v in _personal0.items() if k in _selected_set0}
@@ -896,69 +1188,78 @@ class SceneManager:
             _personal_narration = _personal0
             break
         else:
-            narrations = {}
-            _coerced_dur = None
+            raise ValueError(
+                "SM run_narration: exhausted retries. SM must call "
+                "publish_narrative_block or escalate_to_gm."
+            )
 
-        duration = _coerced_dur or ""
+        duration = _coerced_dur
         world_facts = ""
 
-        _narration_personal_blocks = "\n\n".join(
-            f"[{n}]\n{_personal_narration[n]}" for n in selected_characters if n in _personal_narration
+        # Per-character narration only — no shared narration (avoids info leaks)
+        _per_player_narratives: Dict[str, str] = {}
+        for cname in selected_characters:
+            parts: List[str] = []
+            if cycle_end_time:
+                parts.append(cycle_end_time)
+            personal = _personal_narration.get(cname, "").strip()
+            if personal:
+                parts.append(personal)
+            if parts:
+                _per_player_narratives[cname] = "\n\n".join(parts)
+
+        combined_narration = "\n\n".join(
+            f"[{n}]\n{_per_player_narratives[n]}"
+            for n in selected_characters if n in _per_player_narratives
         )
-        combined_narration = (
-            _shared_narration + "\n\n" + _narration_personal_blocks
-        ).strip() if _narration_personal_blocks else _shared_narration
 
         history_payload = dict(payload) if isinstance(payload, dict) else {}
-        turn_end_time = ""
+        cycle_end_time = ""
         try:
-            start_time = str(history_payload.get("turn_start_time") or "").strip()
+            start_time = str(history_payload.get("cycle_start_time") or "").strip()
             if start_time and duration:
                 start_wt = WorldTime.parse(start_time)
                 dur = WorldDuration.parse_user_input(duration)
-                turn_end_time = start_wt.add_duration(dur).to_string()
+                cycle_end_time = start_wt.add_duration(dur).to_string()
         except Exception:
-            turn_end_time = ""
-        if turn_end_time:
-            history_payload["turn_end_time"] = turn_end_time
+            cycle_end_time = ""
+        if cycle_end_time:
+            history_payload["cycle_end_time"] = cycle_end_time
 
-        history_user_msg = self._build_turn_history_message(history_payload, human_msg)
+        history_user_msg = self._build_history_message(history_payload, human_msg)
 
         if self._history_path and combined_narration:
             limits = limits_from_env()
             append_message(self._history_path, role="user", content=history_user_msg, limits=limits)
-            self._meta.append_entry("interaction", f"turn_narration at {history_payload.get('location','?')}")
+            self._meta.append_entry("interaction", f"narration at {history_payload.get('location','?')}")
             assistant_parts: List[str] = []
-            if turn_end_time:
-                assistant_parts.append(f"Turn end time: {turn_end_time}")
+            if cycle_end_time:
+                assistant_parts.append(f"Cycle end time: {cycle_end_time}")
             if duration:
-                assistant_parts.append(f"Turn duration: {duration}")
+                assistant_parts.append(f"Cycle duration: {duration}")
             assistant_parts.append(combined_narration)
             assistant_mem = "\n\n".join(assistant_parts)
             append_message(self._history_path, role="assistant", content=assistant_mem, limits=limits)
-            self._meta.append_entry("interaction", f"turn_narration result ({duration})")
+            self._meta.append_entry("interaction", f"narrated cycle ({duration}, {len(selected_characters)} chars)")
 
         if combined_narration:
-            self._turn_qa_buffer.clear()
+            self._session_context_buffer.clear()
 
         return {
             "type": "narration",
             "narration": combined_narration,
-            "narrations": narrations,
+            "personal_narration": dict(_per_player_narratives),
             "duration": duration,
             "world_facts": world_facts,
         }
 
-    def _build_turn_narration_message(self, payload: Dict[str, Any]) -> str:
+    def _build_narration_message(self, payload: Dict[str, Any]) -> str:
         """Build the human message for turn narration."""
         char_plans = payload.get("character_plans") if isinstance(payload.get("character_plans"), list) else []
         participant_names = [str(p.get("name") or "").strip() for p in char_plans if str(p.get("name") or "").strip()]
         round_history = payload.get("turn_round_history") if isinstance(payload.get("turn_round_history"), list) else []
 
-        msg = (
-            "Resolve this turn by choosing tools based on Correcting character intents"
-            " and Narrating a turn paragraphs:\n"
-        )
+        msg = "Turn narration:\n"
 
         if round_history:
             msg += "\nRound history for this same turn (oldest first):\n"
@@ -1006,6 +1307,37 @@ class SceneManager:
         if participant_names:
             msg += "\nParticipants:\n" + ", ".join(participant_names) + "\n"
 
+        # Declared intents (structured РІР‚вЂќ from declare_intent tool)
+        declared = payload.get("declared_intents") if isinstance(payload.get("declared_intents"), list) else []
+        if declared:
+            msg += "\nDeclared intents (all participants, unsorted):\n"
+            for di in declared:
+                actor = di.get("actor", "?")
+                atype = di.get("action_type", "?")
+                target = di.get("target", "?")
+                desc = str(di.get("description", "")).strip()
+                cond = di.get("trigger_condition") or ""
+                interval = _format_intent_interval(di)
+                priority = di.get("trigger_priority", 0)
+                on_trig = di.get("on_trigger", "")
+                visibility = str(di.get("visibility") or "public")
+                parts = [f"  {actor}: [{atype}] -> {target}" + (" (private)" if visibility == "private" else "")]
+                if desc:
+                    parts.append(f"    Intent: {desc}")
+                if isinstance(cond, dict):
+                    parts.append(f"    Trigger: {cond.get('actor','?')}/{cond.get('action_type','?')}->{cond.get('target_match','?')}")
+                elif cond:
+                    parts.append(f"    Trigger: {cond}")
+                if interval:
+                    parts.append(f"    Timing: {interval}")
+                if priority:
+                    parts.append(f"    Priority: {priority}")
+                if on_trig:
+                    parts.append(f"    On trigger: {on_trig}")
+                if di.get("is_hostile"):
+                    parts.append("    Hostile: true")
+                msg += "\n".join(parts) + "\n"
+
         if char_plans:
             msg += "\nPlayer intentions for this turn:\n"
             msg += "\n--- TURN BEGIN ---\n"
@@ -1019,20 +1351,115 @@ class SceneManager:
                         msg += f"  Secret thoughts: {thoughts}\n"
             msg += "\n--- TURN END ---\n"
 
-        if self._turn_qa_buffer:
-            msg += "\nAnswers you gave to player questions this turn:\n"
-            for entry in self._turn_qa_buffer:
-                msg += f"\n[{entry['character_name']}]\n"
-                msg += f"  Q: {entry['questions']}\n"
-                msg += f"  A: {entry['answer']}\n"
+        # РІвЂќР‚РІвЂќР‚ Inject cycle context buffer into narration prompt РІвЂќР‚РІвЂќР‚
+        buffer_text = self._build_session_buffer_summary()
+        if buffer_text:
+            msg += f"\n--- Session context (unpublished) ---\n{buffer_text}\n--- end session context ---\n"
 
         return msg
 
-    def _build_turn_history_message(self, payload: Dict[str, Any], default_msg: str) -> str:
+    def _build_resolve_message(self, payload: Dict[str, Any]) -> str:
+        """Build the resolve message for SM РІР‚вЂќ review intents, decide next step."""
+        char_plans = payload.get("character_plans") if isinstance(payload.get("character_plans"), list) else []
+        participant_names = [str(p.get("name") or "").strip() for p in char_plans if str(p.get("name") or "").strip()]
+        declared = payload.get("declared_intents") if isinstance(payload.get("declared_intents"), list) else []
+
+        msg = (
+            "Review all participant intents for this turn cycle.\n"
+            "Decide: are all intents compatible, or do some players need to react "
+            "to new information or correct their actions?\n\n"
+        )
+
+        if participant_names:
+            msg += f"Participants: {', '.join(participant_names)}\n\n"
+
+        if declared:
+            msg += "Declared intents (all participants):\n"
+            for di in declared:
+                actor = di.get("actor", "?")
+                atype = di.get("action_type", "?")
+                target = di.get("target", "?")
+                desc = str(di.get("description", "")).strip()
+                cond = di.get("trigger_condition") or ""
+                interval = str(di.get("interval", "")).strip()
+                priority = di.get("trigger_priority", 0)
+                on_trigger = di.get("on_trigger", "")
+                reaction = str(di.get("prepared_reaction", "")).strip()
+                parts = [f"  {actor}: [{atype}] -> {target}"]
+                if desc:
+                    parts.append(f"    {desc}")
+                if cond:
+                    if isinstance(cond, dict):
+                        parts.append(f"    Trigger: {cond.get('actor','?')}/{cond.get('action_type','?')}->{cond.get('target_match','?')}")
+                    else:
+                        parts.append(f"    Trigger: {cond}")
+                if interval:
+                    parts.append(f"    Duration: {interval}")
+                if priority:
+                    parts.append(f"    Priority: {priority}")
+                if on_trigger:
+                    parts.append(f"    On trigger: {on_trigger}")
+                if reaction:
+                    parts.append(f"    Prepared: {reaction}")
+                msg += "\n".join(parts) + "\n"
+
+        if char_plans:
+            msg += "\nCommit descriptions:\n"
+            for plan in char_plans:
+                if isinstance(plan, dict):
+                    name = plan.get("name") or "?"
+                    action = plan.get("intent") or plan.get("action") or "acts"
+                    thoughts = str(plan.get("thoughts") or "").strip()
+                    msg += f"\n{name}: {action}\n"
+                    if thoughts:
+                        msg += f"  (internal: {thoughts[:200]})\n"
+
+        # Append timeline segments if available
+        timeline_text = str(payload.get("timeline_text") or "").strip()
+        if timeline_text:
+            msg += f"\n---\n{timeline_text}\n---\n"
+
+        return msg
+
+    def session_buffer_chars(self) -> int:
+        """Return estimated character count of accumulated session context."""
+        return sum(len(str(e.get("content", ""))) for e in self._session_context_buffer)
+
+    def is_session_buffer_ready(self) -> bool:
+        """Check if session context buffer has crossed the publication threshold."""
+        return self.session_buffer_chars() >= self._session_buffer_publish_chars
+
+    def is_session_buffer_force(self) -> bool:
+        """Check if session safety cap is reached (force publish regardless)."""
+        return self.session_buffer_chars() >= self._session_buffer_force_chars
+
+    def _build_session_buffer_summary(self) -> str:
+        """Build a compact summary of accumulated session context."""
+        if not self._session_context_buffer:
+            return ""
+        parts: List[str] = []
+        for entry in self._session_context_buffer:
+            etype = entry.get("type", "note")
+            content = str(entry.get("content", "")).strip()
+            if not content:
+                continue
+            if etype == "qa":
+                parts.append(f"[QA] {content}")
+            elif etype == "segment":
+                parts.append(f"[Segment] {content}")
+            elif etype == "escalation":
+                parts.append(f"[Escalation] {content}")
+            elif etype == "interrupt":
+                parts.append(f"[Interrupt] {content}")
+            else:
+                parts.append(content)
+        return "\n".join(parts)
+
+    def _build_history_message(self, payload: Dict[str, Any], default_msg: str) -> str:
         """Build a compact, durable history entry for a turn."""
         location = str(payload.get("location") or "").strip()
-        start_time = str(payload.get("turn_start_time") or "").strip()
-        end_time = str(payload.get("turn_end_time") or "").strip()
+        start_time = str(payload.get("cycle_start_time") or "").strip()
+        end_time = str(payload.get("cycle_end_time") or "").strip()
         char_plans = payload.get("character_plans") if isinstance(payload.get("character_plans"), list) else []
 
         header_parts: List[str] = []

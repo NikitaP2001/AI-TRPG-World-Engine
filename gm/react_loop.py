@@ -241,8 +241,16 @@ def react_loop_iteration(
             messages.append(ToolMessage(content=str(result), tool_call_id=tc_id, name=name))
 
             if name in termination_tools:
-                exit_tool = name
-                exit_args = args
+                # Only treat as exit if the tool succeeded (no error returned)
+                result_str = str(result) if result is not None else ""
+                is_error = (
+                    (isinstance(result, dict) and result.get("status") == "error")
+                    or result_str.startswith("Error:")
+                    or "ERROR:" in result_str
+                )
+                if not is_error:
+                    exit_tool = name
+                    exit_args = args
 
             if name not in readonly_tools and name not in termination_tools:
                 write_confirmations.append(f"[tool:{name}] wrote data")

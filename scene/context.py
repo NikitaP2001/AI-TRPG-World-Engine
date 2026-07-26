@@ -21,13 +21,13 @@ def story_turn_fingerprint(turn: Dict[str, Any]) -> str:
     """Return a stable JSON string that uniquely identifies a story turn."""
     if not isinstance(turn, dict):
         return ""
-    chars = turn.get("characters") if isinstance(turn.get("characters"), list) else []
+    chars = turn.get("players") if isinstance(turn.get("players"), list) else []
     npcs = turn.get("npcs") if isinstance(turn.get("npcs"), list) else []
     data = {
         "start_time": str(turn.get("start_time") or "").strip(),
         "end_time": str(turn.get("end_time") or "").strip(),
         "location": str(turn.get("location") or "").strip(),
-        "characters": sorted(str(x).strip() for x in chars if str(x).strip()),
+        "players": sorted(str(x).strip() for x in chars if str(x).strip()),
         "npcs": sorted(str(x).strip() for x in npcs if str(x).strip()),
         "narration": str(turn.get("narration") or "").strip(),
     }
@@ -125,7 +125,7 @@ def find_reusable_scene_description(
         if not target:
             return None
         for turn in turns:
-            chars = turn.get("characters") if isinstance(turn.get("characters"), list) else []
+            chars = turn.get("players") if isinstance(turn.get("players"), list) else []
             if any(str(x).strip() == target for x in chars):
                 return turn
         return None
@@ -150,7 +150,7 @@ def find_reusable_scene_description(
         if story_turn_fingerprint(turn0) != story_turn_fingerprint(newest_turn):
             return ""
 
-    turn_chars = turn0.get("characters") if isinstance(turn0.get("characters"), list) else []
+    turn_chars = turn0.get("players") if isinstance(turn0.get("players"), list) else []
     turn_char_names = sorted(str(x).strip() for x in turn_chars if str(x).strip())
     selected_char_names = sorted(str(x).strip() for x in (selected_characters or []) if str(x).strip())
     if turn_char_names != selected_char_names:
@@ -200,7 +200,7 @@ def build_focused_scene_context(
     character_last_turns: List[Dict[str, Any]] = []
     for cname in selected_characters:
         for t in turns:
-            chars = t.get("characters") if isinstance(t.get("characters"), list) else []
+            chars = t.get("players") if isinstance(t.get("players"), list) else []
             if any(str(x).strip() == cname for x in chars):
                 _add_turn_if_new(character_last_turns, t)
                 break
@@ -247,7 +247,7 @@ def build_focused_scene_context(
     focused_payload: Dict[str, Any] = {
         "selected_scene": {
             "location": selected_location,
-            "characters": selected_characters,
+            "players": selected_characters,
             "npcs": selected_npcs,
         }
     }

@@ -35,16 +35,16 @@ def initialize_game_dir(*, init_root: str = "init", game_root: str = "game") -> 
     game_path = (workspace / game_root).resolve()
 
     # Ensure base folders exist.
-    (game_path / "characters").mkdir(parents=True, exist_ok=True)
+    (game_path / "players").mkdir(parents=True, exist_ok=True)
 
-    init_chars = init_path / "characters"
+    init_chars = init_path / "players"
     if not init_chars.exists() or not init_chars.is_dir():
         # Nothing to seed.
         return
 
     for char_dir in sorted([p for p in init_chars.iterdir() if p.is_dir()], key=lambda p: p.name.lower()):
         src = char_dir
-        dst = game_path / "characters" / char_dir.name
+        dst = game_path / "players" / char_dir.name
         dst.mkdir(parents=True, exist_ok=True)
 
         for json_file in src.glob("*.json"):

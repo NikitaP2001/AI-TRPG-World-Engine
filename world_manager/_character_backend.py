@@ -3,12 +3,12 @@
 Maps entity fields to character file structure:
   Entity field     Character file
   facts            description.json (written as structured JSON)
-  state            state.json (hp, fp, conditions, injuries)
+  state            state.json (hp, fp, conditions, injuries, location)
   skills           skills.json (ST/DX/IQ/HT, cached_skills, passive_abilities)
   equipment        equipment.json (signature, inventory, currency)
   gurps            skills.json.stats (ST/DX/IQ/HT)
   tags             metadata.json._tags
-  position         description.json.location (legacy format)
+  position         state.json.location ({"inside": id} or {"coords": [lat, lon, z]})
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ class CharacterFileBackend(EntityBackend):
     """
 
     def __init__(self, game_root: Path = Path("game")):
-        self._char_root = (game_root / "characters").resolve()
+        self._char_root = (game_root / "players").resolve()
 
     def _char_dir(self, name: str) -> Path:
         return (self._char_root / name).resolve()
@@ -83,9 +83,16 @@ class CharacterFileBackend(EntityBackend):
             desc = {"general": facts, "race": "", "personality": {}}
             self._write_json(char_dir / "description.json", desc)
             if state is not None:
+                if position:
+                    state["location"] = position
                 self._write_json(char_dir / "state.json", state)
             if skills is not None:
+                if gurps:
+                    skills["stats"] = gurps
                 self._write_json(char_dir / "skills.json", skills)
+            elif gurps is not None:
+                # gurps without skills — create skills.json with stats
+                self._write_json(char_dir / "skills.json", {"stats": gurps})
             if equipment is not None:
                 self._write_json(char_dir / "equipment.json", equipment)
             if tags:
@@ -98,9 +105,22 @@ class CharacterFileBackend(EntityBackend):
                 desc["general"] = facts
                 self._write_json(char_dir / "description.json", desc)
             if state is not None:
+                if position:
+                    state["location"] = position
                 self._write_json(char_dir / "state.json", state)
+            elif position:
+                # Position-only update — merge into existing state.json
+                existing_state = self._read_json(char_dir / "state.json")
+                existing_state["location"] = position
+                self._write_json(char_dir / "state.json", existing_state)
             if skills is not None:
+                if gurps:
+                    skills["stats"] = gurps
                 self._write_json(char_dir / "skills.json", skills)
+            elif gurps is not None:
+                existing_skills = self._read_json(char_dir / "skills.json")
+                existing_skills["stats"] = gurps
+                self._write_json(char_dir / "skills.json", existing_skills)
             if equipment is not None:
                 self._write_json(char_dir / "equipment.json", equipment)
             if tags is not None:
@@ -124,6 +144,9 @@ class CharacterFileBackend(EntityBackend):
 
         gurps_stats = skills.get("stats", {}) if skills else {}
 
+        # Read position from state.json.location
+        position = state.get("location", {}) if state else {}
+
         return {
             "id": name,
             "type": "character",
@@ -135,7 +158,7 @@ class CharacterFileBackend(EntityBackend):
             "equipment": equip,
             "stats": {},
             "tags": meta.get("_tags", []),
-            "position": {},
+            "position": position,
             "scripts": [],
             "effects": [],
             "movement": None,
@@ -209,7 +232,7 @@ class CharacterFileBackend(EntityBackend):
                 "equipment": entity.get("equipment", {}),
                 "stats": {},
                 "tags": entity.get("tags", []),
-                "position": {},
+                "position": entity.get("position", {}),
                 "active_effects": [],
                 "script_count": 0,
             })

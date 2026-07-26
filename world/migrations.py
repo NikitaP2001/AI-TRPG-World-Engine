@@ -36,7 +36,7 @@ def _latest_character_last_acted_from_story(*, story_json: Path) -> Dict[str, st
         except Exception:
             return
 
-        chars = turn.get("characters")
+        chars = turn.get("players")
         if not isinstance(chars, list):
             return
 
@@ -109,7 +109,7 @@ def ensure_character_description_fields(*, game_root: Path) -> None:
     overwrites user/seed values.
     """
 
-    chars_dir = (game_root / "characters").resolve()
+    chars_dir = (game_root / "players").resolve()
     if not chars_dir.exists():
         return
 
@@ -141,6 +141,18 @@ def ensure_character_description_fields(*, game_root: Path) -> None:
         # Remove legacy knowledge list from description.json (now handled by character diary).
         if "knowledge" in data:
             data.pop("knowledge", None)
+            changed = True
+
+        # Strip fields that now live in separate files (state.json, skills.json, equipment.json)
+        for redundant_field in ["skills", "equipment", "stats", "gurps", "status"]:
+            if redundant_field in data:
+                data.pop(redundant_field, None)
+                changed = True
+
+        # Strip location from description.json — it lives in metadata.json now.
+        # Location in description.json is only a narrative starting hint, not authoritative.
+        if "location" in data and data["location"]:
+            data.pop("location", None)
             changed = True
 
         # Default/normalize character status.
@@ -196,7 +208,7 @@ def ensure_character_metadata_fields(*, game_root: Path) -> None:
     directly edited by the LLM (e.g., last_acted).
     """
 
-    chars_dir = (game_root / "characters").resolve()
+    chars_dir = (game_root / "players").resolve()
     if not chars_dir.exists():
         return
 
@@ -251,7 +263,7 @@ def migrate_character_last_acted_to_metadata(*, game_root: Path) -> None:
     it from description.json.
     """
 
-    chars_dir = (game_root / "characters").resolve()
+    chars_dir = (game_root / "players").resolve()
     if not chars_dir.exists():
         return
 
@@ -352,7 +364,7 @@ def ensure_story_schema_v2(*, story_json: Path) -> None:
                     "start_time": "",
                     "turns": [],
                     "locations": [],
-                    "characters": [],
+                    "players": [],
                     "npcs": [],
                 },
             }
@@ -375,7 +387,7 @@ def ensure_story_schema_v2(*, story_json: Path) -> None:
                     "start_time": "",
                     "end_time": "",
                     "locations": [],
-                    "characters": [],
+                    "players": [],
                     "npcs": [],
                     "summary": str(p),
                     "turn_count": 0,
@@ -397,7 +409,7 @@ def ensure_story_schema_v2(*, story_json: Path) -> None:
             "start_time": "",
             "turns": [],
             "locations": [],
-            "characters": [],
+            "players": [],
             "npcs": [],
         }
         changed = True
@@ -406,7 +418,7 @@ def ensure_story_schema_v2(*, story_json: Path) -> None:
             ("start_time", ""),
             ("turns", []),
             ("locations", []),
-            ("characters", []),
+            ("players", []),
             ("npcs", []),
         ):
             if k not in ongoing:
@@ -450,7 +462,7 @@ def ensure_scene_schema_v2(*, scene_json: Path) -> None:
         scene["scene_description"] = ""
         changed = True
 
-    chars = scene.get("characters") if isinstance(scene.get("characters"), dict) else {}
+    chars = scene.get("players") if isinstance(scene.get("players"), dict) else {}
     if isinstance(chars, dict):
         for name, entry in chars.items():
             e = entry if isinstance(entry, dict) else {}
@@ -479,10 +491,10 @@ def ensure_scene_schema_v2(*, scene_json: Path) -> None:
                 e["corrections_exhausted"] = False
                 changed = True
             chars[name] = e
-        scene["characters"] = chars
+        scene["players"] = chars
 
-    if "initiative_order" not in scene:
-        scene["initiative_order"] = list(chars.keys()) if isinstance(chars, dict) else []
+    if "player_order" not in scene:
+        scene["player_order"] = list(chars.keys()) if isinstance(chars, dict) else []
         changed = True
 
     # Remove the legacy iteration sub-object.

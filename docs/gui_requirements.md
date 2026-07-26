@@ -52,8 +52,8 @@ The GUI serves two distinct users:
 
 | User | Goal | Perspective |
 |---|---|---|
-| **Player / GM** | Run the game, read narrative, make decisions | Narrative Engine (Level 1) |
-| **World Builder / Debugger** | Inspect simulation state, monitor agents, edit entities | World Simulation (Level 2) |
+| **Player / GM** | Run the game, read narrative, make decisions | Narrative play |
+| **World Builder / Debugger** | Inspect world state, monitor agents, edit entities | Entity store / agents |
 
 The GUI must support **both** without forcing either into the wrong view.
 
@@ -168,7 +168,7 @@ Requirements:
 
 ---
 
-## §3 World Views (Level 2 — Simulation Layer)
+## §3 World Views (Entity Store & Agents)
 
 ### 3.1 Entity Browser (Right Panel)
 

@@ -21,19 +21,19 @@ from openrouter_langchain_logging import logs_enabled
 # ---------------------------------------------------------------------------
 # Turn recap persistence (for WebUI display of character thoughts/actions)
 # ---------------------------------------------------------------------------
-_TURN_RECAPS_FILENAME = "turn_recaps.jsonl"
+_CYCLE_RECAPS_FILENAME = "cycle_recaps.jsonl"
 _GUI_STREAM_INPUT_LOCK = threading.Lock()
 
 
-def append_turn_recap(game_root: Path, result: Dict[str, Any]) -> None:
-    """Append a turn recap dict as a single JSON line to turn_recaps.jsonl.
+def append_cycle_recap(game_root: Path, result: Dict[str, Any]) -> None:
+    """Append a cycle recap dict as a single JSON line to cycle_recaps.jsonl.
 
     The WebUI reads this file to display per-character thoughts and actions
-    on each turn card.  We keep it separate from SA messages so we don't
+    on each cycle card.  We keep it separate from SA messages so we don't
     inject orphaned ToolMessages that would confuse the SA's ReAct loop.
     """
     try:
-        recaps_path = game_root / _TURN_RECAPS_FILENAME
+        recaps_path = game_root / _CYCLE_RECAPS_FILENAME
         with open(recaps_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(result, ensure_ascii=False) + "\n")
     except Exception:
@@ -101,7 +101,7 @@ def looks_like_pseudo_tool_markup(text: str) -> bool:
             return True
     output_indicators = [
         '"narration"', '"turn_duration"', '"location"',
-        '"characters"', '"state"', '"npcs"', '"acted"', '"_context_notice"',
+        '"players"', '"state"', '"npcs"', '"acted"', '"_context_notice"',
     ]
     count = sum(1 for ind in output_indicators if ind in t)
     if '```json' in t and count >= 2:
@@ -136,7 +136,7 @@ def is_tool_error_message(text: str) -> bool:
             "not available in the current context",
             "context changed during this invocation",
             "is not a valid tool",
-            "turn already finalized",
+            "cycle already finalized",
             "please fix your mistakes",
             "not all characters ended",
             "is not valid right now",

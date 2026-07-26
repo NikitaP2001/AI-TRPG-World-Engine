@@ -1,4 +1,4 @@
-﻿"""GUI Panels вЂ” Dear ImGui panels for LLM World.
+"""GUI Panels — Dear ImGui panels for LLM World.
 
 Each panel is a function that renders one UI section.
 Panels are assembled in opengl_app/main.py.
@@ -13,7 +13,7 @@ import imgui
 from opengl_app.gui_bridge import GuiBridge as B
 
 
-# в”Ђв”Ђ Style в”Ђв”Ђ
+# ── Style ──
 
 _COL_BG = (0.06, 0.09, 0.16, 1.0)       # slate-900
 _COL_SURFACE = (0.12, 0.16, 0.23, 1.0)  # slate-800
@@ -54,7 +54,7 @@ def _init_style(scale: float = 1.0):
     style.colors[imgui.COLOR_BORDER] = _COL_BORDER
     style.colors[imgui.COLOR_BUTTON] = _COL_SURFACE2
     style.colors[imgui.COLOR_HEADER] = _COL_SURFACE2
-    # Style dimensions — scale for HiDPI
+    # Style dimensions � scale for HiDPI
     style.window_rounding = 4.0 * scale
     style.frame_rounding = 3.0 * scale
     style.child_rounding = 2.0 * scale
@@ -72,7 +72,7 @@ def _init_style(scale: float = 1.0):
     style.mouse_cursor_scale = max(1.0, scale)
 
 
-# в”Ђв”Ђ Helpers в”Ђв”Ђ
+# ── Helpers ──
 
 def _icon(entity_type: str) -> str:
     return {"character": "@", "npc": "%", "location": "#",
@@ -103,12 +103,12 @@ def _hp_bar(label: str, current: float, maximum: float, width: float = 80):
     imgui.set_cursor_screen_pos((cursor.x, cursor.y + height + 2))
 
 
-# в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+# ══════════════════════════════════════════════════════════════════
 # PANELS
-# в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+# ══════════════════════════════════════════════════════════════════
 
 
-# в”Ђв”Ђ Scene View в”Ђв”Ђ
+# ── Scene View ──
 
 _scene_expanded: Dict[str, bool] = {}
 _scene_input: str = ""
@@ -130,8 +130,8 @@ def panel_scene_view():
     imgui.text(f"Location: {loc_name}  |  Time: {wt}")
     imgui.separator()
 
-    # в”Ђв”Ђ Characters present в”Ђв”Ђ
-    chars = scene.get("characters", {})
+    # ── Characters present ──
+    chars = scene.get("players", {})
     if isinstance(chars, dict):
         imgui.text("Characters:")
         imgui.indent(10)
@@ -155,7 +155,7 @@ def panel_scene_view():
 
     imgui.separator()
 
-    # в”Ђв”Ђ NPCs present в”Ђв”Ђ
+    # ── NPCs present ──
     npc_names = scene.get("npcs", [])
     if npc_names:
         imgui.text("NPCs:")
@@ -168,7 +168,7 @@ def panel_scene_view():
 
     imgui.separator()
 
-    # в”Ђв”Ђ Character input в”Ђв”Ђ
+    # ── Character input ──
     if isinstance(chars, dict) and chars:
         char_names = list(chars.keys())
         current_char = _scene_char_inputs.get("_selected", char_names[0])
@@ -201,7 +201,7 @@ def panel_scene_view():
     imgui.end()
 
 
-# в”Ђв”Ђ Entity Browser в”Ђв”Ђ
+# ── Entity Browser ──
 
 _entity_filter: str = ""
 _entity_type_filter: str = "all"
@@ -262,7 +262,7 @@ def panel_entity_browser(on_select):
     imgui.end()
 
 
-# в”Ђв”Ђ Entity Editor в”Ђв”Ђ
+# ── Entity Editor ──
 
 _editor_data: Dict[str, Any] = {}
 _editor_id: str = ""
@@ -481,7 +481,7 @@ def editor_open(entity_id: str):
     _editor_dirty = False
 
 
-# в”Ђв”Ђ Story Timeline в”Ђв”Ђ
+# ── Story Timeline ──
 
 _story_expanded: Dict[str, bool] = {}
 
@@ -522,7 +522,7 @@ def panel_story_timeline():
     imgui.end()
 
 
-# в”Ђв”Ђ Event Log в”Ђв”Ђ
+# ── Event Log ──
 
 _event_filter: str = ""
 _event_show_auto: bool = True
@@ -562,7 +562,7 @@ def panel_event_log():
     imgui.end()
 
 
-# в”Ђв”Ђ Agent Dashboard в”Ђв”Ђ
+# ── Agent Dashboard ──
 
 _agent_status_data: Dict[str, Any] = {}
 
@@ -598,7 +598,7 @@ def panel_agent_dashboard():
     imgui.end()
 
 
-# в”Ђв”Ђ Prompt Inspector в”Ђв”Ђ
+# ── Prompt Inspector ──
 
 _prompt_agent: str = "gm"
 _prompt_messages: List[Dict[str, Any]] = []
@@ -697,7 +697,7 @@ def panel_prompt_inspector():
     imgui.end()
 
 
-# в”Ђв”Ђ Script/Effect Monitor в”Ђв”Ђ
+# ── Script/Effect Monitor ──
 
 def panel_script_monitor():
     imgui.begin("Automations", None, imgui.WINDOW_NO_MOVE | imgui.WINDOW_NO_COLLAPSE | imgui.WINDOW_NO_RESIZE)

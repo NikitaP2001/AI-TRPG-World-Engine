@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 from world_manager._json_backend import JsonFileBackend
 from world_manager._character_backend import CharacterFileBackend
+from world_manager._location_backend import LocationFileBackend
 from world_manager._composite_backend import CompositeBackend
 
 
@@ -22,7 +23,8 @@ def _get_backend() -> CompositeBackend:
     if _backend is None:
         json_backend = JsonFileBackend()
         char_backend = CharacterFileBackend()
-        _backend = CompositeBackend(json_backend, char_backend)
+        loc_backend = LocationFileBackend()
+        _backend = CompositeBackend(json_backend, char_backend, loc_backend)
     return _backend
 
 
@@ -33,6 +35,33 @@ def reset_backend() -> None:
 
 
 # ── Public API (same signatures as old entity_store.py) ──
+
+
+def _validate_position(position: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Check position format. Returns error string or None if valid."""
+    if not position:
+        return None
+    valid_keys = {"inside", "near", "coords", "offset"}
+    extra = set(position.keys()) - valid_keys
+    if extra:
+        return f"Unknown position key(s): {', '.join(sorted(extra))}."
+    if "coords" in position:
+        coords = position["coords"]
+        if not isinstance(coords, (list, tuple)) or len(coords) < 2:
+            return "coords must be [lat, lon] or [lat, lon, z]."
+        lat, lon = coords[0], coords[1]
+        if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+            return "coords values must be numbers."
+        if lat < -90 or lat > 90:
+            return f"Latitude must be between -90 and 90, got {lat}."
+        if lon < -180 or lon > 180:
+            return f"Longitude must be between -180 and 180, got {lon}."
+    for key in ("inside", "near"):
+        if key in position:
+            ref = position[key]
+            if not isinstance(ref, str) or not ref.strip():
+                return f"{key} must be a non-empty entity_id."
+    return None
 
 
 def set_entity(
@@ -48,7 +77,14 @@ def set_entity(
     skills: Optional[Dict[str, Any]] = None,
     equipment: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Create or update any entity. Routes to correct backend automatically."""
+    """Create or update any entity. Routes to correct backend automatically.
+
+    Position validation: coords must be valid lat/lon (-90..90, -180..180);
+    inside/near must reference a non-empty entity_id.
+    """
+    err = _validate_position(position)
+    if err:
+        return {"status": "error", "error": f"Invalid position: {err}"}
     return _get_backend().set(
         id=id, type=type, base_type=base_type,
         facts=facts, gurps=gurps, stats=stats,

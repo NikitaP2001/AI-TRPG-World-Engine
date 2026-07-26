@@ -68,13 +68,11 @@ def build_encounter_list(
     known: Dict[str, str] = {}  # name_lower -> "player" | "npc"
 
     if world is not None:
-        # Player characters from info.json
+        # Player characters from entity store
         try:
-            info = world.get_info()
-            for ch in (info.get("characters") or []):
+            for ch in world.get_players():
                 if isinstance(ch, dict):
                     n = str(ch.get("name") or "").strip()
-                    loc = str(ch.get("location") or "").strip()
                     if n and n.lower() != character_name.lower():
                         known[n.lower()] = "player"
         except Exception:

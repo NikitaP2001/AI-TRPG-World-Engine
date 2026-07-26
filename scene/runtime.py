@@ -41,50 +41,25 @@ class Scene:
         if not character_names:
             raise ValueError("character_names must not be empty")
 
-        # Validate location exists.
-        _ = self.world.get_location(location)
-
-        # Require a non-empty scene description.
+        # Require a non-empty scene description unless player_descriptions are provided.
         desc = str(scene_description or "").strip()
-        if not desc:
+        player_desc = player_descriptions or {}
+        if not desc and not player_desc:
             raise ValueError(
-                "scene_description is required — cannot start a scene without describing it."
+                "scene_description or player_descriptions required — cannot start a scene without describing it."
             )
 
         existing = self.world.get_scene()
         if isinstance(existing, dict) and existing.get("state") == "active":
-            # Idempotency: if the exact same scene is already active, return it.
+            # Idempotency: if same characters, return existing scene
             try:
-                existing_loc = str(existing.get("location") or "")
-                existing_chars = existing.get("characters")
+                existing_chars = existing.get("players")
                 existing_names = list(existing_chars.keys()) if isinstance(existing_chars, dict) else []
-                existing_npcs = existing.get("npcs")
-                existing_npc_names = (
-                    [str(x) for x in existing_npcs if str(x).strip()] if isinstance(existing_npcs, list) else []
-                )
-                desired_npc_names = [str(x) for x in (npc_names or []) if str(x).strip()]
-                if (
-                    existing_loc == location
-                    and sorted([str(x) for x in existing_names]) == sorted([str(x) for x in character_names])
-                    and sorted(existing_npc_names) == sorted(desired_npc_names)
-                ):
+                if sorted([str(x) for x in existing_names]) == sorted([str(x) for x in character_names]):
                     return existing
             except Exception:
                 pass
             raise ValueError("A scene is already active")
-        # Validate characters and align their location if unspecified.
-        # Strict mode: do NOT silently assign/teleport characters into scene locations.
-        for name in character_names:
-            desc = self.world.get_character_description(name)
-            current_loc = str(desc.get("location") or "").strip()
-            if current_loc and current_loc != location:
-                raise ValueError(
-                    f"Character '{name}' has location '{current_loc}', cannot start scene at '{location}'."
-                )
-            if not current_loc:
-                raise ValueError(
-                    f"Character '{name}' has no location set; set /location first before starting scene at '{location}'."
-                )
 
         start_time = self.world.get_world_time().to_string()
 
@@ -136,8 +111,8 @@ class Scene:
             "scene_description": str(scene_description or ""),
             "player_descriptions": player_descriptions if isinstance(player_descriptions, dict) else {},
             "npcs": desired_npc_names,
-            "initiative_order": [str(x) for x in character_names if str(x).strip()],
-            "characters": {
+            "player_order": [str(x) for x in character_names if str(x).strip()],
+            "players": {
                 name: {
                     "acted": False,
                     "last_decision": "",
@@ -196,15 +171,15 @@ class Scene:
         name = str(character_name or "").strip()
         if not name:
             raise ValueError("character_name is required")
-        chars = scene.get("characters") or {}
+        chars = scene.get("players") or {}
         if name not in chars:
             chars[name] = {"acted": False, "last_decision": "", "last_thoughts": ""}
-        scene["characters"] = chars
+        scene["players"] = chars
         # Rebuild initiative order
-        order = scene.get("initiative_order") or []
+        order = scene.get("player_order") or []
         if name not in order:
             order.append(name)
-            scene["initiative_order"] = order
+            scene["player_order"] = order
         self.world.set_scene(scene)
         return scene
 
@@ -214,14 +189,14 @@ class Scene:
         name = str(character_name or "").strip()
         if not name:
             raise ValueError("character_name is required")
-        chars = scene.get("characters") or {}
+        chars = scene.get("players") or {}
         if name in chars:
             del chars[name]
-            scene["characters"] = chars
-        order = scene.get("initiative_order") or []
+            scene["players"] = chars
+        order = scene.get("player_order") or []
         if name in order:
             order = [n for n in order if n != name]
-            scene["initiative_order"] = order
+            scene["player_order"] = order
         self.world.set_scene(scene)
         return scene
 
@@ -233,16 +208,16 @@ class Scene:
 
     def validate_character_in_scene(self, character_name: str) -> Dict[str, Any]:
         scene = self.require_active()
-        chars = scene.get("characters") or {}
+        chars = scene.get("players") or {}
         if character_name not in chars:
             raise ValueError(f"Character '{character_name}' is not part of the current scene")
         if (chars[character_name] or {}).get("acted") is True:
-            raise ValueError(f"Character '{character_name}' already acted this turn")
+            raise ValueError(f"Character '{character_name}' already acted this cycle")
         return scene
 
-    def mark_character_acted(
+    def mark_player_acted(
         self,
-        character_name: str,
+        player_name: str,
         *,
         last_decision: str,
         last_thoughts: str = "",
@@ -251,24 +226,36 @@ class Scene:
         output_source: str = "model",
     ) -> Dict[str, Any]:
         scene = self.require_active()
-        chars = scene.get("characters") or {}
-        if character_name not in chars:
-            raise ValueError(f"Character '{character_name}' is not part of the current scene")
-        entry = chars[character_name] or {}
+        chars = scene.get("players") or {}
+        if player_name not in chars:
+            raise ValueError(f"Player '{player_name}' is not part of the current scene")
+        entry = chars[player_name] or {}
         entry["acted"] = True
         entry["last_decision"] = last_decision or ""
         entry["last_thoughts"] = last_thoughts or ""
         entry["last_gm_answers"] = last_gm_answers or ""
         entry["character_input"] = character_input or ""
         entry["output_source"] = output_source or "model"
-        chars[character_name] = entry
-        scene["characters"] = chars
+        chars[player_name] = entry
+        scene["players"] = chars
         self.world.set_scene(scene)
         return scene
 
-    def all_characters_ended(self) -> bool:
+    def reset_acted_flags(self) -> Dict[str, Any]:
+        """Reset all players' 'acted' flags for the next cycle, keeping the scene alive."""
         scene = self.require_active()
-        chars = scene.get("characters") or {}
+        chars = scene.get("players") or {}
+        for ch_name in chars:
+            entry = chars[ch_name] or {}
+            entry["acted"] = False
+            chars[ch_name] = entry
+        scene["players"] = chars
+        self.world.set_scene(scene)
+        return scene
+
+    def all_players_ended(self) -> bool:
+        scene = self.require_active()
+        chars = scene.get("players") or {}
         return all((v or {}).get("acted") is True for v in chars.values())
 
     def update_character_intent(
@@ -282,7 +269,7 @@ class Scene:
     ) -> Dict[str, Any]:
         """Replace intent/thoughts for a character who already acted this turn."""
         scene = self.require_active()
-        chars = scene.get("characters") or {}
+        chars = scene.get("players") or {}
         if character_name not in chars:
             raise ValueError(f"Character '{character_name}' is not part of the current scene")
 
@@ -295,11 +282,12 @@ class Scene:
         entry["last_gm_answers"] = last_gm_answers or ""
         entry["output_source"] = output_source or "model"
         chars[character_name] = entry
-        scene["characters"] = chars
+        scene["players"] = chars
         self.world.set_scene(scene)
         return scene
 
-    def end_with_gm_output(self, *, narration: str, location: str, turn_duration: str) -> Dict[str, Any]:
+    def end_with_gm_output(self, *, narration: str, location: str, cycle_duration: str,
+                           keep_scene: bool = False) -> Dict[str, Any]:
         scene = self.require_active()
 
         if location != scene.get("location"):
@@ -309,11 +297,11 @@ class Scene:
         loc_obj = self.world.get_location(location)
 
         current_world_time = self.world.get_world_time()
-        duration = WorldDuration.parse_user_input(str(turn_duration))
+        duration = WorldDuration.parse_user_input(str(cycle_duration))
         start = WorldTime.parse(str(scene.get("start_time")))
         new_t = start.add_duration(duration)
 
-        if not self.all_characters_ended():
+        if not keep_scene and not self.all_players_ended():
             raise ValueError("Not all characters ended their turns yet")
 
         # Snapshot the scene before we mutate/clear it.
@@ -321,7 +309,7 @@ class Scene:
 
         recap_characters: List[Dict[str, Any]] = []
         try:
-            chars = scene_snapshot.get("characters") if isinstance(scene_snapshot, dict) else None
+            chars = scene_snapshot.get("players") if isinstance(scene_snapshot, dict) else None
             if isinstance(chars, dict):
                 for name, entry in chars.items():
                     e = entry if isinstance(entry, dict) else {}
@@ -345,7 +333,7 @@ class Scene:
             "npcs": list(scene_snapshot.get("npcs") or [])
             if isinstance(scene_snapshot.get("npcs"), list)
             else [],
-            "characters": recap_characters,
+            "players": recap_characters,
         }
 
         # Update world info.
@@ -357,7 +345,7 @@ class Scene:
         write_json(self.world.paths.info_json, info)
 
         # Append this turn to the story's ongoing paragraph (10 turns per paragraph).
-        char_names = list((scene.get("characters") or {}).keys())
+        char_names = list((scene.get("players") or {}).keys())
         npc_names = scene.get("npcs") if isinstance(scene.get("npcs"), list) else []
         self.world.append_turn_to_story(
             narration=narration or "",
@@ -369,7 +357,7 @@ class Scene:
         )
 
         # Update each character in scene.
-        for char_name in (scene.get("characters") or {}).keys():
+        for char_name in (scene.get("players") or {}).keys():
             self.world.add_character_json(
                 name=char_name,
                 pointer="/location",
@@ -403,8 +391,19 @@ class Scene:
         # Resync info.json characters list.
         self.world._sync_info_characters()
 
-        # Clear scene.
-        self.world.clear_scene()
+        if keep_scene:
+            # Update scene start_time so next cycle uses the new time.
+            scene["start_time"] = new_t.to_string()
+            scene["declared_intents"] = []
+            # Reset acted flags so characters can act in the next cycle.
+            for ch_name in (scene.get("players") or {}).keys():
+                ch_entry = scene["players"].get(ch_name) or {}
+                ch_entry["acted"] = False
+                scene["players"][ch_name] = ch_entry
+            self.world.set_scene(scene)
+        else:
+            # Clear scene — end of narrative block, scene is done.
+            self.world.clear_scene()
 
         loc_summary = ""
         try:
@@ -416,7 +415,7 @@ class Scene:
         return {
             "narration": narration or "",
             "location": location,
-            "turn_duration": duration.to_string(),
+            "cycle_duration": duration.to_string(),
             "new_time": new_t.to_string(),
             "scene_recap": recap,
             "location_summary": loc_summary,

@@ -156,8 +156,8 @@ class GameMaster:
         ]
 
         # Reset invocation-scoped state before each GM call.
-        # No read tracker needed — entity_store is stateless per call.
-        
+        from world_manager.tool_registry import reset_doc_read_tracker
+        reset_doc_read_tracker("gm")
 
         tools_by_name = {t.name: t for t in all_tools}
         llm_with_tools = llm.bind_tools(all_tools).with_config({
@@ -182,7 +182,7 @@ class GameMaster:
             if world_time_str:
                 ctx_parts.append(f"\nWorld time: {world_time_str}")
             # Last-call reminder so GM knows the time gap
-            last_call = self._meta.last_call_world_time
+            last_call = self._meta.last_call_time
             if last_call:
                 ctx_parts.append(f"GM was last called at: {last_call}")
             players = context.get("players", [])
@@ -214,6 +214,51 @@ class GameMaster:
 
         human_msg = "\n".join(ctx_parts)
 
+        # Set up close-invocation validation hook: prevent GM from closing
+        # until all character state files are in place.
+        from world_manager.tool_registry import set_close_validation_hook
+        _players_to_validate = [p.get("name", "") for p in (context or {}).get("players", []) if p.get("name")]
+
+        def _validate_gm_close() -> Optional[str]:
+            """Check that GM created all required character data via set_entity."""
+            if not _players_to_validate:
+                return None
+            from world_manager.entity_store import get_entity_state as _get_state, get_entity as _get_entity
+            missing = []
+            for pname in _players_to_validate:
+                entity = _get_entity(pname)
+                if entity is None:
+                    missing.append(f"{pname}: character entity not found — use set_entity(name=\"{pname}\", ...)")
+                    continue
+                state = _get_state(pname) or {}
+                if not state.get("gurps"):
+                    missing.append(f"{pname}: gurps block missing — set ST/DX/IQ/HT")
+                else:
+                    g = state["gurps"]
+                    for attr in ("ST", "DX", "IQ", "HT"):
+                        if attr not in g:
+                            missing.append(f"{pname}: gurps.{attr} missing")
+                if not state.get("state") or not isinstance(state["state"], dict):
+                    missing.append(f"{pname}: state block missing — set hp/fp/conditions")
+                else:
+                    s = state["state"]
+                    if not s.get("hp"):
+                        missing.append(f"{pname}: state.hp not set")
+                    if not s.get("fp"):
+                        missing.append(f"{pname}: state.fp not set")
+                if not state.get("skills"):
+                    missing.append(f"{pname}: skills block missing")
+                if not state.get("equipment"):
+                    missing.append(f"{pname}: equipment block missing")
+                # Location: check entity.position (populated from state.json["location"])
+                if not entity.get("position"):
+                    missing.append(f"{pname}: location not set — use position={{\"inside\": \"location_id\"}}")
+            if missing:
+                return "GM initialization incomplete:\n" + "\n".join(f"  - {m}" for m in missing)
+            return None
+
+        set_close_validation_hook(_validate_gm_close)
+
         # Inject pinned system messages via unified PinnedContext builder
         from engine.pinned_context import PinnedContext
         ctx = PinnedContext(self._history_path, _WORLD)
@@ -228,8 +273,8 @@ class GameMaster:
             from world.story import build_gm_summaries_block
             history_msgs = ctx.add_gm_summaries(history_msgs)
         invocation = ctx.add_storage_notice().build_invocation()
-        sys_msgs = [SystemMessage(content=self._prompt_text), *persistent, *invocation]
-        messages = [*sys_msgs, *history_msgs, HumanMessage(content=human_msg)]
+        sys_msgs = [SystemMessage(content=self._prompt_text), *persistent]
+        messages = [*sys_msgs, *history_msgs, *invocation, HumanMessage(content=human_msg)]
 
         result = react_loop_iteration(
             messages,
@@ -239,6 +284,11 @@ class GameMaster:
             readonly_tools={"get_entity", "get_entity_facts", "query_entities", "query_events"},
             pinned_refresh_fn=ctx.rebuild_storage_notice,
         )
+
+        # Clear validation hook and doc tracker regardless of outcome
+        set_close_validation_hook(None)
+        from world_manager.tool_registry import clear_current_agent
+        clear_current_agent()
 
         # Persist to GM history + tag entries
         if self._history_path:
