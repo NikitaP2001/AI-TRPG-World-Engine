@@ -13,7 +13,7 @@ from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 
 from memory_store import append_message, approx_token_count, limits_from_env, load_history
-from openrouter_langchain_logging import logs_enabled, enable_direct_text_abort, disable_direct_text_abort
+from openrouter_langchain_logging import logs_enabled
 from openrouter_llm import build_openrouter_chat_llm, openrouter_logging_callbacks, read_prompt_text
 from world.story import PinnedBlockCache
 from player.reflection import build_character_arc_block, build_character_paragraph_block, _character_dir
@@ -35,8 +35,6 @@ _PENDING_OBSERVES: List[Dict[str, Any]] = []
 _PENDING_RECALLS: List[Dict[str, Any]] = []
 _SM_RESOLVER = None  # Set by _run_single_character for immediate SM answers
 _NOW_SECONDS: int = 0  # Anchor for this invocation's t_start offsets (scheduler/timeline.py)
-_DISPOSITION_SET: bool = False  # Whether establish_disposition was called this session
-
 # в”Ђв”Ђ Session context persistence (В§1.1 вЂ” single invocation context per session) в”Ђв”Ђ
 # Stores the FULL state["messages"] + globals across reinvokes within one session.
 # Saved to disk only once at end_session().
@@ -130,7 +128,7 @@ def _flush_pending_to_sm(player_name: str, pending: Dict[str, List[Dict[str, Any
         return {}
 
     try:
-        answer = _SM_RESOLVER(character_name=player_name, questions=questions_str)
+        answer = _SM_RESOLVER(player_name=player_name, questions=questions_str)
     except Exception as e:
         return {pid: {"result": f"(SM error: {e})"} for pid in id_map}
 
@@ -289,10 +287,10 @@ def declare_intent(
       combat:   attack, defend, grapple, spell. May set is_hostile=true.
       cosmetic: minor non-interactive action (sigh, adjust gear, glance). No mechanical effect.
     **target** — who or what this action targets.
-      "all"      — everyone present (for public speech).
-      "self"     — yourself (internal monologue, self-buff).
+      "self"     — yourself (self-buff - cast on self)
+      "all"      — everyone present (public speech or speech to unknown targets).
       "area"     — area-of-effect. Provide area dict if action_type=combat.
-      otherwise  — character name, NPC name, or location/object reference.
+      otherwise  — character name, location/object reference, or unknown if name not known.
     **description** — what the character does and says. ALL narrative prose goes here.
       Include speech text, movement description, combat narration.
       This is what the scheduler records and the SM narrates.
@@ -384,8 +382,9 @@ def establish_disposition(
 ) -> str:
     """Define your psychological baseline for this session.
 
-    Call this ONCE at the start of a session, before any other decisions.
+    Call this ONLY ONCE at the start of a session.
     Establishes standing internal state independent of present circumstance.
+    Idempotent — subsequent calls return success without re-recording.
 
     Args:
         psyche_core (MAX 100 WORDS): JSON string capturing the primary internal
@@ -411,8 +410,6 @@ def establish_disposition(
             of events; the durable shape the compromise takes independent of
             what has not yet happened.
     """
-    global _DISPOSITION_SET
-    _DISPOSITION_SET = True
     ch = str(_CHARACTER_NAME or "").strip()
     if logs_enabled():
         print(f"[trace] {ch}: disposition established")
@@ -420,24 +417,11 @@ def establish_disposition(
 
 
 @tool
-def commit_decision(
-    compromise_intent: str,
-) -> str:
-    """Final output — commit to an intent and end this invocation.
+def commit_decision() -> str:
+    """End this invocation. Call when you are done.
 
-    Call this to end your current turn with a behavioral output.
-
-    Args:
-        compromise_intent (MAX 150 WORDS): The final behavioral output.
-            What you actually do — the intersection of drive and constraint.
+    Signals that your turn is complete. Any declared intents are saved automatically.
     """
-    global _DISPOSITION_SET
-    if not _DISPOSITION_SET:
-        return json.dumps({"status": "error", "error": "establish_disposition must be called before commit_decision"})
-
-    intent_text = str(compromise_intent or "").strip()
-    if not intent_text:
-        raise ValueError("compromise_intent is required")
 
     runtime_character_name = str(_CHARACTER_NAME or "").strip()
     if not runtime_character_name:
@@ -445,7 +429,7 @@ def commit_decision(
 
     return json.dumps({
         "character": runtime_character_name,
-        "intent": intent_text,
+        "intent": "",
     }, ensure_ascii=False, indent=2)
 
 
@@ -512,23 +496,15 @@ def run_player_agent(
     callbacks = openrouter_logging_callbacks(scope="character", label=character_name)
 
     def _current_allowed_tool_names() -> set[str]:
-        base = {"commit_decision", "declare_intent", "observe", "recall", "cancel_subscription"}
-        if not _DISPOSITION_SET:
-            base.add("establish_disposition")
-        return base
+        return {"commit_decision", "declare_intent", "observe", "recall",
+                "cancel_subscription"}
 
-    def _build_bound_llm():
-        allowed_tools = [observe, recall, declare_intent, cancel_subscription, commit_decision]
-        if not _DISPOSITION_SET:
-            allowed_tools.insert(0, establish_disposition)  # first = most visible
-
-        # Force a tool call so models don't spend the output budget on free-form prose.
-        tool_choice: Any = "required"
-
+    def _build_bound_llm(*, tool_choice: Any = None):
+        allowed_tools = [observe, recall, declare_intent,
+                         cancel_subscription, commit_decision]
         try:
             return llm.bind_tools(allowed_tools, tool_choice=tool_choice).with_config({"callbacks": callbacks})
         except TypeError:
-            # Older LangChain versions may not support tool_choice.
             return llm.bind_tools(allowed_tools).with_config({"callbacks": callbacks})
 
     bound_llm = _build_bound_llm()
@@ -659,26 +635,30 @@ def run_player_agent(
         pass
 
     # Dynamic per-turn context only.
-    context_obj: Dict[str, Any] = {
-        "scene_location": scene_location,
-        "world_time": world_time,
-        "current_scene_context": current_scene_context or "",
-    }
+    # Plain text, no JSON — avoids redundancy with scene_location/world_time.
+    context_parts = [f"Location: {scene_location}", f"World time: {world_time}"]
+    extra_ctx = str(current_scene_context or "").strip()
+    # current_scene_context often starts with Location/Time that duplicates
+    # context_parts above — strip those lines, keep the rest
+    if extra_ctx:
+        extra_lines = extra_ctx.replace("\r", "").split("\n")
+        loc_line = f"Location: {scene_location}"
+        time_line = f"Time: {world_time}"
+        filtered = [
+            l for l in extra_lines
+            if l.strip() and l.strip() not in (loc_line, time_line)
+        ]
+        if filtered:
+            context_parts.extend(filtered)
     reality_notice = str(gm_reality_notice or "").strip()
     if reality_notice:
-        notice_obj: Dict[str, str] = {
-            "notice": reality_notice,
-        }
-        prev_intent_text = str(previous_intent or "").strip()
-        if prev_intent_text:
-            notice_obj["previous_intent"] = prev_intent_text
-        context_obj["gm_reality_notice"] = notice_obj
+        context_parts.append(f"[Notice]\n{reality_notice}")
     if prev_cycle_thoughts:
-        context_obj["prev_cycle_thoughts"] = prev_cycle_thoughts
+        context_parts.append(f"[Previous thoughts]\n{prev_cycle_thoughts}")
 
-    context_blob = json.dumps(context_obj, ensure_ascii=False, indent=2)
+    context_blob = "\n".join(context_parts)
 
-    # в”Ђв”Ђ В§1.1 вЂ” Check if this is a reinvoke within the same turn в”Ђв”Ђ
+    # ── §1.1 — Check if this is a reinvoke within the same turn ──
     global _SESSION_CONTEXTS, _SESSION_HISTORY_PATHS, _SESSION_LIMITS
     existing_ctx = _SESSION_CONTEXTS.get(character_name)
     if existing_ctx and existing_ctx.get("messages"):
@@ -687,7 +667,7 @@ def run_player_agent(
         _CANCELLED_SUBSCRIPTION_IDS = list(existing_ctx.get("cancelled_subscriptions", []))
         state = {"messages": list(existing_ctx["messages"])}
         state["messages"].append(HumanMessage(
-            content=f"[Reinvoke - new context]\n{context_blob}"
+            content=f"[Reinvoke]\n{context_blob}"
         ))
         if logs_enabled():
             print(f"[trace] character {character_name}: reinvoked, {len(state['messages'])} messages in turn context")
@@ -721,7 +701,7 @@ def run_player_agent(
                 [HumanMessage(content=memory_block)]
                 if memory_block else []
             ),  # Reflection + diary - after stable history, before scene context
-            HumanMessage(content=context_blob),  # Dynamic scene context
+            HumanMessage(content=f"[session_start]\n{context_blob}"),  # Dynamic scene context
         ]
     }
 
@@ -874,40 +854,111 @@ def run_player_agent(
     tool_calls: List[Dict[str, Any]] = []
 
     def _retry_instruction(*, why: str, err: Optional[str] = None) -> HumanMessage:
-        allowed = " OR ".join(sorted(_current_allowed_tool_names()))
         parts = [
             f"{INTERNAL_RETRY_MARKER}",
             f"Your last output was invalid: {why}.",
         ]
         if err:
             parts.append(f"Tool call error: {err}")
-        parts.append(
-            "Do NOT print tool calls (no <function_calls>/<invoke>, no fake Python). "
-            f"Use the built-in tool calling interface to call EXACTLY ONE tool now: {allowed}. "
-            "Do not add any other text."
-        )
         return HumanMessage(content="\n".join(parts))
+
+    # ── Phase 1: Disposition — once per session, skip on reinvoke ──
+    _existing_disp = _SESSION_CONTEXTS.get(character_name, {}).get("disposition")
+    if _existing_disp:
+        _DISP_HUMAN = HumanMessage(content="[disposition_request] (already established)")
+        state["messages"].append(_DISP_HUMAN)
+        state["messages"].append(AIMessage(
+            content=json.dumps(_existing_disp, ensure_ascii=False, indent=2)
+        ))
+    else:
+        _DISPOSITION_TEXT: Optional[str] = None
+        _DISP_HUMAN = HumanMessage(content=(
+            "[disposition_request]\n"
+            "Establish your psychological baseline for this session.\n"
+            "Establishes standing internal state independent of present circumstance.\n"
+            "Idempotent — subsequent calls return success without re-recording.\n"
+            "\n"
+            "Output a JSON object with exactly these fields:\n"
+            "{\n"
+            '  "psyche_core": {\n'
+            '    "affective_impulse": "... the dominant internal tension, drive, or state of inertia generated by baseline constitution.",\n'
+            '    "phantasm": "... the structural formula defining cognitive orientation toward external entities — as subjects, instruments, or obstacles."\n'
+            "  },\n"
+            '  "ego_rationalization": {\n'
+            '    "internal_talk": "... the habitual operational calculus and tactical reasoning, independent of present circumstance.",\n'
+            '    "defense_mechanism": "... the cognitive loop maintaining coherence with own history and self-image."\n'
+            "  },\n"
+            '  "compromise_formation": "... the standing resolution this foundation produces between drive and constraint — what is sought, avoided, guarded against, or open to. Not a plan, not a prediction of events; the durable shape the compromise takes independent of what has not yet happened."\n'
+            "}\n"
+            "MAX 100 WORDS per string field. Omit a key only if that substrate is genuinely inert.\n"
+            "Output ONLY valid JSON — no markdown, no explanations."
+        ))
+        _disposition_llm = _build_bound_llm(tool_choice="none")  # same LLM, tools disabled — prefix cache preserved
+        for _disp_attempt in range(3):
+            try:
+                _disp_out = _disposition_llm.invoke(state["messages"] + [_DISP_HUMAN])
+            except Exception:
+                continue
+            _disp_raw = str(getattr(_disp_out, "content", "") or "").strip()
+            if not _disp_raw:
+                continue
+            # Strip markdown fences if present
+            _disp_cleaned = _disp_raw
+            if _disp_cleaned.startswith("```"):
+                _lines = _disp_cleaned.split("\n")
+                _start = 0
+                for i, _l in enumerate(_lines):
+                    if _l.strip().startswith("```"):
+                        _start = i + 1
+                        break
+                _end = len(_lines)
+                for i in range(len(_lines) - 1, _start - 1, -1):
+                    if _lines[i].strip().startswith("```"):
+                        _end = i
+                        break
+                _disp_cleaned = "\n".join(_lines[_start:_end]).strip()
+            _brace_start = _disp_cleaned.find("{")
+            _brace_end = _disp_cleaned.rfind("}")
+            if _brace_start >= 0 and _brace_end > _brace_start:
+                _disp_cleaned = _disp_cleaned[_brace_start:_brace_end + 1]
+            try:
+                _parsed = json.loads(_disp_cleaned)
+            except Exception:
+                continue
+            if not isinstance(_parsed, dict):
+                continue
+            _pc = _parsed.get("psyche_core")
+            _er = _parsed.get("ego_rationalization")
+            _cf = _parsed.get("compromise_formation")
+            if not isinstance(_pc, dict) or "affective_impulse" not in _pc or "phantasm" not in _pc:
+                continue
+            if not isinstance(_er, dict) or "internal_talk" not in _er or "defense_mechanism" not in _er:
+                continue
+            if not isinstance(_cf, str) or not _cf.strip():
+                continue
+            # Valid — store and inject into state (agent sees its disposition in Phase 2)
+            _DISPOSITION_TEXT = json.dumps(_parsed, ensure_ascii=False, indent=2)
+            _SESSION_CONTEXTS[character_name] = _SESSION_CONTEXTS.get(character_name, {})
+            _SESSION_CONTEXTS[character_name]["disposition"] = _parsed
+            if logs_enabled():
+                print(f"[trace] {character_name}: disposition established ({len(_DISPOSITION_TEXT)} chars)")
+            state["messages"].append(_DISP_HUMAN)
+            state["messages"].append(AIMessage(content=_DISPOSITION_TEXT))
+            break
+
+    # ── Phase 2: Tool-based turn (tools available, model decides when to use them) ──
+    bound_llm = _build_bound_llm(tool_choice=None)
+    allowed_tool_names = _current_allowed_tool_names()
 
     while True:
         if attempt >= max_attempts:
             allowed = "/".join(sorted(allowed_tool_names))
-            raise ValueError(
-                f"Character agent '{character_name}' failed to successfully execute required tool call ({allowed}) after {max_attempts} attempts."
-            )
+            if logs_enabled():
+                print(f"[trace] character {character_name}: exhausted {max_attempts} attempts — ending turn without intent")
+            break
         attempt += 1
 
-        enable_direct_text_abort(max_words=15)
-        try:
-            ai_msg = bound_llm.invoke(state["messages"])
-        except KeyboardInterrupt:
-            if logs_enabled():
-                print(f"[trace] character {character_name}: direct text abort вЂ” must use tool calls, retrying")
-            state["messages"].append(_retry_instruction(
-                why="you produced raw text instead of calling a tool. ALL output must go through tool calls"
-            ))
-            continue
-        finally:
-            disable_direct_text_abort()
+        ai_msg = bound_llm.invoke(state["messages"])
 
         pre_tool_text = _truncate_thoughts_text((getattr(ai_msg, "content", "") or ""))
         tool_calls = _extract_tool_calls(ai_msg)
@@ -915,7 +966,7 @@ def run_player_agent(
 
         recognized = [tc for tc in tool_calls if str(tc.get("name") or "").strip() in allowed_tool_names]
 
-        # в”Ђв”Ђ Batch-aware validation в”Ђв”Ђ
+        # Batch-aware validation
         recognized_names = [str(tc.get("name", "")).strip() for tc in recognized]
         BATCH_INFO_TOOLS = {"observe", "recall"}
 
@@ -928,9 +979,11 @@ def run_player_agent(
 
             _debug_log_invalid_model_output(why=why, msg=ai_msg)
             if logs_enabled():
-                print(f"[trace] character output invalid ({character_name}): {why}; retrying")
-            state["messages"].append(_retry_instruction(why=why))
-            continue
+                print(f"[trace] character {character_name}: {why} — ending turn without intent")
+            # Save the agent's thoughts (internal monologue, reasoning)
+            if pre_tool_text:
+                state["messages"].append(AIMessage(content=pre_tool_text))
+            break  # ← same as GM/WM: no tool call = agent has nothing actionable, end turn
 
         # Allow multiple info-gathering calls, reject mixed batches with non-info
         if len(recognized) > 1:
@@ -1012,7 +1065,7 @@ def run_player_agent(
                     if not _action_type or _action_type not in _valid_types:
                         raise ValueError(f"action_type must be one of {_valid_types}, got '{_action_type}'")
                     if not _target:
-                        raise ValueError("target is required")
+                        raise ValueError("target is required — who or what? (self, all, area, or a name/description)")
                     if not _t_start:
                         raise ValueError("t_start is required вЂ” when does this action start?")
 
@@ -1120,12 +1173,20 @@ def run_player_agent(
                 _PENDING_OBSERVES.clear()
                 _PENDING_RECALLS.clear()
 
-            # в”Ђв”Ђ Add batch results to state в”Ђв”Ђ
-            for ai_str, tm in zip(batch_ai_contents, batch_tool_msgs):
-                state["messages"].append(AIMessage(
-                    content=ai_str,
-                    tool_calls=[{"name": tm.name, "args": {}, "id": tm.tool_call_id, "type": "tool_call"}],
-                ))
+            # ── Add batch results to state ──
+            # Single AIMessage with ALL tool_calls, then all ToolMessages
+            if batch_ai_contents:
+                first_content = batch_ai_contents[0]
+                tool_calls_list = [
+                    {"name": tm.name, "args": {}, "id": tm.tool_call_id, "type": "tool_call"}
+                    for tm in batch_tool_msgs
+                ]
+                if first_content.strip() or tool_calls_list:
+                    state["messages"].append(AIMessage(
+                        content=first_content,
+                        tool_calls=tool_calls_list if tool_calls_list else None,
+                    ))
+            for tm in batch_tool_msgs:
                 state["messages"].append(tm)
 
             if is_done:
@@ -1135,15 +1196,7 @@ def run_player_agent(
                         user_mem = json.dumps(mem_obj, ensure_ascii=False, indent=2)
                     except Exception:
                         user_mem = context_blob
-                    psyche = str(exit_payload.get("psyche_core") or "").strip()
-                    ego = str(exit_payload.get("ego_rationalization") or "").strip()
-                    action_text = str(exit_payload.get("action") or "").strip()
-                    decision_block = (
-                        f"[decision]\n"
-                        f"psyche_core: {psyche}\n"
-                        f"ego_rationalization: {ego}\n"
-                        f"compromise_intent: {action_text}"
-                    )
+                    decision_block = "[decision]"
                     _SESSION_CONTEXTS[character_name] = {
                         "context_blob": user_mem,
                         "decision_block": decision_block,
@@ -1151,12 +1204,8 @@ def run_player_agent(
                             "memory_path": memory_path,
                             "world_time": world_time,
                             "scene_location": scene_location,
-                            "thoughts": [psyche, ego] if (psyche or ego) else [],
-                            "outcome": {
-                                "psyche_core": psyche,
-                                "ego_rationalization": ego,
-                                "compromise_intent": action_text,
-                            },
+                            "thoughts": [],
+                            "outcome": {},
                         },
                         "messages": list(state["messages"]),
                         "declared_intents": list(_DECLARED_INTENTS),
@@ -1184,3 +1233,11 @@ def run_player_agent(
             else:
                 state["messages"].append(_retry_instruction(why="tool call failed to execute", err=str(e)))
             continue
+
+    # Agent ended turn without declaring intent — return skip
+    return json.dumps({
+        "character": character_name,
+        "decision": {"action": "skip", "reason": "no intent declared"},
+        "declared_intents": list(_DECLARED_INTENTS),
+        "cancel_subscription_ids": list(_CANCELLED_SUBSCRIPTION_IDS),
+    }, ensure_ascii=False, indent=2)

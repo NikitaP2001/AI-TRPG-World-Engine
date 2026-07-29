@@ -54,7 +54,7 @@ def _init_style(scale: float = 1.0):
     style.colors[imgui.COLOR_BORDER] = _COL_BORDER
     style.colors[imgui.COLOR_BUTTON] = _COL_SURFACE2
     style.colors[imgui.COLOR_HEADER] = _COL_SURFACE2
-    # Style dimensions � scale for HiDPI
+    # Style dimensions � scale for HiDPI
     style.window_rounding = 4.0 * scale
     style.frame_rounding = 3.0 * scale
     style.child_rounding = 2.0 * scale
@@ -74,9 +74,31 @@ def _init_style(scale: float = 1.0):
 
 # ── Helpers ──
 
-def _icon(entity_type: str) -> str:
-    return {"character": "@", "npc": "%", "location": "#",
-            "faction": "&", "item": "$", "template": "?"}.get(entity_type, "?")
+def _icon(entity: dict) -> str:
+    """Determine display icon from data shape, not type string.
+
+    Rules (first match wins):
+      - position.coords exists → world map (#)
+      - position.inside exists → inside something (+)
+      - gurps exists (non-empty) → creature (@)
+      - stats.members exists → faction (&)
+      - type ends with _template → template (?)
+      - default → bullet (.)
+    """
+    pos = entity.get("position") or {}
+    if pos.get("coords"):
+        return "#"
+    if pos.get("inside") or pos.get("near"):
+        return "+"
+    if entity.get("gurps"):
+        return "@"
+    stats = entity.get("stats") or {}
+    if stats.get("members"):
+        return "&"
+    etype = str(entity.get("type", "") or "")
+    if etype.endswith("_template"):
+        return "?"
+    return "."
 
 
 def _hp_bar(label: str, current: float, maximum: float, width: float = 80):
@@ -217,7 +239,13 @@ def panel_entity_browser(on_select):
     search = _entity_filter.strip()
 
     # Type filter
-    types = ["all", "npc", "character", "location", "faction", "item"]
+    # Build dynamic type list from actual entities in store (no hardcoded types)
+    try:
+        all_entities = B.query_entities(limit=200)
+        types_set = sorted(set(e.get("type", "?") for e in all_entities if e.get("type")))
+        types = ["all"] + types_set
+    except Exception:
+        types = ["all"]
     if imgui.begin_combo("Type", _entity_type_filter):
         for t in types:
             if imgui.selectable(t, t == _entity_type_filter)[0]:
@@ -241,11 +269,11 @@ def panel_entity_browser(on_select):
             etype = ent.get("type", "?")
             tags = ent.get("tags", [])
             facts = ent.get("facts", "") or ""
-            label = f"{_icon(etype)} {eid}"
+            label = f"{_icon(ent)} {eid}"
             # Show first tag as subtitle
             name_tag = next((t[5:] for t in tags if t.startswith("name:")), "")
             if name_tag:
-                label = f"{_icon(etype)} {name_tag}"
+                label = f"{_icon(ent)} {name_tag}"
 
             if imgui.selectable(label, False)[0]:
                 on_select(eid)

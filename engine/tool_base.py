@@ -11,7 +11,6 @@ import json
 import os
 from typing import Any, Callable, Dict, List, Optional
 
-from scene import Scene
 from world import World
 
 
@@ -20,7 +19,6 @@ from world import World
 # ---------------------------------------------------------------------------
 
 _WORLD = World()
-_SCENE = Scene(world=_WORLD)
 
 
 # ---------------------------------------------------------------------------

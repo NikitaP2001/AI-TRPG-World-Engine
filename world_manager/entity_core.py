@@ -8,9 +8,11 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from world_manager._json_backend import JsonFileBackend
-from world_manager._character_backend import CharacterFileBackend
-from world_manager._location_backend import LocationFileBackend
 from world_manager._composite_backend import CompositeBackend
+from world_manager.entity_validation import (
+    validate_position,
+    validate_facts,
+)
 
 
 # Module-level singleton
@@ -22,46 +24,51 @@ def _get_backend() -> CompositeBackend:
     global _backend
     if _backend is None:
         json_backend = JsonFileBackend()
-        char_backend = CharacterFileBackend()
-        loc_backend = LocationFileBackend()
-        _backend = CompositeBackend(json_backend, char_backend, loc_backend)
+        _backend = CompositeBackend(json_backend)
     return _backend
 
 
 def reset_backend() -> None:
-    """Reset the singleton (for testing)."""
+    """Reset the singleton (for testing) and invocation counter."""
     global _backend
     _backend = None
+    JsonFileBackend.reset_invocation_counter()
 
 
-# ── Public API (same signatures as old entity_store.py) ──
+# ── Helpers ──
 
 
-def _validate_position(position: Optional[Dict[str, Any]]) -> Optional[str]:
-    """Check position format. Returns error string or None if valid."""
-    if not position:
-        return None
-    valid_keys = {"inside", "near", "coords", "offset"}
-    extra = set(position.keys()) - valid_keys
-    if extra:
-        return f"Unknown position key(s): {', '.join(sorted(extra))}."
-    if "coords" in position:
-        coords = position["coords"]
-        if not isinstance(coords, (list, tuple)) or len(coords) < 2:
-            return "coords must be [lat, lon] or [lat, lon, z]."
-        lat, lon = coords[0], coords[1]
-        if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
-            return "coords values must be numbers."
-        if lat < -90 or lat > 90:
-            return f"Latitude must be between -90 and 90, got {lat}."
-        if lon < -180 or lon > 180:
-            return f"Longitude must be between -180 and 180, got {lon}."
-    for key in ("inside", "near"):
-        if key in position:
-            ref = position[key]
-            if not isinstance(ref, str) or not ref.strip():
-                return f"{key} must be a non-empty entity_id."
-    return None
+def _is_meaningful(val: Any) -> bool:
+    """A value is meaningful (non-empty) for storage purposes.
+
+    Empty strings, dicts, lists, and None are not stored — they waste
+    space and convey no information. This rule applies universally,
+    regardless of entity type, so WM-invented types get clean storage
+    for free without any per-type schema.
+    """
+    if val is None:
+        return False
+    if isinstance(val, (str, list, dict)) and not val:
+        return False
+    return True
+
+
+def _compact(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove empty/default values from a record dict.
+
+    Empty values convey nothing and waste storage. `id` and `type` are
+    always provided by the caller and are meaningful strings, so they
+    survive this filter naturally.
+    """
+    return {k: v for k, v in record.items() if _is_meaningful(v)}
+
+
+# ── Public API ──
+
+
+def reset_creation_counter() -> None:
+    """Reset per-invocation creation rate limit. Call at start of agent invocation."""
+    JsonFileBackend.reset_invocation_counter()
 
 
 def set_entity(
@@ -76,21 +83,55 @@ def set_entity(
     state: Optional[Dict[str, Any]] = None,
     skills: Optional[Dict[str, Any]] = None,
     equipment: Optional[Dict[str, Any]] = None,
+    parent_location: str = "",
+    sublocations: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Create or update any entity. Routes to correct backend automatically.
+    """Create or update any entity.
 
-    Position validation: coords must be valid lat/lon (-90..90, -180..180);
-    inside/near must reference a non-empty entity_id.
+    Entity type is an arbitrary string defined by the WM — there are no
+    reserved types and no per-type schema. Only non-empty values are
+    persisted; empty defaults (gurps={}, stats={}, tags=[], etc.)
+    are silently omitted from storage regardless of entity type.
+
+    Position validation (coords lat/lon bounds, inside/near + offset format)
+    is the only generic form check — it applies to every entity type.
+    Per-type structural rules ("location must have facts") are the WM's
+    responsibility via base_type templates, not the engine's.
     """
-    err = _validate_position(position)
+    # 1. Check if entity already exists (set_entity is create-only)
+    if id:
+        existing = _get_backend().get(id)
+        if existing is not None:
+            return {"status": "error", "error": f"Entity '{id}' already exists. Use adjust_entity to modify runtime state or position."}
+
+    # 2. Generic form validation (position format, facts safety)
+    err = validate_position(position)
     if err:
         return {"status": "error", "error": f"Invalid position: {err}"}
-    return _get_backend().set(
-        id=id, type=type, base_type=base_type,
-        facts=facts, gurps=gurps, stats=stats,
-        tags=tags, position=position,
-        state=state, skills=skills, equipment=equipment,
-    )
+
+    # 3. Collect all API params and strip empty/None values
+    #    (tool defaults like gurps={} become "not provided" — not stored)
+    record = _compact({
+        "id": id,
+        "type": type,
+        "base_type": base_type,
+        "facts": facts,
+        "gurps": gurps,
+        "stats": stats,
+        "tags": tags,
+        "position": position,
+        "state": state,
+        "skills": skills,
+        "equipment": equipment,
+        "parent_location": parent_location,
+        "sublocations": sublocations,
+    })
+
+    et = record.pop("type", type or "")
+    eid = record.pop("id", id or "")
+
+    # 4. Pass to backend — id/type as explicit params, record as kwargs
+    return _get_backend().set(id=eid, type=et, **record)
 
 
 def get_entity(id: str) -> Optional[Dict[str, Any]]:
@@ -189,17 +230,6 @@ def detach_script(entity_id: str, script_id: str) -> Dict[str, Any]:
     return _get_backend().detach_script(entity_id, script_id)
 
 
-def set_movement(
-    entity_id: str,
-    destination: Optional[Dict[str, Any]] = None,
-    speed: float = 1.0,
-    comment: str = "",
-) -> Dict[str, Any]:
-    """Set an entity in motion toward a destination."""
-    # Only JsonFileBackend supports movement
-    return _get_backend()._json.set_movement(entity_id, destination, speed, comment)
-
-
 def adjust_entity(
     entity_id: str,
     hp: Optional[int] = None,
@@ -217,8 +247,25 @@ def adjust_entity(
     add_skill: str = "",
     remove_skill: str = "",
     current_state: str = "",
+    gurps: Optional[Dict[str, Any]] = None,
+    position: Optional[Dict[str, Any]] = None,
+    connections: Optional[Dict[str, Any]] = None,
+    skills: Optional[Dict[str, Any]] = None,
+    equipment: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Apply targeted runtime mutations to an entity (NPC or character)."""
+    # Validate position if provided
+    if position is not None:
+        from world_manager.entity_validation import validate_position
+        err = validate_position(position)
+        if err:
+            return {"status": "error", "error": f"Invalid position: {err}"}
+    # Validate connections if provided
+    if connections is not None:
+        from world_manager.entity_validation import validate_connections
+        err = validate_connections(connections)
+        if err:
+            return {"status": "error", "error": f"Invalid connections: {err}"}
     return _get_backend().adjust(
         entity_id=entity_id,
         hp=hp, fp=fp, er=er,
@@ -229,7 +276,59 @@ def adjust_entity(
         add_ability=add_ability, remove_ability=remove_ability,
         add_skill=add_skill, remove_skill=remove_skill,
         current_state=current_state,
+        gurps=gurps,
+        position=position if position else None,
+        connections=connections,
+        skills=skills,
+        equipment=equipment,
     )
+
+
+def compute_entry_offset(
+    source_id: str,
+    target_id: str,
+    exit_offset: List[float],
+) -> Dict[str, Any]:
+    """Compute the entry point offset in target's local space.
+
+    Given a connection from source to target where both entities are inside
+    the same parent (same position.inside), computes where the connection
+    opens in the target's local coordinate system.
+
+    Returns {"offset": [x, y, z]} with the computed entry point,
+    or {"offset": exit_offset} if entities are not in the same parent
+    or position data is insufficient.
+    """
+    backend = _get_backend()
+    source = backend.get(source_id)
+    target = backend.get(target_id)
+    if not source or not target:
+        return {"offset": list(exit_offset)}
+
+    src_pos = source.get("position") or {}
+    tgt_pos = target.get("position") or {}
+
+    src_parent = src_pos.get("inside", "")
+    tgt_parent = tgt_pos.get("inside", "")
+    src_off = src_pos.get("offset")
+    tgt_off = tgt_pos.get("offset")
+
+    # Both must share the same parent and have offsets
+    if not src_parent or src_parent != tgt_parent:
+        return {"offset": list(exit_offset)}
+    if not isinstance(src_off, (list, tuple)) or len(src_off) != 3:
+        return {"offset": list(exit_offset)}
+    if not isinstance(tgt_off, (list, tuple)) or len(tgt_off) != 3:
+        return {"offset": list(exit_offset)}
+
+    # Door position in parent space
+    door_x = src_off[0] + exit_offset[0]
+    door_y = src_off[1] + exit_offset[1]
+    door_z = src_off[2] + exit_offset[2]
+
+    # Entry point in target's local space
+    entry = [door_x - tgt_off[0], door_y - tgt_off[1], door_z - tgt_off[2]]
+    return {"offset": entry}
 
 
 def tick(current_tick: int, world_time: int = 0) -> Dict[str, Any]:

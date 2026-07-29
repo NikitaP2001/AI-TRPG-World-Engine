@@ -1,11 +1,12 @@
-"""CompositeBackend — auto-routes each entity_id to correct backend.
+"""CompositeBackend — thin pass-through to JsonFileBackend.
 
-Lookup order:
-  1. Is entity_id a key in LocationFileBackend (type="location")? → use LocationFileBackend
-  2. Is entity_id a key in JsonFileBackend's cache? → use JsonFileBackend
-  3. Is entity_id a character folder name? → use CharacterFileBackend
-  4. Is there a tag "name:<entity_id>" in JsonFileBackend? → use JsonFileBackend
-  5. Default: JsonFileBackend (let it create)
+Previously routed between JsonFileBackend and CharacterFileBackend.
+CharacterFileBackend has been removed — all entities (including player
+mechanical data) now go through the single JsonFileBackend path.
+
+Player-specific files (description.json, metadata.json, memory.json,
+messages.json) remain on disk under game/players/{name}/ — the entity
+store only contains mechanical data (gurps, stats, state, skills, etc.).
 """
 from __future__ import annotations
 
@@ -15,139 +16,53 @@ from world_manager._backend_base import EntityBackend
 
 
 class CompositeBackend(EntityBackend):
-    """Routes each operation to the correct backend based on entity_id.
+    """Thin pass-through to the single JsonFileBackend."""
 
-    Three backends:
-      - JsonFileBackend (entity_store/entities.json) — default
-      - CharacterFileBackend (characters/{name}/*.json)
-      - LocationFileBackend (world/locations.json)
-    """
-
-    def __init__(self, json_backend: EntityBackend, char_backend: EntityBackend, loc_backend: EntityBackend):
+    def __init__(self, json_backend: EntityBackend):
         self._json = json_backend
-        self._char = char_backend
-        self._loc = loc_backend
-
-    def _resolve(self, id: str, type_hint: str = "") -> tuple[EntityBackend, str]:
-        """Returns (backend, resolved_id).
-        If type_hint is "location", routes directly to LocationFileBackend.
-        """
-        if not id:
-            return (self._json, id)
-        id_stripped = id.strip()
-
-        # 0. type hint overrides all
-        if type_hint == "location":
-            return (self._loc, id_stripped)
-
-        # 1. Check location store
-        if self._loc.get(id_stripped) is not None:
-            return (self._loc, id_stripped)
-
-        # 2. Check JSON store (by exact key)
-        if self._json.get(id_stripped) is not None:
-            return (self._json, id_stripped)
-        # 3. Check character folders
-        if self._char.get(id_stripped) is not None:
-            return (self._char, id_stripped)
-        # 4. Check name tags in JSON store
-        try:
-            matches = self._json.query(tags=[f"name:{id_stripped}"], include_templates=False, limit=1)
-            if matches:
-                return (self._json, matches[0]["id"])
-        except Exception:
-            pass
-        # 5. Default: JSON store
-        return (self._json, id_stripped)
-
-    def _resolve_read(self, id: str) -> tuple[EntityBackend, str]:
-        """For reads, check all backends."""
-        if not id:
-            return (self._json, id)
-        id_stripped = id.strip()
-        loc_entity = self._loc.get(id_stripped)
-        if loc_entity is not None:
-            return (self._loc, id_stripped)
-        json_entity = self._json.get(id_stripped)
-        if json_entity is not None:
-            return (self._json, id_stripped)
-        char_entity = self._char.get(id_stripped)
-        if char_entity is not None:
-            return (self._char, id_stripped)
-        return (self._json, id_stripped)
 
     def set(self, id: str = "", **kwargs) -> Dict[str, Any]:
-        type_hint = kwargs.get("type", "")
-        backend, rid = self._resolve(id or "", type_hint=type_hint)
-        return backend.set(id=rid, **kwargs)
+        return self._json.set(id=id, **kwargs)
 
     def get(self, id: str) -> Optional[Dict[str, Any]]:
-        backend, rid = self._resolve_read(id)
-        return backend.get(rid)
+        return self._json.get(id)
 
     def get_facts(self, id: str) -> Optional[str]:
-        backend, rid = self._resolve_read(id)
-        return backend.get_facts(rid)
+        return self._json.get_facts(id)
 
     def set_facts(self, id: str, facts: str) -> Dict[str, Any]:
-        backend, rid = self._resolve(id)
-        return backend.set_facts(rid, facts)
+        return self._json.set_facts(id, facts)
 
     def get_state(self, id: str) -> Optional[Dict[str, Any]]:
-        backend, rid = self._resolve_read(id)
-        return backend.get_state(rid)
+        return self._json.get_state(id)
 
     def query(self, **kwargs) -> List[Dict[str, Any]]:
-        """Query all backends and merge results."""
-        results = []
-        # Location backend first (for type="location" queries)
-        loc_results = self._loc.query(**kwargs)
-        for lr in loc_results:
-            if not any(r.get("id") == lr.get("id") for r in results):
-                results.append(lr)
-        # JSON store
-        json_results = self._json.query(**kwargs)
-        for jr in json_results:
-            if not any(r.get("id") == jr.get("id") for r in results):
-                results.append(jr)
-        # Character files
-        char_results = self._char.query(**kwargs)
-        for cr in char_results:
-            if not any(r.get("id") == cr.get("id") for r in results):
-                results.append(cr)
-        return results
+        return self._json.query(**kwargs)
 
     def delete(self, id: str, reason: str = "") -> Dict[str, Any]:
-        backend, rid = self._resolve(id)
-        return backend.delete(rid, reason)
+        return self._json.delete(id, reason)
 
     def adjust(self, entity_id: str, **kwargs) -> Dict[str, Any]:
-        backend, rid = self._resolve(entity_id)
-        return backend.adjust(rid, **kwargs)
+        return self._json.adjust(entity_id, **kwargs)
 
     def add_tags(self, entity_id: str, tags: List[str]) -> Dict[str, Any]:
-        backend, rid = self._resolve(entity_id)
-        return backend.add_tags(rid, tags)
+        return self._json.add_tags(entity_id, tags)
 
     def remove_tags(self, entity_id: str, tags: List[str]) -> Dict[str, Any]:
-        backend, rid = self._resolve(entity_id)
-        return backend.remove_tags(rid, tags)
+        return self._json.remove_tags(entity_id, tags)
 
     def set_effect(self, entity_id: str, **kwargs) -> Dict[str, Any]:
-        backend, rid = self._resolve(entity_id)
-        return backend.set_effect(rid, **kwargs)
+        return self._json.set_effect(entity_id, **kwargs)
 
     def remove_effect(self, entity_id: str, effect_id: str) -> Dict[str, Any]:
-        backend, rid = self._resolve(entity_id)
-        return backend.remove_effect(rid, effect_id)
+        return self._json.remove_effect(entity_id, effect_id)
 
     def attach_script(self, entity_id: str, **kwargs) -> Dict[str, Any]:
-        backend, rid = self._resolve(entity_id)
-        return backend.attach_script(rid, **kwargs)
+        return self._json.attach_script(entity_id, **kwargs)
 
     def detach_script(self, entity_id: str, script_id: str) -> Dict[str, Any]:
-        backend, rid = self._resolve(entity_id)
-        return backend.detach_script(rid, script_id)
+        return self._json.detach_script(entity_id, script_id)
 
     def validate_facts(self, facts: str, entity_id: str = "") -> List[str]:
-        return self._json.validate_facts(facts, entity_id)
+        from world_manager.entity_validation import validate_facts as _vfacts
+        return _vfacts(facts, entity_id)

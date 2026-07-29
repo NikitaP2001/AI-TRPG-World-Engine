@@ -16,6 +16,7 @@ from memory_store import append_message, load_history, limits_from_env
 from openrouter_langchain_logging import logs_enabled, _safe_label
 from openrouter_llm import build_openrouter_chat_llm, openrouter_logging_callbacks, read_prompt_text
 from gm.react_loop import coerce_tool_calls, react_loop_iteration
+from engine.history_meta import HistoryMeta as WMHistoryMeta
 
 
 WORLD_SETTING_FIELDS = [
@@ -101,6 +102,11 @@ class WorldManager:
         self._history_path = history_path
         self._last_call_tick: int = 0
         self._last_summary: str = ""
+        self._last_digest_event_id: str = ""
+        self._meta = WMHistoryMeta(
+            (self._history_path.parent / "wm_history_meta.json")
+            if self._history_path else Path("wm_history_meta.json"),
+        )
 
     def create_world_setting(
         self,
@@ -118,7 +124,7 @@ class WorldManager:
             streaming=True,
             title_suffix="-world-manager-init",
             max_tokens=3000,
-            parallel_tool_calls=False,
+            parallel_tool_calls=True,
             timeout=120.0,
         )
 
@@ -181,10 +187,6 @@ class WorldManager:
             "3. initial_world_time (string): REQUIRED.\n"
             "   EXACT format Y0000-01-01 00:00 (no prose). Must be meaningful,\n"
             "   not year 0000/0001.\n"
-            "4. player_reference (object, optional):\n"
-            "   - location (string): Name of a location where players should start.\n"
-            "     This is a hint — it does not create the location.\n"
-            "   - notes (string): Narrative context for the starting point.\n"
             "Use abstract framing throughout. No proper nouns, no numeric ranges.\n"
         )
 
@@ -196,7 +198,6 @@ class WorldManager:
         try:
             bound_llm = llm.bind_tools(
                 [world_setting_result],
-                tool_choice="required",
             ).with_config({"callbacks": callbacks})
         except TypeError:
             bound_llm = llm.bind_tools([world_setting_result]).with_config({"callbacks": callbacks})
@@ -434,7 +435,7 @@ class WorldManager:
                 streaming=True,
                 title_suffix="-world-manager",
                 max_tokens=4000,
-                parallel_tool_calls=False,
+                parallel_tool_calls=True,
             )
 
         from world_manager.tool_registry import ToolRegistry
@@ -463,7 +464,40 @@ class WorldManager:
 
         # Reason for this call
         if notice == "initialize_world":
-            intro_parts.append("Reason: first invocation — world initialization.")
+            # Inject character descriptions from preset files + plot
+            from world.io import _read_json as _read_json_file
+            game_root = Path("game")
+            char_dir = (game_root / "players").resolve()
+            char_blocks = []
+            plot_text = ""
+            if char_dir.exists():
+                for pdir in sorted(char_dir.iterdir()):
+                    if not pdir.is_dir():
+                        continue
+                    desc_file = pdir / "description.json"
+                    if desc_file.exists():
+                        desc = _read_json_file(desc_file)
+                        if isinstance(desc, dict):
+                            name = desc.get("name") or pdir.name
+                            block = f"[Character: {name}]\n{json.dumps(desc, ensure_ascii=False, indent=2)}"
+                            char_blocks.append(block)
+            # Read plot from setups if available
+            try:
+                plot_path = self._history_path.parent / "setups" / "plot.json" if self._history_path else game_root / "setups" / "plot.json"
+                if plot_path and plot_path.exists():
+                    from world.io import read_json as _read_json_plot
+                    plot_data = _read_json_plot(str(plot_path)) or {}
+                    plot_text = str(plot_data.get("init") or plot_data.get("premise") or plot_data.get("description", "") or "")
+            except Exception:
+                pass
+            intro_parts.append("## Characters")
+            if char_blocks:
+                intro_parts.append("\n\n".join(char_blocks))
+            else:
+                intro_parts.append("(none)")
+            if plot_text:
+                intro_parts.append(f"\n## Plot\n{plot_text}")
+            intro_parts.append("\nCreate location entities for each unique character starting location. Do NOT create player character entities — they are handled separately.")
         elif notice == "fallback_tick":
             intro_parts.append("Reason: fallback interval expired — no subscribed events fired.")
         elif context and context.get("subscription_trigger"):
@@ -489,6 +523,16 @@ class WorldManager:
 
         # Persistent context
         persistent = []
+        # Add per-agent summaries from PinnedContext
+        try:
+            from engine.pinned_context import PinnedContext
+            _ctx = PinnedContext(self._history_path, self._world)
+            persistent.extend(
+                _ctx.add_wm_summaries()
+                    .build_persistent()
+            )
+        except Exception:
+            pass
         if context and context.get("world_registry"):
             persistent.append(SystemMessage(
                 content=f"[world_registry]\n{json.dumps(context['world_registry'], indent=2)}"
@@ -540,10 +584,54 @@ class WorldManager:
 
         # ── Assemble and invoke ──────────────────────────────────────
 
+        # Set up close-invocation validation for initialize_world:
+        # check that location entities exist for each character's starting location.
+        from world_manager.tool_registry import set_close_validation_hook
+        _starting_locations: set = set()
+        if notice == "initialize_world":
+            try:
+                from world.io import _read_json as _read_json_file
+                char_dir = (Path("game") / "players").resolve()
+                if char_dir.exists():
+                    for pdir in sorted(char_dir.iterdir()):
+                        if not pdir.is_dir():
+                            continue
+                        desc_file = pdir / "description.json"
+                        if desc_file.exists():
+                            desc = _read_json_file(desc_file)
+                            if isinstance(desc, dict):
+                                loc = str(desc.get("location", "")).strip()
+                                if loc:
+                                    _starting_locations.add(loc)
+            except Exception:
+                pass
+
+        def _validate_wm_close() -> Optional[str]:
+            if not _starting_locations:
+                return None
+            try:
+                from world_manager.entity_core import query_entities as _qe
+                existing = {e.get("id", "") for e in _qe(include_templates=False, limit=200)}
+                missing = [loc for loc in sorted(_starting_locations) if loc not in existing]
+                if missing:
+                    return (f"WM initialization incomplete — missing location entities:\n"
+                            + "\n".join(f"  - {loc}" for loc in missing)
+                            + "\n\nCreate each missing location with set_entity(type=\"location\", ...).")
+            except Exception:
+                pass
+            return None
+
+        set_close_validation_hook(_validate_wm_close)
+
+        # ── News digest ──────────────────────────────────────────────
+        news_digest = self._build_news_digest()
+        news_msgs = [SystemMessage(content=news_digest)] if news_digest else []
+
         messages = [
             SystemMessage(content=self._prompt_text),
             *persistent,
             *history_msgs,
+            *news_msgs,
             *invocation,
             HumanMessage(content=human_msg),
         ]
@@ -587,7 +675,7 @@ class WorldManager:
             "record_event",
             "attach_script", "detach_script",
             "set_effect", "remove_effect",
-            "set_movement", "delete_entity",
+            "delete_entity",
             "write_correction",
         }
 
@@ -632,14 +720,163 @@ class WorldManager:
                         content=f"[correction] {msg[:200]}", limits=limits,
                     )
 
+        from world_manager.tool_registry import set_close_validation_hook as _clear_hook
+        _clear_hook(None)
         clear_current_agent()
 
         # ── Update last_call_tick ───────────────────────────────────
         if context and context.get("current_tick"):
             self._last_call_tick = int(context["current_tick"])
 
+        # ── Update news digest marker on successful invocation ──────
+        exit_tool = result.get("exit_tool")
+        if exit_tool in ("close_invocation", "invoke_self"):
+            if self._last_digest_event_id:
+                self._meta.set_last_seen_event_id(self._last_digest_event_id)
+
+        # ── Summarization triggers (every 10 invocations, every 10 paragraphs) ──
+        inv_count = self._meta.increment_invocation()
+        if inv_count > 0 and inv_count % 10 == 0:
+            self._run_paragraph_summary()
+
+        para_count = self._meta.paragraph_count
+        if para_count > 0 and para_count % 10 == 0 and inv_count % 10 != 0:
+            self._run_arc_summary()
+
         return {
             "exit_tool": result.get("exit_tool"),
             "exit_args": result.get("exit_args"),
             "thinking": thinking,
         }
+
+    def _run_paragraph_summary(self) -> None:
+        """Run WM paragraph summary (every 10 invocations).
+
+        Writes to wm_story.json + wm_summaries.json (NOT messages.json).
+        """
+        if not self._history_path:
+            return
+        try:
+            from world.agent_story import append_paragraph
+            from engine.summarizer import SummaryRunner
+
+            runner = SummaryRunner(
+                self._meta, self._history_path, self._prompt_text,
+                temperature=self._temperature, scope="world_manager",
+            )
+            last_ref = self._meta.last_summarized_paragraph or "(start)"
+            task_prompt = runner.build_task_prompt(
+                "[wm_paragraph_summary_task]\n"
+                "Summarize the world state since \"{last_ref}\".\n"
+                "Below are the events since then (auto-injected context excluded):\n\n"
+                "{refs}\n\n"
+                "Write a paragraph with a short title (3-10 words) and 5-10 sentence summary.\n"
+                "Respond with JSON: {\"name\": \"short title\", \"summary\": \"your summary\"}.",
+                last_ref=last_ref,
+            )
+            result = runner.run_summary(
+                task_prompt=task_prompt,
+                title_suffix="-world-manager-paragraph",
+                label="wm_paragraph_summary",
+            )
+            if result:
+                pname, summary = result
+                pname = pname or "World Summary"
+                root = self._history_path.parent
+                append_paragraph(
+                    summaries_path=root / "wm_summaries.json",
+                    story_path=root / "wm_story.json",
+                    name=pname,
+                    summary=summary,
+                )
+                self._meta.append_entry("auto_injection", f"[wm_paragraph:{pname}]")
+                self._meta.mark_summarized(pname)
+                self._meta.increment_paragraph()
+                if logs_enabled():
+                    print(f"[trace] WM paragraph summary: '{pname}' ({len(summary)} chars)")
+        except Exception as e:
+            if logs_enabled():
+                print(f"[trace] WM _run_paragraph_summary error: {e}")
+
+    def _run_arc_summary(self) -> None:
+        """Run WM arc summary (every 10 paragraphs).
+
+        Writes to wm_story.json + wm_summaries.json (NOT messages.json).
+        """
+        if not self._history_path:
+            return
+        try:
+            from world.agent_story import append_arc
+            from engine.summarizer import SummaryRunner
+
+            runner = SummaryRunner(
+                self._meta, self._history_path, self._prompt_text,
+                temperature=self._temperature, scope="world_manager",
+            )
+            last_ref = self._meta.last_summarized_paragraph or "(start)"
+            task_prompt = runner.build_task_prompt(
+                "[wm_arc_summary_task]\n"
+                "Since arc summary after paragraph \"{last_ref}\", "
+                "10 new paragraphs have been summarized.\n"
+                "Write an arc-level summary covering all these paragraphs.\n"
+                "Respond with JSON: {\"name\": \"arc title\", \"summary\": \"your summary\"}.",
+                last_ref=last_ref,
+            )
+            result = runner.run_summary(
+                task_prompt=task_prompt,
+                title_suffix="-world-manager-arc",
+                label="wm_arc_summary",
+            )
+            if result:
+                arc_name, summary = result
+                arc_name = arc_name or "Arc Summary"
+                root = self._history_path.parent
+                append_arc(
+                    summaries_path=root / "wm_summaries.json",
+                    story_path=root / "wm_story.json",
+                    name=arc_name,
+                    summary=summary,
+                )
+                self._meta.append_entry("auto_injection", f"[wm_arc:{arc_name}]")
+                if logs_enabled():
+                    print(f"[trace] WM arc summary: '{arc_name}' ({len(summary)} chars)")
+        except Exception as e:
+            if logs_enabled():
+                print(f"[trace] WM _run_arc_summary error: {e}")
+
+    def _build_news_digest(self) -> str:
+        """Build news digest from narrative_flag events since last invocation."""
+        try:
+            from world_manager.event_log import query_events
+            from world.time import WorldTime
+
+            last_id = self._meta.last_seen_event_id
+            events = query_events(
+                narrative_flag_only=True,
+                since_event_id=last_id,
+                limit=20,
+            )
+        except Exception:
+            return ""
+
+        if not events:
+            return ""
+
+        try:
+            wt = WorldTime.now() if hasattr(WorldTime, 'now') else None
+            now_str = wt.to_string() if wt else "?"
+        except Exception:
+            now_str = "?"
+
+        lines = [f"[news_digest] Since your last invocation — current time ({now_str})"]
+        for ev in events:
+            ev_tick = ev.get("tick", 0)
+            desc = str(ev.get("description", "")).strip()
+            tag = str(ev.get("tag", "")).strip()
+            if tag:
+                lines.append(f"  [{tag}] {desc[:200]}")
+            else:
+                lines.append(f"  - {desc[:200]}")
+            self._last_digest_event_id = ev.get("event_id", "")
+
+        return "\n".join(lines)

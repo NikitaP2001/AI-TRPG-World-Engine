@@ -16,7 +16,6 @@ from world_manager.entity_store import (
     attach_script, detach_script,
 )
 from world_manager.event_log import query_events, record_event
-from news_queue import consume as consume_news, peek as peek_news, append as append_news
 from scheduler_queue import pop_due_invocations, schedule_invocation, peek_due_invocations
 
 
@@ -85,10 +84,10 @@ class GuiBridge:
     # ── Scene ──
 
     @staticmethod
-    def get_scene(location_id: str) -> Dict[str, Any]:
-        """Get current scene: location, participants, recent events."""
-        from scene_manager.tools import get_scene as _get_scene
-        return _get_scene(location_id)
+    def get_location_info(location_id: str) -> Dict[str, Any]:
+        """Get location data: entities present, recent events."""
+        from scene_manager.tools import get_location_info as _get_location_info
+        return _get_location_info(location_id)
 
     @staticmethod
     def get_active_scene() -> Optional[Dict[str, Any]]:
@@ -181,7 +180,11 @@ class GuiBridge:
 
     @staticmethod
     def get_news_queue(agent: str) -> List[str]:
-        return peek_news(agent, limit=20)
+        try:
+            events = query_events(narrative_flag_only=True, limit=20)
+            return [f"[{ev.get('tag','')}] {ev.get('description','')[:100]}" for ev in events]
+        except Exception:
+            return []
 
     @staticmethod
     def invoke_agent(agent: str, comment: str = "") -> Dict[str, Any]:

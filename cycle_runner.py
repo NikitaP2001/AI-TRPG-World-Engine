@@ -272,16 +272,6 @@ def _invoke_players(
             print(f"  ✗ {pname} error: {e}")
             import traceback
             traceback.print_exc()
-            try:
-                from scene.runtime import Scene
-                app._scene.mark_player_acted(
-                    player_name=pname,
-                    last_decision=f"(error: {e})",
-                    last_thoughts="",
-                    output_source="error",
-                )
-            except Exception:
-                pass
 
 
 def _run_single_player(
@@ -374,24 +364,17 @@ def _run_single_player(
 
     # Store declared intents for the segment scheduler (scheduler/timeline.py)
     if declared:
-        s = app.world.get_scene()
-        s.setdefault("declared_intents", []).extend(declared)
-        app.world.set_scene(s)
+        timeline = app.world.get_timeline()
+        existing = timeline.get("intents") or []
+        # scene.json also had declared_intents — now they live in timeline.json only
+        existing.extend(declared)
+        timeline["intents"] = existing
+        app.world.set_timeline(timeline)
 
     if cancel_ids:
         _apply_cancelled_subscriptions(app, player_name, cancel_ids)
 
-    # Mark player as acted
-    thoughts_block = f"psyche: {psyche}\nego: {ego}"
-    if thoughts_text:
-        thoughts_block = f"[thoughts]\n{thoughts_text}\n\n{thoughts_block}"
-    app._scene.mark_player_acted(
-        player_name=player_name,
-        last_decision=intent,
-        last_thoughts=thoughts_block,
-        output_source="model",
-    )
-
+    # No acted flag — continuous timeline has no turn boundary (design doc §6)
 
 def _resolve_player_locations(player_list: list, app: "GameOrchestrator") -> list:
     """Resolve each player's location string to a real entity_id.
@@ -405,7 +388,7 @@ def _resolve_player_locations(player_list: list, app: "GameOrchestrator") -> lis
     for p in player_list:
         loc = (p.get("location") or "").strip()
         if loc and not loc.startswith("?"):
-            found = _query(type_filter="location", limit=50)
+            found = _query(limit=50)
             match = None
             loc_lower = loc.lower()
             for entity in found:
@@ -449,10 +432,52 @@ def _run_startup_agents(app: "GameOrchestrator") -> None:
             pass
         # Resolve location strings to real entity_ids (or mark as unresolved)
         player_list = _resolve_player_locations(player_list, app)
-        gm_context = {"players": player_list}
+        gm_context: Dict[str, Any] = {"players": player_list}
         if player_list:
             print(f"  📋 GM needs to initialize {len(player_list)} player(s): {', '.join(p['name'] for p in player_list)}")
+        # Pass world time on first invocation
+        try:
+            wt = app.world.get_world_time()
+            gm_context["world_time"] = wt.to_string()
+        except Exception:
+            pass
+        # Pass plot on first invocation (prefer original preset over game copy)
+        try:
+            from world.io import read_json
+            workspace_root = app.world.game_root.parent
+            for candidate in [
+                workspace_root / "setups" / "plot.json",
+                app.world.game_root / "setups" / "plot.json",
+            ]:
+                if candidate.exists():
+                    raw = read_json(candidate)
+                    if isinstance(raw, dict) and raw.get("init", "").strip():
+                        gm_context["plot"] = raw
+                        break
+        except Exception:
+            pass
+
+        # Set inline WM invoker so notify_wm(blocking=True) works synchronously
+        from world_manager.tool_registry import set_wm_invoker
+        def _wm_inline(message: str) -> str:
+            """Invoke WM synchronously with an escalation message."""
+            result = app._wm.call_wm(
+                notice=f"[escalation] {message[:100]}",
+                context={"escalation_message": message},
+            )
+            thinking = str(result.get("thinking") or result.get("exit_args") or "")
+            return thinking[:1000] if thinking else "(WM responded)"
+        set_wm_invoker(_wm_inline)
+
         app._game_master.call_gm(notice="initialize", context=gm_context)
+
+        # Strip description.json to core fields (general/race/personality) now
+        # that GM has created entity store entries.
+        from world.state import World as _World
+        for _cname in app.world.list_character_names():
+            _World.strip_character_description_to_core(
+                game_root=app.world.game_root, name=_cname,
+            )
     except Exception as e:
         print(f"  ⚠ GM init error: {e}")
 
@@ -475,40 +500,50 @@ def run_cycle(app: "GameOrchestrator", user_msg: Optional[HumanMessage]) -> None
         app._fully_initialized = True
         _run_startup_agents(app)
 
-    # 2. Begin SM session + character session contexts (§1.1)
-    try:
-        app._sm.begin_session()
-    except Exception:
-        pass
-    try:
-        from player.agent import begin_session
-        begin_session()
-    except Exception:
-        pass
+    # 2. Auto-start session if not already active (§1.1 — multi-cycle session)
+    if not getattr(app, '_session_active', False):
+        app.begin_session()
 
     try:
         # 3. Bootstrap scene if none active
         app._bootstrap_next_scene()
 
-        # 4. Check if scene is active
-        scene = app.world.get_scene()
-        if not isinstance(scene, dict) or scene.get("state") != "active":
-            if logs_enabled():
-                print("[cycle] No active scene")
+        # 4. Check if any players exist (no scene.json — players from entity store)
+        try:
+            all_players = app.world.get_players()
+            if not all_players:
+                if logs_enabled():
+                    print("[cycle] No players found")
+                return
+        except Exception:
             return
 
-        # 5. T-cycle invocation (§5.1) — per location:
-        #    Step 1: players WITHOUT active intents declare first.
-        #    Step 2: if any declared new intent, alert players re-evaluate.
-        #    Step 3: no one without intent → all alert players skip.
-        #    Step 4: immersed players never invoked by this condition.
-        chars = scene.get("players") or {}
-        location = str(scene.get("location") or "")
-        start_time = str(scene.get("start_time") or "")
-        npcs = scene.get("npcs") or []
-        players = list(chars.keys())
+        # 5. Invocation by location (§5.1) — no scene.json, no acted flags.
+        #    Players are grouped by location from entity store.
+        try:
+            all_players = app.world.get_players()
+        except Exception:
+            all_players = []
 
-        scene_data = scene  # capture initial scene state
+        # Group by location, pick the largest group
+        location_groups: Dict[str, List[str]] = {}
+        for ch in all_players:
+            if not isinstance(ch, dict):
+                continue
+            name = str(ch.get("name") or "").strip()
+            loc = str(ch.get("location") or "").strip()
+            if name and loc:
+                location_groups.setdefault(loc, []).append(name)
+
+        if not location_groups:
+            if logs_enabled():
+                print("[cycle] No players at any location")
+            return
+
+        target_loc = max(location_groups, key=lambda k: len(location_groups[k]))
+        players_at_loc = location_groups[target_loc]
+        location = target_loc
+        start_time = app.world.get_world_time().to_string()
 
         # Step 1: players with no active intent
         no_intent = _players_without_active_intent(app, location)
@@ -517,47 +552,43 @@ def run_cycle(app: "GameOrchestrator", user_msg: Optional[HumanMessage]) -> None
             _invoke_players(
                 app, no_intent,
                 location=location, start_time=start_time,
-                npcs=npcs, players=players,
-                scene_data=scene_data,
+                npcs=[], players=players_at_loc,
+                scene_data={},
             )
 
-        # Step 2: check if any new intents appeared, then alert players
-        # Refresh from scene to get declared_intents
-        scene_after = app.world.get_scene()
-        declared_after = scene_after.get("declared_intents") or []
-        had_new_intents = bool(declared_after)
-
-        if had_new_intents:
-            alert_players = _alert_players_at_location(app, location)
-            if alert_players:
-                print(f"  👀 Re-evaluating {len(alert_players)} alert player(s): {', '.join(alert_players)}")
-                _invoke_players(
-                    app, alert_players,
-                    location=location, start_time=start_time,
-                    npcs=npcs, players=players,
-                    scene_data=scene_after,
-                    gm_notice="You notice new activity at this location.",
-                )
-
-        # Step 3 & 4: handled implicitly — if no one without intent, or everyone
-        # is immersed, nothing happens. The scheduler handles carry-over.
+        # Step 2 removed: alert re-invoke with generic notice was uninformative.
+        # SegmentScheduler handles re-invocation via trigger matching (§4).
 
         # 6. Resolution loop + finalize
         app._finalize_cycle_if_ready()
 
+        # ── Scheduler tick: evaluate periodic jobs (summaries, etc.) ──
+        try:
+            app._scheduler.tick(
+                cycle_count=0,
+                session_count=app._scheduler.session_count,
+                paragraph_count=0,
+                world=app.world,
+            )
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
     finally:
-        # Always end SM session (cleanup)
-        try:
-            app._sm.end_session()
-        except Exception:
-            pass
-        try:
-            from player.agent import end_session
-            end_session()
-        except Exception:
-            pass
-        try:
-            from player.agent import set_sm_resolver
-            set_sm_resolver(None)
-        except Exception:
-            pass
+        # End session only if we auto-started it (backward compat — REPL mode).
+        # Multi-cycle sessions manage lifecycle externally via app.begin/end_session.
+        if not getattr(app, '_session_active', False):
+            try:
+                app._sm.end_session()
+            except Exception:
+                pass
+            try:
+                from player.agent import end_session
+                end_session()
+            except Exception:
+                pass
+            try:
+                from player.agent import set_sm_resolver
+                set_sm_resolver(None)
+            except Exception:
+                pass

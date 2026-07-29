@@ -9,7 +9,7 @@ from world_manager.tool_registry import (
     attach_script, detach_script,
     record_event, query_events,
     invoke_self, close_invocation,
-    delete_entity, set_movement, write_correction,
+    delete_entity, write_correction,
     read_tool_doc,
 )
 

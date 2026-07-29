@@ -15,7 +15,7 @@ from world_manager.tool_registry import (
     set_effect, remove_effect,
     attach_script, detach_script,
     invoke_self, close_invocation,
-    notify_wm, escalate_to_sm,
+    notify_wm,
 )
 
 __all__ = [
@@ -27,5 +27,5 @@ __all__ = [
     "attach_script", "detach_script",
     "set_effect", "remove_effect",
     "invoke_self", "close_invocation",
-    "notify_wm", "escalate_to_sm",
+    "notify_wm",
 ]

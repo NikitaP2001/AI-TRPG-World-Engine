@@ -144,7 +144,7 @@ class GameMaster:
                 streaming=True,
                 title_suffix="-game-master",
                 max_tokens=2000,
-                parallel_tool_calls=False,
+                parallel_tool_calls=True,
             )
 
         from world_manager.tool_registry import ToolRegistry
@@ -211,6 +211,10 @@ class GameMaster:
             scene = context.get("current_scene", "")
             if scene:
                 ctx_parts.append(f"\nActive scene: {scene}")
+            plot = context.get("plot")
+            if plot:
+                import json as _json
+                ctx_parts.append(f"\nPlot:\n{_json.dumps(plot, ensure_ascii=False, indent=2)}")
 
         human_msg = "\n".join(ctx_parts)
 
@@ -250,9 +254,15 @@ class GameMaster:
                     missing.append(f"{pname}: skills block missing")
                 if not state.get("equipment"):
                     missing.append(f"{pname}: equipment block missing")
-                # Location: check entity.position (populated from state.json["location"])
-                if not entity.get("position"):
-                    missing.append(f"{pname}: location not set — use position={{\"inside\": \"location_id\"}}")
+                # Location: check entity.position has inside + offset [x,y,z]
+                pos = entity.get("position") or {}
+                if not pos.get("inside"):
+                    missing.append(f"{pname}: position.inside not set — use "
+                                   f"position={{\"inside\": \"location_id\", \"offset\": [x, y, z]}}")
+                else:
+                    offset = pos.get("offset")
+                    if not offset or not isinstance(offset, (list, tuple)) or len(offset) != 3:
+                        missing.append(f"{pname}: position.offset [x,y,z] required (3 meters)")
             if missing:
                 return "GM initialization incomplete:\n" + "\n".join(f"  - {m}" for m in missing)
             return None
@@ -264,15 +274,14 @@ class GameMaster:
         ctx = PinnedContext(self._history_path, _WORLD)
         persistent = (
             ctx.add_world_setting()
-               .add_arc_summaries()
-               .add_paragraph_summaries()
+               .add_gm_summaries()
+               .add_all_player_descriptions()
                .add_active_characters()
                .build_persistent()
         )
-        if self._history_path:
-            from world.story import build_gm_summaries_block
-            history_msgs = ctx.add_gm_summaries(history_msgs)
-        invocation = ctx.add_storage_notice().build_invocation()
+        invocation = ctx.add_storage_notice().add_news_digest(
+            last_seen_event_id=self._meta.last_seen_event_id,
+        ).build_invocation()
         sys_msgs = [SystemMessage(content=self._prompt_text), *persistent]
         messages = [*sys_msgs, *history_msgs, *invocation, HumanMessage(content=human_msg)]
 
@@ -314,6 +323,12 @@ class GameMaster:
         if context and context.get("world_time"):
             self._meta.set_last_call_time(str(context["world_time"]))
 
+        # Update news digest marker on successful invocation
+        exit_tool = result.get("exit_tool")
+        if exit_tool in ("close_invocation", "invoke_self_gm", "answer_lore_question_gm"):
+            if ctx.last_digest_event_id:
+                self._meta.set_last_seen_event_id(ctx.last_digest_event_id)
+
         # Summarization triggers (every 10 invocations, every 10 paragraphs)
         inv_count = self._meta.increment_invocation()
         if inv_count > 0 and inv_count % 10 == 0:
@@ -330,10 +345,15 @@ class GameMaster:
         }
 
     def _run_summarization(self) -> None:
-        """Run GM story summarization (every 10 invocations)."""
+        """Run GM story summarization (every 10 invocations).
+
+        Writes to gm_story.json + gm_summaries.json (NOT messages.json).
+        """
         if not self._history_path:
             return
         try:
+            from world.agent_story import append_paragraph
+
             runner = SummaryRunner(
                 self._meta, self._history_path, self._prompt_text,
                 temperature=self._temperature, scope="game_master",
@@ -357,10 +377,14 @@ class GameMaster:
             if result:
                 pname, summary = result
                 pname = pname or "Summary"
-                summary_block = f"[gm_summary:{pname}]\n{summary}"
-                limits = limits_from_env()
-                append_message(self._history_path, role="user", content=summary_block, limits=limits)
-                self._meta.append_entry("auto_injection", f"[gm_summary:{pname}]")
+                root = self._history_path.parent
+                append_paragraph(
+                    summaries_path=root / "gm_summaries.json",
+                    story_path=root / "gm_story.json",
+                    name=pname,
+                    summary=summary,
+                )
+                self._meta.append_entry("auto_injection", f"[gm_paragraph:{pname}]")
                 self._meta.mark_summarized(pname)
                 self._meta.increment_paragraph()
                 if logs_enabled():
@@ -370,10 +394,15 @@ class GameMaster:
                 print(f"[trace] GM _run_summarization error: {e}")
 
     def _run_arc_summary(self) -> None:
-        """Run GM arc summary (every 10 paragraphs)."""
+        """Run GM arc summary (every 10 paragraphs).
+
+        Writes to gm_story.json + gm_summaries.json (NOT messages.json).
+        """
         if not self._history_path:
             return
         try:
+            from world.agent_story import append_arc
+
             runner = SummaryRunner(
                 self._meta, self._history_path, self._prompt_text,
                 temperature=self._temperature, scope="game_master",
@@ -395,10 +424,14 @@ class GameMaster:
             if result:
                 arc_name, summary = result
                 arc_name = arc_name or "Arc Summary"
-                arc_block = f"[gm_arc_summary:{arc_name}]\n{summary}"
-                limits = limits_from_env()
-                append_message(self._history_path, role="user", content=arc_block, limits=limits)
-                self._meta.append_entry("auto_injection", f"[gm_arc_summary:{arc_name}]")
+                root = self._history_path.parent
+                append_arc(
+                    summaries_path=root / "gm_summaries.json",
+                    story_path=root / "gm_story.json",
+                    name=arc_name,
+                    summary=summary,
+                )
+                self._meta.append_entry("auto_injection", f"[gm_arc:{arc_name}]")
                 if logs_enabled():
                     print(f"[trace] GM arc summary: '{arc_name}' ({len(summary)} chars)")
         except Exception as e:

@@ -11,7 +11,7 @@ from __future__ import annotations
 from functools import partial
 from typing import TYPE_CHECKING
 
-from scheduler.core import TickScheduler, Job, CycleCount, ParagraphCount, MemoryEntryCount
+from scheduler.core import TickScheduler, Job, CycleCount, SessionCount, ParagraphCount, MemoryEntryCount
 
 if TYPE_CHECKING:
     from engine.orchestrator import GameOrchestrator
@@ -30,7 +30,7 @@ def register_all_jobs(scheduler: TickScheduler, orch: "GameOrchestrator") -> Non
 
     scheduler.register(
         Job("paragraph_summary", orch._sm._run_paragraph_summary,
-            trigger=CycleCount(interval=10),
+            trigger=SessionCount(interval=10),
             priority=50,
             ),
         Job("arc_summary", orch._sm._run_arc_summary,

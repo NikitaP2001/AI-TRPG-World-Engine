@@ -21,37 +21,13 @@ from .io import (
 from .migrations import (
     ensure_character_description_fields,
     ensure_character_metadata_fields,
-    ensure_story_schema_v2,
-    ensure_scene_schema_v2,
     migrate_character_last_acted_to_metadata,
 )
-from .story import append_turn_to_story as _append_turn_to_story
 
 
 # ---------------------------------------------------------------------------
-# Character storage limits (static + dynamic LRU sections)
+# Character storage — limits and LRU eviction moved to _json_backend.py
 # ---------------------------------------------------------------------------
-STATE_LIMIT_BYTES = 2 * 1024
-SKILLS_LIMIT_BYTES = 4 * 1024
-SKILLS_CORE_LIMIT_BYTES = 2 * 1024
-EQUIPMENT_LIMIT_BYTES = 2 * 1024
-EQUIPMENT_SIG_LIMIT_BYTES = 1 * 1024
-
-
-def _lru_evict(items: List[Dict[str, Any]], max_bytes: int) -> List[Dict[str, Any]]:
-    """Evict lowest-priority, oldest items until serialized size is under max_bytes."""
-    while True:
-        raw = json.dumps(items, ensure_ascii=False)
-        if len(raw.encode("utf-8")) <= max_bytes:
-            break
-        candidates = [i for i in items if i.get("priority", 1) < 3]
-        if not candidates:
-            break
-        # Sort by (priority ascending, last_used_tick ascending) → remove worst
-        candidates.sort(key=lambda x: (x.get("priority", 1), x.get("last_used_tick", 0)))
-        victim = candidates[0]
-        items = [i for i in items if i is not victim]
-    return items
 
 
 @dataclass
@@ -63,20 +39,10 @@ class WorldPaths:
         return self.root / "info.json"
 
     @property
-    def story_json(self) -> Path:
-        return self.root / "story.json"
-
-    @property
     def locations_json(self) -> Path:
+        # Legacy path — kept for backward compat during migration, now unused.
+        # Locations are stored in entity_store/entities.json with type="location".
         return self.root / "locations.json"
-
-    @property
-    def npc_json(self) -> Path:
-        return self.root / "npc.json"
-
-    @property
-    def scene_json(self) -> Path:
-        return self.root / "scene.json"
 
     @property
     def timeline_json(self) -> Path:
@@ -121,34 +87,10 @@ class World:
     def ensure_initialized(self) -> None:
         self._paths.root.mkdir(parents=True, exist_ok=True)
 
-        # Ensure core JSON files exist.
-        if not self._paths.locations_json.exists():
-            _write_json(self._paths.locations_json, {})
-        if not self._paths.npc_json.exists():
-            _write_json(self._paths.npc_json, {})
-        if not self._paths.story_json.exists():
-            _write_json(
-                self._paths.story_json,
-                [
-                    {
-                        "name": "Ongoing Arc",
-                        "paragraphs": [],
-                        "ongoing_paragraph": {
-                            "start_time": "",
-                            "turns": [],
-                            "locations": [],
-                            "players": [],
-                            "npcs": [],
-                        },
-                    }
-                ],
-            )
-        if not self._paths.scene_json.exists():
-            _write_json(self._paths.scene_json, {"state": ""})
-        else:
-            # Scene duration is finalized at gm_output_turn time; do not enforce turn_duration on persisted scenes.
-            pass
-
+        # NOTE: story.json is no longer created here — each agent has its own
+        # {agent}_story.json managed by world.agent_story module.
+        # locations.json is also no longer created — locations live in
+        # entity_store/entities.json with type="location".
         if not self._paths.timeline_json.exists():
             _write_json(self._paths.timeline_json, {
                 "intents": [],
@@ -156,19 +98,6 @@ class World:
                 "cursor": 0,
                 "horizon": 0,
             })
-
-        # Ensure scene schema fields exist (state, acted, etc.) and migrate legacy fields.
-        ensure_scene_schema_v2(scene_json=self._paths.scene_json)
-
-        # Strip non-core fields from description.json upfront (equipment, skills,
-        # status, appearance, location).  Saved to _stripped.json for storage
-        # notice fallback.  ONLY FOR FIRST INIT: capture the real values before
-        # ensure_description_fields adds empty defaults.
-        try:
-            for name in self.list_character_names():
-                self._strip_noncore_fields(name)
-        except Exception:
-            pass
 
         # Ensure characters have required fields in their description.json.
         self._ensure_character_description_fields()
@@ -179,15 +108,7 @@ class World:
         # One-time migration: move last_acted out of description.json.
         self._migrate_character_last_acted_to_metadata()
 
-        # Ensure story.json schema is in the expected (v2) format.
-        self._ensure_story_schema_v2()
-
-        # Remove legacy plot_seed turns (old format) and persist init plot as
-        # a proper first paragraph so it survives through paragraph summaries.
-        self._remove_legacy_plot_seed_turns()
-        self._ensure_init_plot_as_first_paragraph()
-
-        # Ensure every location entry has a sublocations_names field.
+        # Sync location parent→sublocations hierarchy in entity store.
         self._ensure_location_sublocations_field()
 
         # Ensure info.json exists and is in sync with current characters.
@@ -203,135 +124,6 @@ class World:
             _write_json(self._paths.info_json, info)
         else:
             self._sync_info_characters()
-
-    def _read_init_plot_json(self) -> Optional[Dict[str, Any]]:
-        """Best-effort read of init/plot.json (or legacy init/characters/plot.json)."""
-
-        init_plot_path = (self._workspace / "init" / "plot.json").resolve()
-        alt_plot_path = (self._workspace / "init" / "players" / "plot.json").resolve()
-        path = init_plot_path if init_plot_path.exists() else alt_plot_path
-        if not path.exists():
-            return None
-
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except Exception:
-            return None
-
-        try:
-            parsed = json.loads(raw)
-        except Exception:
-            return None
-        return parsed if isinstance(parsed, dict) else None
-
-    def _remove_legacy_plot_seed_turns(self) -> None:
-        """Remove legacy plot_seed turns previously persisted into story.json."""
-        try:
-            arcs = _read_json(self._paths.story_json)
-        except Exception:
-            return
-        if not isinstance(arcs, list) or not arcs:
-            return
-
-        changed = False
-        for i, arc in enumerate(arcs):
-            if not isinstance(arc, dict):
-                continue
-
-            ongoing = arc.get("ongoing_paragraph")
-            if isinstance(ongoing, dict):
-                turns = ongoing.get("turns")
-                if isinstance(turns, list):
-                    filtered = [
-                        t for t in turns
-                        if not (isinstance(t, dict) and str(t.get("kind") or "").strip() == "plot_seed")
-                    ]
-                    if len(filtered) != len(turns):
-                        ongoing["turns"] = filtered
-                        arc["ongoing_paragraph"] = ongoing
-                        changed = True
-
-            paragraphs = arc.get("paragraphs")
-            if isinstance(paragraphs, list):
-                for p in paragraphs:
-                    if not isinstance(p, dict):
-                        continue
-                    p_turns = p.get("turns")
-                    if not isinstance(p_turns, list):
-                        continue
-                    filtered_p = [
-                        t for t in p_turns
-                        if not (isinstance(t, dict) and str(t.get("kind") or "").strip() == "plot_seed")
-                    ]
-                    if len(filtered_p) != len(p_turns):
-                        p["turns"] = filtered_p
-                        changed = True
-
-            arcs[i] = arc
-
-        if changed:
-            try:
-                _write_json(self._paths.story_json, arcs)
-            except Exception:
-                return
-
-    def _ensure_init_plot_as_first_paragraph(self) -> None:
-        """Persist init/plot.json as the very first paragraph in story.json (once).
-
-        Unlike the old plot_seed approach which injected a special turn kind,
-        this creates a real summarized paragraph so the plot text survives
-        through paragraph summaries and remains visible in context forever.
-        Idempotent: skips if a paragraph named 'Initial Plot' already exists.
-        """
-
-        plot = self._read_init_plot_json()
-        if not isinstance(plot, dict):
-            return
-
-        init_text = str(plot.get("init") or "").strip()
-        if not init_text:
-            return
-
-        try:
-            arcs = _read_json(self._paths.story_json)
-        except Exception:
-            return
-        if not isinstance(arcs, list) or not arcs:
-            return
-
-        # Find the oldest arc (last element) to prepend the paragraph there.
-        oldest_arc = arcs[-1]
-        if not isinstance(oldest_arc, dict):
-            return
-
-        paras = oldest_arc.get("paragraphs")
-        if not isinstance(paras, list):
-            paras = []
-            oldest_arc["paragraphs"] = paras
-
-        # Idempotency: if first paragraph is already the plot, skip.
-        if paras and isinstance(paras[0], dict) and str(paras[0].get("name") or "").strip() == "Initial Plot":
-            return
-
-        plot_paragraph = {
-            "name": "Initial Plot",
-            "start_time": "",
-            "end_time": "",
-            "locations": [],
-            "players": [],
-            "npcs": [],
-            "summary": init_text,
-            "turn_count": 0,
-            "turns": [],
-        }
-        paras.insert(0, plot_paragraph)
-        oldest_arc["paragraphs"] = paras
-        arcs[-1] = oldest_arc
-
-        try:
-            _write_json(self._paths.story_json, arcs)
-        except Exception:
-            return
 
     def _character_dir(self, name: str) -> Path:
         if not name:
@@ -421,64 +213,50 @@ class World:
         _write_json(self._paths.info_json, info)
 
     def get_locations(self) -> Dict[str, Any]:
-        """Return locations as {name: data} dict.
-        
-        Delegates to entity_store for type="location" entities,
-        falls back to old game/world/locations.json.
+        """Return locations as {id: data} dict from entity store.
+
+        All locations are stored in entity_store/entities.json with type="location".
+        Returns a dict of {id: entity_dict} for backward-compatible iteration.
         """
-        try:
-            from world_manager.entity_core import _get_backend
-            backend = _get_backend()
-            entities = backend.query(type_filter="location", include_templates=False, limit=200)
-            if entities:
-                result = {}
-                for e in entities:
-                    name = ""
-                    for tag in e.get("tags", []):
-                        if tag.startswith("name:"):
-                            name = tag[5:]
-                            break
-                    if not name:
-                        name = e.get("id", "unknown")
-                    result[name] = {
-                        "name": name,
-                        "summary": e.get("facts", "")[:200],
-                        "details": e.get("facts", ""),
-                        "parent_location": "",
-                        "sublocations_names": [],
-                        "npcs_present": [],
-                        "last_active": "",
-                    }
-                if result:
-                    return result
-        except Exception:
-            pass
-        return _read_json(self._paths.locations_json)
+        from world_manager.entity_core import _get_backend
+        backend = _get_backend()
+        entities = backend.query(type_filter="location", include_templates=False, limit=200)
+        result = {}
+        for e in entities:
+            eid = e.get("id", "unknown")
+            result[eid] = e
+        return result
 
     def get_players(self) -> List[Dict[str, str]]:
         """Return player list from entity store: [{name, location, last_acted}].
 
-        Replaces the old info.json['players'] source. Each player is a character
-        entity with position and metadata. Falls back to _stripped.json for
-        location if the entity doesn't have a position yet (startup path).
+        "Player" = entity whose id matches a game/players/{id}/ folder.
+        Entity type is irrelevant — it's an orchestration fact,
+        not an entity-store concept.
+
+        Falls back to info.json if entity store has no matching entities yet
+        (startup path — before GM populates them).
         """
         try:
             from world_manager.entity_core import _get_backend
-            backend = _get_backend()
-            entities = backend.query(type_filter="character", include_templates=False, limit=50)
+            from pathlib import Path as _P
+            players_root = _P("game") / "players"
             result = []
+            # Phase 1: entities already in store
+            backend = _get_backend()
+            entities = backend.query(include_templates=False, limit=200)
+            seen = set()
             for e in entities:
                 name = e.get("id", "").strip()
-                if not name:
+                if not name or not (players_root / name).is_dir():
                     continue
-                # Extract location from position field (stored in state.json.location)
+                seen.add(name.lower())
                 position = e.get("position", {}) or {}
                 loc = position.get("inside", position.get("near", ""))
                 if not loc:
                     coords = position.get("coords")
                     if coords:
                         loc = f"coords:{coords[0]},{coords[1]}"
-                # Read last_acted from metadata
                 last_acted = "never"
                 try:
                     meta = _read_json(self._character_dir(name) / "metadata.json")
@@ -490,416 +268,239 @@ class World:
                     "location": loc if loc else "no location specified",
                     "last_acted": last_acted,
                 })
+            # Phase 2: player folders without entity records yet (startup)
+            if players_root.is_dir():
+                for pdir in sorted(players_root.iterdir()):
+                    if not pdir.is_dir():
+                        continue
+                    name = pdir.name
+                    if name.lower() in seen:
+                        continue
+                    loc = "no location specified"
+                    last_acted = "never"
+                    try:
+                        meta = _read_json(pdir / "metadata.json")
+                        last_acted = str(meta.get("last_acted", "never"))
+                    except Exception:
+                        pass
+                    result.append({
+                        "name": name,
+                        "location": loc,
+                        "last_acted": last_acted,
+                    })
             return result
         except Exception:
             pass
-        # Fallback to old info.json if entity store fails
+        # Fallback to old info.json
         info = self.get_info()
         return info.get(self.K_PLAYERS, []) if isinstance(info, dict) else []
 
     def get_story(self) -> Any:
-        return _read_json(self._paths.story_json)
-
-    def _ensure_story_schema_v2(self) -> None:
-        ensure_story_schema_v2(story_json=self._paths.story_json)
-
-    def append_turn_to_story(
-        self,
-        *,
-        narration: str,
-        start_time: str,
-        end_time: str,
-        location: str,
-        characters: List[str],
-        npcs: List[str],
-    ) -> None:
-        """Append one turn to the ongoing paragraph; summarize every 10 turns into a paragraph."""
-
-        _append_turn_to_story(
-            story_json=self._paths.story_json,
-            workspace=self._workspace,
-            narration=narration,
-            start_time=start_time,
-            end_time=end_time,
-            location=location,
-            characters=characters,
-            npcs=npcs,
-        )
+        """Read legacy story.json (no longer written to, exists for backward compat)."""
+        legacy = self._paths.root / "story.json"
+        if legacy.exists():
+            return _read_json(legacy)
+        return []
 
     def _ensure_location_sublocations_field(self) -> None:
-        """Backfill and normalize location hierarchy fields on existing entries."""
+        """Sync sublocations list via entity store (idempotent)."""
+        from world_manager.entity_core import query_entities, set_entity as _se
         try:
-            locs = self.get_locations()
+            locations = query_entities(type_filter="location", include_templates=False, limit=200)
         except Exception:
             return
-        changed = self._sync_location_hierarchy_fields(locs)
-        if changed:
-            _write_json(self._paths.locations_json, locs)
-
-    def _sync_location_hierarchy_fields(self, locs: Dict[str, Any]) -> bool:
-        """Ensure `parent_location` and `sublocations_names` are mutually consistent.
-
-        Rules:
-        - Every location has `parent_location` (str) and `sublocations_names` (list).
-        - If a child has `parent_location` pointing to an existing location, that parent
-          includes the child in `sublocations_names`.
-        - If parent changes or is removed, parent sublocation lists are rebuilt accordingly.
-        """
-
-        if not isinstance(locs, dict):
-            return False
-
-        changed = False
-        location_names: List[str] = [str(k) for k, v in locs.items() if isinstance(v, dict)]
-        desired_children: Dict[str, List[str]] = {nm: [] for nm in location_names}
-
-        # Ensure required fields and compute desired parent -> children mapping.
-        # Also collect any referenced parent names that don't exist as records yet.
-        missing_parents: List[str] = []
-        for child_name in location_names:
-            entry = locs.get(child_name)
-            if not isinstance(entry, dict):
-                continue
-
-            if "parent_location" not in entry:
-                entry["parent_location"] = ""
-                changed = True
-            if "sublocations_names" not in entry:
-                entry["sublocations_names"] = []
-                changed = True
-
-            parent_name = str(entry.get("parent_location") or "").strip()
-            if not parent_name or parent_name == child_name:
-                continue
-            if parent_name in desired_children:
-                if child_name not in desired_children[parent_name]:
-                    desired_children[parent_name].append(child_name)
-            else:
-                # Parent is referenced but has no location record — create a stub.
-                if parent_name not in missing_parents:
-                    missing_parents.append(parent_name)
-
-        # Create minimal stub records for referenced-but-missing parents.
-        for parent_name in missing_parents:
-            locs[parent_name] = {
-                "name": parent_name,
-                "summary": "",
-                "details": "",
-                "last_active": "",
-                "parent_location": "",
-                "sublocations_names": [],
-            }
-            location_names.append(parent_name)
-            desired_children[parent_name] = []
-            changed = True
-
-        # Re-run the child assignment now that stub parents exist.
-        for child_name in location_names:
-            entry = locs.get(child_name)
-            if not isinstance(entry, dict):
-                continue
-            parent_name = str(entry.get("parent_location") or "").strip()
-            if parent_name and parent_name in desired_children and parent_name != child_name:
-                if child_name not in desired_children[parent_name]:
-                    desired_children[parent_name].append(child_name)
-
-        # Normalize each parent's sublocations_names to match current parent links.
-        for parent_name in location_names:
-            entry = locs.get(parent_name)
-            if not isinstance(entry, dict):
-                continue
-
-            current_raw = entry.get("sublocations_names")
-            current_list: List[str] = []
-            if isinstance(current_raw, list):
-                for x in current_raw:
-                    sx = str(x).strip()
-                    if sx and sx not in current_list:
-                        current_list.append(sx)
-
-            expected_list = desired_children.get(parent_name, [])
-            if current_list != expected_list:
-                entry["sublocations_names"] = expected_list
-                changed = True
-
-        return changed
+        # Build parent→children map
+        children_of: Dict[str, List[str]] = {}
+        for loc in locations:
+            eid = loc.get("id", "")
+            parent = str(loc.get("parent_location") or "").strip()
+            if parent and parent != eid:
+                children_of.setdefault(parent, []).append(eid)
+        # Update each parent's sublocations
+        for loc in locations:
+            eid = loc.get("id", "")
+            expected = sorted(set(children_of.get(eid, [])))
+            current = sorted(loc.get("sublocations") or [])
+            if current != expected:
+                _se(id=eid, type="location",
+                    facts=loc.get("facts", ""),
+                    sublocations=expected)
 
     def get_location(self, name: str) -> Dict[str, Any]:
-        locs = self.get_locations()
-        if name not in locs:
+        from world_manager.entity_core import get_entity
+        entity = get_entity(name)
+        if entity is None:
             raise KeyError(f"Unknown location: {name}")
-        return locs[name]
-
-    def create_location(
-        self,
-        *,
-        name: str,
-        summary: str,
-        details: str,
-        parent_location: str = "",
-    ) -> Dict[str, Any]:
-        name = (name or "").strip()
-        if not name:
-            raise ValueError("Location name is required")
-
-        locs = self.get_locations()
-        if name in locs:
-            return locs[name]
-
-        parent = str(parent_location or "").strip()
-
-        locs[name] = {
-            "name": name,
-            "summary": summary or "",
-            "details": details or "",
-            "last_active": "",
-            "parent_location": parent,
-            "sublocations_names": [],
-        }
-        self._sync_location_hierarchy_fields(locs)
-        _write_json(self._paths.locations_json, locs)
-
-        info = self.get_info()
-        if name not in info.get(self.K_LOCATIONS, []):
-            info.setdefault(self.K_LOCATIONS, []).append(name)
-            _write_json(self._paths.info_json, info)
-
-        return locs[name]
-
-    def update_location_json(self, *, name: str, pointer: str, value: str) -> Dict[str, Any]:
-        """Update a JSON field in locations.json using JSON Pointer (no container creation)."""
-
-        parsed = _parse_value(value)
-
-        locs = self.get_locations()
-        if name not in locs:
-            raise KeyError(f"Unknown location: {name}")
-
-        loc = locs.get(name)
-        if not isinstance(loc, dict):
-            raise ValueError(f"Invalid location record: {name}")
-
-        set_at_pointer(loc, pointer, parsed, create_missing=False)
-        locs[name] = loc
-        self._sync_location_hierarchy_fields(locs)
-        _write_json(self._paths.locations_json, locs)
-        return loc
-
-    def add_location_json(self, *, name: str, pointer: str, value: str) -> Dict[str, Any]:
-        """Add/create a JSON field in locations.json using JSON Pointer (creates missing containers)."""
-
-        parsed = _parse_value(value)
-
-        locs = self.get_locations()
-        if name not in locs:
-            raise KeyError(f"Unknown location: {name}")
-
-        loc = locs.get(name)
-        if not isinstance(loc, dict):
-            raise ValueError(f"Invalid location record: {name}")
-
-        set_at_pointer(loc, pointer, parsed, create_missing=True)
-        locs[name] = loc
-        self._sync_location_hierarchy_fields(locs)
-        _write_json(self._paths.locations_json, locs)
-        return loc
-
-    def delete_location_json(self, *, name: str, pointer: str) -> Dict[str, Any]:
-        """Delete a JSON field in locations.json using JSON Pointer."""
-
-        locs = self.get_locations()
-        if name not in locs:
-            raise KeyError(f"Unknown location: {name}")
-
-        loc = locs.get(name)
-        if not isinstance(loc, dict):
-            raise ValueError(f"Invalid location record: {name}")
-
-        remove_at_pointer(loc, pointer)
-        locs[name] = loc
-        self._sync_location_hierarchy_fields(locs)
-        _write_json(self._paths.locations_json, locs)
-        return loc
+        return entity
 
     def get_npcs(self) -> Dict[str, Any]:
-        """Return NPCs as {name: data} dict.
+        """Return all non-player entities as {name: data} dict.
 
-        Delegates to entity_store for type="npc" entities,
-        falls back to old game/world/npc.json.
+        UI helper — filters out entities whose id matches a game/players/{id}/
+        folder (those are player-controlled). Not a type check — the entity
+        store does not know what a "player" is.
         """
         try:
             from world_manager.entity_core import _get_backend
+            from pathlib import Path as _P
             backend = _get_backend()
-            entities = backend.query(type_filter="npc", include_templates=False, limit=200)
-            if entities:
-                result = {}
-                for e in entities:
-                    name = ""
-                    for tag in e.get("tags", []):
-                        if tag.startswith("name:"):
-                            name = tag[5:]
-                            break
-                    if not name:
-                        name = e.get("id", "unknown")
-                    result[name] = {
-                        "name": name,
-                        "location": "",
-                        "current_state": e.get("state", {}).get("current_state", ""),
-                        "description": e.get("facts", ""),
-                        "details": "",
-                        "last_acted": "never",
-                    }
-                if result:
-                    return result
+            entities = backend.query(include_templates=False, limit=200)
+            result = {}
+            for e in entities:
+                eid = e.get("id", "")
+                if not eid:
+                    continue
+                # Skip player-controlled entities
+                if (_P("game") / "players" / eid).is_dir():
+                    continue
+                loc_data = e.get("position", {})
+                loc = loc_data.get("inside", "") if isinstance(loc_data, dict) else ""
+                result[eid] = {
+                    "name": eid,
+                    "location": loc,
+                    "current_state": e.get("state", {}).get("current_state", ""),
+                    "description": e.get("facts", ""),
+                    "details": "",
+                    "last_acted": e.get("state", {}).get("last_acted", "never"),
+                }
+            return result
         except Exception:
             pass
-        return _read_json(self._paths.npc_json)
+        return {}
 
     def get_npc(self, name: str) -> Dict[str, Any]:
-        npcs = self.get_npcs()
-        if name not in npcs:
-            raise KeyError(f"Unknown NPC: {name}")
-        npc = npcs.get(name)
-        if not isinstance(npc, dict):
-            raise ValueError(f"Invalid NPC record: {name}")
-        return npc
+        from world_manager.entity_core import get_entity as _ge
+        entity = _ge(name)
+        if entity is None:
+            raise KeyError(f"Unknown entity: {name}")
+        loc_data = entity.get("position", {})
+        loc = loc_data.get("inside", "") if isinstance(loc_data, dict) else ""
+        return {
+            "name": name,
+            "location": loc,
+            "current_state": entity.get("state", {}).get("current_state", ""),
+            "description": entity.get("facts", ""),
+            "details": "",
+            "last_acted": entity.get("state", {}).get("last_acted", "never"),
+        }
 
     def create_npc(self, *, name: str, location: str, current_state: str, description: str) -> Dict[str, Any]:
+        from world_manager.entity_core import set_entity as _se
         name = (name or "").strip()
         if not name:
             raise ValueError("NPC name is required")
 
-        # NPC names must not collide with character names.
-        # Compare case-insensitively to avoid ambiguous overlaps on case-insensitive filesystems.
+        # Validate no character collision
         try:
             for existing in self.list_character_names():
                 if str(existing).strip().lower() == name.lower():
                     raise ValueError(
-                        f"NPC name '{name}' conflicts with existing character '{existing}'. Choose a different NPC name."
+                        f"NPC name '{name}' conflicts with existing character '{existing}'."
                     )
         except ValueError:
             raise
         except Exception:
-            # If character scanning fails for any reason, do not block NPC creation.
             pass
 
         location = (location or "").strip()
         if not location:
             raise ValueError("NPC location is required")
-
-        # Validate location exists.
         _ = self.get_location(location)
 
-        npcs = self.get_npcs()
-        if name in npcs:
-            raise ValueError(f"NPC already exists: {name}. Use update_npc to modify it.")
+        # Check duplicate via entity store
+        from world_manager.entity_core import get_entity as _ge
+        if _ge(name) is not None:
+            raise ValueError(f"NPC already exists: {name}. Use update methods to modify it.")
 
-        npcs[name] = {
-            "name": name,
-            "location": location,
-            "current_state": current_state or "",
-            "description": description or "",
-            "details": "",
-            "last_acted": "never",
-        }
-        _write_json(self._paths.npc_json, npcs)
-        return npcs[name]
+        result = _se(
+            id=name, type="npc",
+            facts=description or "",
+            state={"current_state": current_state or "", "last_acted": "never"},
+            position={"inside": location},
+        )
+        if result.get("status") == "error":
+            raise ValueError(f"Failed to create NPC: {result.get('error')}")
+        return self.get_npc(name)
 
     def update_npc_json(self, *, name: str, pointer: str, value: str) -> Dict[str, Any]:
-        """Update a JSON field in npc.json using JSON Pointer (no container creation)."""
-
-        parsed = _parse_value(value)
-
-        npcs = self.get_npcs()
-        if name not in npcs:
+        """Update a JSON field on an NPC entity using JSON Pointer."""
+        from world_manager.entity_core import get_entity as _ge, set_entity as _se
+        entity = _ge(name)
+        if entity is None:
             raise KeyError(f"Unknown NPC: {name}")
-
-        npc = npcs.get(name)
-        if not isinstance(npc, dict):
-            raise ValueError(f"Invalid NPC record: {name}")
-
-        set_at_pointer(npc, pointer, parsed, create_missing=False)
-        npcs[name] = npc
-        _write_json(self._paths.npc_json, npcs)
-        return npc
+        parsed = _parse_value(value)
+        set_at_pointer(entity, pointer, parsed, create_missing=False)
+        result = _se(id=name, type="npc",
+            facts=entity.get("facts", ""),
+            state=entity.get("state", {}),
+            position=entity.get("position", {}),
+        )
+        if result.get("status") == "error":
+            raise ValueError(f"Failed to update NPC: {result.get('error')}")
+        return entity
 
     def add_npc_json(self, *, name: str, pointer: str, value: str) -> Dict[str, Any]:
-        """Add/create a JSON field in npc.json using JSON Pointer (creates missing containers)."""
-
-        parsed = _parse_value(value)
-
-        npcs = self.get_npcs()
-        if name not in npcs:
+        """Add/create a JSON field on an NPC entity using JSON Pointer."""
+        from world_manager.entity_core import get_entity as _ge, set_entity as _se
+        entity = _ge(name)
+        if entity is None:
             raise KeyError(f"Unknown NPC: {name}")
-
-        npc = npcs.get(name)
-        if not isinstance(npc, dict):
-            raise ValueError(f"Invalid NPC record: {name}")
-
-        set_at_pointer(npc, pointer, parsed, create_missing=True)
-        npcs[name] = npc
-        _write_json(self._paths.npc_json, npcs)
-        return npc
+        parsed = _parse_value(value)
+        set_at_pointer(entity, pointer, parsed, create_missing=True)
+        result = _se(id=name, type="npc",
+            facts=entity.get("facts", ""),
+            state=entity.get("state", {}),
+            position=entity.get("position", {}),
+        )
+        if result.get("status") == "error":
+            raise ValueError(f"Failed to add NPC field: {result.get('error')}")
+        return entity
 
     def delete_npc_json(self, *, name: str, pointer: str) -> Dict[str, Any]:
-        """Delete a JSON field in npc.json using JSON Pointer."""
-
-        npcs = self.get_npcs()
-        if name not in npcs:
+        """Delete a JSON field on an NPC entity using JSON Pointer."""
+        from world_manager.entity_core import get_entity as _ge, set_entity as _se
+        entity = _ge(name)
+        if entity is None:
             raise KeyError(f"Unknown NPC: {name}")
-
-        npc = npcs.get(name)
-        if not isinstance(npc, dict):
-            raise ValueError(f"Invalid NPC record: {name}")
-
-        remove_at_pointer(npc, pointer)
-        npcs[name] = npc
-        _write_json(self._paths.npc_json, npcs)
-        return npc
-
-    def delete_location(self, name: str) -> None:
-        """Remove a location from locations.json entirely."""
-        name = (name or "").strip()
-        if not name:
-            raise ValueError("Location name is required")
-        locations = self.get_locations()
-        if name not in locations:
-            raise KeyError(f"Unknown location: {name}")
-        del locations[name]
-        _write_json(self._paths.locations_json, locations)
+        remove_at_pointer(entity, pointer)
+        result = _se(id=name, type="npc",
+            facts=entity.get("facts", ""),
+            state=entity.get("state", {}),
+            position=entity.get("position", {}),
+        )
+        if result.get("status") == "error":
+            raise ValueError(f"Failed to delete NPC field: {result.get('error')}")
+        return entity
 
     def delete_npc(self, name: str) -> None:
-        """Remove an NPC from npc.json entirely."""
+        """Remove an NPC from the entity store."""
+        from world_manager.entity_core import _get_backend
         name = (name or "").strip()
         if not name:
             raise ValueError("NPC name is required")
-        npcs = self.get_npcs()
-        if name not in npcs:
+        backend = _get_backend()
+        if backend.get(name) is None:
             raise KeyError(f"Unknown NPC: {name}")
-        del npcs[name]
-        _write_json(self._paths.npc_json, npcs)
+        backend.delete(name, reason="deleted via delete_npc")
 
     def set_npc_last_acted(self, *, name: str, last_acted: str) -> Dict[str, Any]:
-        """Set an NPC's last_acted timestamp in npc.json (runtime-managed)."""
-
-        # Validate NPC exists.
-        _ = self.get_npc(name)
-
+        """Set an NPC's last_acted timestamp via entity store."""
+        from world_manager.entity_core import get_entity as _ge, set_entity as _se
+        entity = _ge(name)
+        if entity is None:
+            raise KeyError(f"Unknown NPC: {name}")
         raw = str(last_acted or "").strip()
-        if not raw or raw.lower() == "never":
-            normalized = "never"
-        else:
-            normalized = WorldTime.parse(raw).to_string()
-
-        npcs = self.get_npcs()
-        npc = npcs.get(name)
-        if not isinstance(npc, dict):
-            raise ValueError(f"Invalid NPC record: {name}")
-
-        npc["last_acted"] = normalized
-        npcs[name] = npc
-        _write_json(self._paths.npc_json, npcs)
-        return npc
+        normalized = "never" if not raw or raw.lower() == "never" else WorldTime.parse(raw).to_string()
+        state = dict(entity.get("state", {}))
+        state["last_acted"] = normalized
+        result = _se(id=name, type="npc",
+            facts=entity.get("facts", ""),
+            state=state,
+            position=entity.get("position", {}),
+        )
+        if result.get("status") == "error":
+            raise ValueError(f"Failed to update NPC last_acted: {result.get('error')}")
+        return self.get_npc(name)
 
     def get_character_metadata(self, name: str) -> Dict[str, Any]:
         p = self._character_metadata_path(name)
@@ -954,20 +555,50 @@ class World:
         except Exception:
             pass
 
-        # Merge back fields that were stripped to _stripped.json during
-        # ensure_initialized (location, equipment, skills, status, appearance).
-        # This ensures get_character_description returns complete data.
-        try:
-            stripped_path = self._character_dir(name) / "_stripped.json"
-            if stripped_path.exists():
-                stripped = _read_json(stripped_path)
-                for field in ("location", "equipment", "skills", "status", "appearance"):
-                    if field in stripped and not data.get(field):
-                        data[field] = stripped[field]
-        except Exception:
-            pass
+        # NOTE: _stripped.json merge-back removed — non-core fields (location,
+        # equipment, skills, status, appearance) now live in entity store only.
+        # After GM entity initialization, strip_character_description_to_core()
+        # keeps only general/race/personality in description.json.
 
         return data
+
+    CORE_DESCRIPTION_FIELDS = frozenset({"general", "race", "personality"})
+
+    @classmethod
+    def strip_character_description_to_core(cls, *, game_root: Path, name: str) -> bool:
+        """Strip description.json to core fields only.
+
+        After GM initializes a character entity in the entity store (gurps,
+        state, skills, equipment, position), the description.json becomes a
+        narrative-only document. This removes location, status, appearance,
+        equipment, skills — keeping only general, race, personality.
+
+        Stripped fields are saved to _stripped.json for debugging/backward compat.
+        """
+        desc_path = (game_root / "players" / name / "description.json").resolve()
+        if not desc_path.exists():
+            return False
+        try:
+            data = _read_json(desc_path)
+        except Exception:
+            return False
+        if not isinstance(data, dict):
+            return False
+
+        # Check if already stripped
+        existing_keys = set(data.keys())
+        if existing_keys.issubset(cls.CORE_DESCRIPTION_FIELDS):
+            return False  # nothing to do
+
+        # Save stripped fields for backward compat
+        stripped = {k: v for k, v in data.items() if k not in cls.CORE_DESCRIPTION_FIELDS}
+        if stripped:
+            _write_json(desc_path.with_name("_stripped.json"), stripped)
+
+        # Write core only
+        core = {k: data[k] for k in cls.CORE_DESCRIPTION_FIELDS if k in data}
+        _write_json(desc_path, core)
+        return True
 
     # ------------------------------------------------------------------
     # Character state.json (GURPS runtime: hp, fp, hunger, etc.)
@@ -981,22 +612,7 @@ class World:
         except Exception:
             return {}
 
-    def set_character_state(self, name: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Write state.json with 2KB limit. Strips 'status' and 'appearance' from description on first creation."""
-        p = self._character_state_path(name)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        serialized = json.dumps(data, ensure_ascii=False)
-        size = len(serialized.encode("utf-8"))
-        if size > STATE_LIMIT_BYTES:
-            raise StorageLimitExceeded(
-                f"Character state exceeds 2KB limit ({size} bytes)"
-            )
-        _write_json(p, data)
-        self._strip_description_field(name, "status")
-        self._strip_description_field(name, "appearance")
-        self._strip_description_field(name, "equipment")
-        self._strip_description_field(name, "location")
-        return data
+    # NOTE: set_character_state — removed (dead code, 0 callers)
 
     # ------------------------------------------------------------------
     # Character skills.json (GURPS abilities: core + LRU cache)
@@ -1010,42 +626,12 @@ class World:
         except Exception:
             return {}
 
-    def set_character_skills(self, name: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Write skills.json with 4KB limit (core block 2KB + cached_skills 2KB LRU).
-        Strips 'skills' from description on first creation."""
-        p = self._character_skills_path(name)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        # Build core dict: stats + narrative_tier + origin + passive_abilities + lore_interpretation_rule
-        core_block = {
-            "stats": data.get("stats", {}),
-            "narrative_tier": data.get("narrative_tier", "mortal"),
-            "origin": data.get("origin", ""),
-            "passive_abilities": data.get("passive_abilities", []),
-            "lore_interpretation_rule": data.get("lore_interpretation_rule", ""),
-        }
-        core_raw = json.dumps(core_block, ensure_ascii=False)
-        if len(core_raw.encode("utf-8")) > SKILLS_CORE_LIMIT_BYTES:
-            raise StorageLimitExceeded(
-                f"Skills core block exceeds 2KB limit ({len(core_raw.encode('utf-8'))} bytes)"
-            )
-        # LRU evict cached_skills section
-        cached = data.get("cached_skills", [])
-        cached = _lru_evict(cached, SKILLS_LIMIT_BYTES - SKILLS_CORE_LIMIT_BYTES)
-        data["cached_skills"] = cached
-        # Build full document
-        full = {**core_block, "cached_skills": cached}
-        serialized = json.dumps(full, ensure_ascii=False)
-        if len(serialized.encode("utf-8")) > SKILLS_LIMIT_BYTES:
-            raise StorageLimitExceeded(
-                f"Skills exceed 4KB limit ({len(serialized.encode('utf-8'))} bytes)"
-            )
-        _write_json(p, full)
-        self._strip_description_field(name, "skills")
-        return full
-
-    # ------------------------------------------------------------------
-    # Character equipment.json (gear, items, money)
-    # ------------------------------------------------------------------
+    # NOTE: set_character_skills/set_character_equipment/set_character_state
+    # and _strip_description_field/_strip_noncore_fields have been REMOVED.
+    # These were dead code (0 external callers). Byte budgets, LRU eviction,
+    # and narrative-strip mechanisms are now in _json_backend.py as generic
+    # field-config, applied via _field_config on base_type templates or
+    # form-based defaults — not tied to any type string.
 
     def get_character_equipment(self, name: str) -> Dict[str, Any]:
         """Return equipment.json or {} if not yet initialized."""
@@ -1054,69 +640,6 @@ class World:
             return _read_json(p) if p.exists() else {}
         except Exception:
             return {}
-
-    def set_character_equipment(self, name: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Write equipment.json with 2KB limit (1KB signature + 1KB LRU inventory).
-        Strips 'equipment' from description on first creation."""
-        p = self._character_equipment_path(name)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        # Enforce signature section limit
-        sig = data.get("signature", [])
-        sig_raw = json.dumps(sig, ensure_ascii=False)
-        if len(sig_raw.encode("utf-8")) > EQUIPMENT_SIG_LIMIT_BYTES:
-            raise StorageLimitExceeded(
-                f"Signature equipment exceeds 1KB limit ({len(sig_raw.encode('utf-8'))} bytes)"
-            )
-        # LRU evict inventory section
-        inv = data.get("inventory", [])
-        inv = _lru_evict(inv, EQUIPMENT_LIMIT_BYTES - EQUIPMENT_SIG_LIMIT_BYTES)
-        data["inventory"] = inv
-        # Preserve currency and lore_interpretation_rule
-        currency = data.get("currency", {})
-        lore = str(data.get("lore_interpretation_rule", "") or "").strip()
-        full = {"signature": sig, "inventory": inv, "currency": currency}
-        if lore:
-            full["lore_interpretation_rule"] = lore
-        # Enforce total limit
-        serialized = json.dumps(full, ensure_ascii=False)
-        if len(serialized.encode("utf-8")) > EQUIPMENT_LIMIT_BYTES:
-            raise StorageLimitExceeded(
-                f"Equipment exceeds 2KB limit ({len(serialized.encode('utf-8'))} bytes)"
-            )
-        _write_json(p, full)
-        self._strip_description_field(name, "equipment")
-        return full
-
-    # ------------------------------------------------------------------
-    # Strip helper: removes a field from description.json when storage is split out
-    # ------------------------------------------------------------------
-
-    def _strip_description_field(self, name: str, field: str) -> None:
-        """Remove *field* from description.json (idempotent — safe to call repeatedly).
-        Saves removed data to _stripped.json for storage notice fallback."""
-        desc_path = self._character_description_path(name)
-        if not desc_path.exists():
-            return
-        try:
-            desc = _read_json(desc_path)
-            if field in desc:
-                removed = desc.pop(field)
-                _write_json(desc_path, desc)
-                # Save to _stripped.json for fallback (skip empty values)
-                if removed:
-                    stripped_path = self._character_dir(name) / "_stripped.json"
-                    stripped = _read_json(stripped_path) if stripped_path.exists() else {}
-                    stripped[field] = removed
-                    _write_json(stripped_path, stripped)
-        except Exception:
-            pass
-
-    def _strip_noncore_fields(self, name: str) -> None:
-        """Strip all non-core fields from description.json upfront.
-        Saved to _stripped.json for storage notice fallback.
-        Idempotent — safe to call repeatedly."""
-        for field in ("equipment", "skills", "status", "appearance", "location"):
-            self._strip_description_field(name, field)
 
     def update_character_json(self, *, name: str, pointer: str, value: str) -> Dict[str, Any]:
         p = self._character_description_path(name)
@@ -1182,22 +705,25 @@ class World:
         self._sync_info_characters()
         return data
 
+    # ------------------------------------------------------------------
+    # Scene state (ephemeral — no scene.json, design doc §6: no scene
+    # boundaries, no declared_intents reset, no acted flags).
+    # Kept as in-memory fallback for gradual migration.
+    # ------------------------------------------------------------------
+
+    _scene_cache: Dict[str, Any] = {"state": ""}
+
     def get_scene(self) -> Dict[str, Any]:
-        return _read_json(self._paths.scene_json)
+        return self._scene_cache
 
     def set_scene(self, scene: Dict[str, Any]) -> None:
-        _write_json(self._paths.scene_json, scene)
+        self._scene_cache = dict(scene)
 
     def clear_scene(self) -> None:
-        _write_json(self._paths.scene_json, {"state": ""})
+        self._scene_cache = {"state": ""}
 
     # ------------------------------------------------------------------
-    # Timeline store (scheduler/timeline.py) — independent of scene
-    # lifecycle. Carries active intents/persistent subscriptions and the
-    # accumulated resolved history across scene/narrative-block boundaries
-    # (docs/scene_design.md §3.2, §6).
-    # ------------------------------------------------------------------
-
+    # Timeline store
     def get_timeline(self) -> Dict[str, Any]:
         if not self._paths.timeline_json.exists():
             return {"intents": [], "resolved_history": [], "cursor": 0, "horizon": 0}

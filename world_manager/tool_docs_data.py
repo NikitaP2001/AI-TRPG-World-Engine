@@ -17,7 +17,7 @@ DOCS: Dict[str, Dict[str, str]] = {
             "effects, laws, alliances — anything.\n\n"
             "Entity Types — the WM defines these strings; the engine has no reserved types. "
             "Conventions (not enforced): 'race_template', 'class_template', 'character', "
-            "'npc', 'faction', 'location', 'object', 'effect_source', 'political_entity', 'concept'."
+            "'faction', 'location', 'object', 'effect_source', 'political_entity', 'concept'."
         ),
         "name": (
             "The entity's name. For named characters (e.g. 'Elena Brightwood'), "
@@ -45,8 +45,8 @@ DOCS: Dict[str, Dict[str, str]] = {
             "Max recommended: 200 words."
         ),
         "gurps": (
-            "GURPS stat block dict. See §Core Concepts — GURPS Stats Block for all keys. "
-            "Primary attributes: ST, DX, IQ, HT (human average: 10). "
+            "GURPS stat block dict. They are potentially not limited by any specific power limit"
+            "Primary attributes: ST, DX, IQ, HT. "
             "Secondary: HP, Will, Per, FP, Basic_Speed, Basic_Move. "
             "Combat: DR, Dodge. "
             "Resistances (0.0–1.0): poison_resist, disease_resist, fire_resist, "
@@ -69,14 +69,13 @@ DOCS: Dict[str, Dict[str, str]] = {
             "Tags are the query surface for group membership. Use them."
         ),
         "position": (
-            "Where this entity is. Three forms: "
-            "{'inside': 'entity_id'} — contained within another entity. "
-            "{'near': 'entity_id'} — approximately co-located. "
+            "Where this entity is. Forms: "
             "{'coords': [lat, lon]} or [lat, lon, z] — absolute world coordinates "
             "(latitude -90..90, longitude -180..180). "
-            "Omit for non-spatial entities (laws, alliances, abstract concepts).\n\n"
-            "Validation: coords outside lat/lon range or unknown keys are rejected "
-            "with an error. inside/near must be a non-empty string."
+            "{'inside': 'entity_id', 'offset': [x, y, z]} — contained within "
+            "another entity at local 3D coordinates (meters). "
+            "{'near': 'entity_id', 'offset': [x, y, z]} — approximately "
+            "co-located, offset relative to reference entity."
         ),
     },
     # ==================================================================
@@ -280,29 +279,6 @@ DOCS: Dict[str, Dict[str, str]] = {
         "effect_id": "The effect to remove.",
     },
     # ==================================================================
-    "set_movement": {
-        "_tool": (
-            "**Set an entity in motion toward a destination.** "
-            "WM-only — positional authority over world-scale entity movement belongs to the WM. "
-            "The system updates position automatically over ticks, writes position events "
-            "to the 4D log, and fires on_entity_enter/on_arrive triggers on arrival."
-        ),
-        "entity_id": "Entity to move. REQUIRED.",
-        "destination": (
-            "Where the entity is heading. Same three forms as position. "
-            "If destination is another entity that is itself moving, the system "
-            "tracks the target's position at each tick. Use for pursuit/escort."
-        ),
-        "speed": (
-            "World units per tick. Set to 0 for instant teleportation. "
-            "Calibrate against your world's coordinate scale. "
-            "Example for 1 unit = 1 km, 1 tick = 1 day: "
-            "human walking ≈ 0.04, army marching ≈ 0.025, dragon flying ≈ 0.5, "
-            "teleportation = 0."
-        ),
-        "comment": "Why this entity is moving. Written to movement event log.",
-    },
-    # ==================================================================
     "delete_entity": {
         "_tool": (
             "**Permanently remove an entity. WM-only.** "
@@ -358,53 +334,20 @@ DOCS: Dict[str, Dict[str, str]] = {
         "_tool": (
             "**Deliver resolved action to players as immersive prose.** "
             "This is the ONLY tool that produces player-facing narrative text. "
-            "distinct from record_event which writes structured facts.\n\n"
+            "Each player character gets their own personalized narration. "
+            "The factual summary is a compressed objective description saved "
+            "to SM memory and forwarded to GM as news.\n\n"
             "Call this when you have reviewed the resolved history and are ready "
-            "to describe what happened. The duration determines how much in-game "
-            "time passes."
-        ),
-        "since_event_id": (
-            "The resolved-history event id to start from "
-            "(normally the id after the previous publication). "
-            "You can find event ids in the resolved history provided in your context."
+            "to describe what happened."
         ),
         "narration": (
-            "The assembled narrative text. Should be in Russian, third-person "
-            "objective, novelistic tone. Must match character knowledge — don't "
-            "reveal information the characters couldn't perceive."
+            "Dict mapping each character name to their personal narrative text. "
+            "Key = character name, value = third-person immersive prose from "
+            "that character's perspective. Must include ALL active characters."
         ),
-        "covers_t_range": (
-            "Timeline range this block covers, format 't_start_sec..t_end_sec' "
-            "as absolute seconds. Example: '5000..5900'."
-        ),
-        "duration": (
-            "How much in-game time this block covers. "
-            "Required. Valid units: s, m, h, d."
-        ),
-    },
-    # ==================================================================
-    "end_scene": {
-        "_tool": (
-            "**Explicitly end the current scene.** "
-            "Use when the scene is narratively complete — characters leave, "
-            "a major time skip occurs, or the story moves to a different "
-            "location and context.\n\n"
-            "Do NOT call this just because nothing happened — the scheduler "
-            "handles structural pauses automatically. Only call this when "
-            "the scene is truly done."
-        ),
-        "reason": "Why the scene ends. Must be a clear narrative justification.",
-        "final_narration": (
-            "Optional final narrative text to conclude the scene. "
-            "If provided, this is the last thing the players see for this scene."
-        ),
-        "duration": (
-            "How much in-game time this conclusion covers. Optional. "
-            "Valid units: s, m, h, d."
-        ),
-        "next_location": (
-            "Hint for where the next scene should take place. "
-            "If empty, the system determines the next scene from character locations."
+        "factual_summary": (
+            "2-4 sentence objective summary of what happened this cycle. "
+            "Not personalized. Stored in SM memory and forwarded to GM as news."
         ),
     },
     # ==================================================================
@@ -466,9 +409,9 @@ DOCS: Dict[str, Dict[str, str]] = {
             "set_entity, set_entity_facts, get_entity, get_entity_facts, "
             "add_tags, remove_tags, query_entities, query_events, "
             "record_event, attach_script, detach_script, "
-            "set_effect, remove_effect, set_movement, delete_entity, "
+            "set_effect, remove_effect, delete_entity, "
             "invoke_self, write_correction, read_tool_doc, " \
-            "publish_narrative_block, end_scene, manage_intent, " \
+            "publish_narrative_block, manage_intent, " \
             "update_awareness, proceed_to_narration."
         ),
         "parameters": (
@@ -479,6 +422,54 @@ DOCS: Dict[str, Dict[str, str]] = {
     },
 }
 
+
+    # ==================================================================
+    "declare_intent": {
+        "_tool": (
+            "**Declare an intent on behalf of any entity (NPC, world, or player).** "
+            "SM-only. Write NPC actions, environmental reactions, or correct "
+            "player intent details. Merged with player intents before resolution."
+        ),
+        "actor": "entity_id of the acting entity. Can be NPC, location, or player.",
+        "action_type": "speech / movement / combat / cosmetic.",
+        "target": "Who or what this action targets.",
+        "description": "Narrative prose of the action.",
+        "t_start": "When it starts. '0s' = now. Suffix: s, m, h, d.",
+        "duration": "How long it lasts. Empty = instant (resolves in one segment).",
+        "visibility": "'public' or 'private'.",
+        "is_hostile": "Only for combat. Default false.",
+        "area": "Area-of-effect data for target='area'.",
+        "detection_difficulty": "For private actions with mechanical effect.",
+        "trigger_condition": "Conditional activation.",
+        "trigger_priority": "Lower fires first. Default 0.",
+        "on_trigger": "'interrupt_with_new_decision' or 'apply_prepared_reaction'.",
+        "prepared_reaction": "Pre-written sub-intent on trigger.",
+        "on_timeout": "Sub-intent if duration expires without trigger.",
+        "absorption": "'alert' or 'immersed'.",
+    },
+    # ==================================================================
+    "modify_intent": {
+        "_tool": (
+            "**Modify an existing intent by ID. SM-only.** "
+            "Change timing, visibility, hostility, or any other field of "
+            "an existing intent — player or NPC. Only provided fields change."
+        ),
+        "intent_id": "The intent's id (returned by declare_intent).",
+        "actor": "New actor entity_id.",
+        "action_type": "New action type.",
+        "target": "New target.",
+        "description": "New description.",
+        "duration": "New duration string.",
+        "visibility": "New visibility.",
+        "is_hostile": "New hostility flag.",
+        "detection_difficulty": "New detection difficulty.",
+        "trigger_condition": "New trigger condition.",
+        "trigger_priority": "New priority.",
+        "on_trigger": "New trigger response.",
+        "absorption": "New absorption level.",
+    },
+    # ==================================================================
+}
 
 def get_tool_doc(tool_name: str, parameters: Optional[List[str]] = None) -> str:
     """Get detailed documentation for a tool and its parameters.

@@ -125,3 +125,16 @@ class HistoryMeta:
     @property
     def last_call_time(self) -> str:
         return self.load().get("last_call_time", "")
+
+    # ------------------------------------------------------------------
+    # News digest marker
+    # ------------------------------------------------------------------
+
+    def set_last_seen_event_id(self, event_id: str) -> None:
+        data = self.load()
+        data["last_seen_event_id"] = str(event_id or "")
+        self.save(data)
+
+    @property
+    def last_seen_event_id(self) -> str:
+        return self.load().get("last_seen_event_id", "")

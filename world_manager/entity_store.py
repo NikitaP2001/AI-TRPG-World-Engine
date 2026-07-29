@@ -13,12 +13,13 @@ from world_manager.entity_core import (
     set_entity, get_entity, get_entity_facts, set_entity_facts,
     get_entity_state, delete_entity, query_entities,
     add_tags, remove_tags, set_effect, remove_effect,
-    attach_script, detach_script, set_movement, adjust_entity,
+    attach_script, detach_script, adjust_entity,
+    reset_creation_counter,
 )
 
 __all__ = [
     "set_entity", "get_entity", "get_entity_facts", "set_entity_facts",
     "get_entity_state", "delete_entity", "query_entities",
     "add_tags", "remove_tags", "set_effect", "remove_effect",
-    "attach_script", "detach_script", "set_movement", "adjust_entity",
+    "attach_script", "detach_script", "adjust_entity",
 ]

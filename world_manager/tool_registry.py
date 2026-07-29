@@ -28,7 +28,7 @@ from world_manager.entity_store import (
     remove_effect as _store_remove_effect,
     attach_script as _store_attach_script,
     detach_script as _store_detach_script,
-    set_movement as _store_set_movement,
+
     adjust_entity as _store_adjust_entity,
 )
 from world_manager.event_log import (
@@ -36,7 +36,6 @@ from world_manager.event_log import (
     query_events as _log_query_events,
 )
 from scheduler_queue import schedule_invocation as _sched
-from news_queue import close_invocation as _ci
 
 
 # ======================================================================
@@ -49,6 +48,30 @@ CLOSE_VALIDATION_HOOK = None  # Callable[[], Optional[str]]
 def set_close_validation_hook(fn):
     global CLOSE_VALIDATION_HOOK
     CLOSE_VALIDATION_HOOK = fn
+
+
+# ======================================================================
+# Synchronous inline escalation: GM→WM (notify_wm blocking=True)
+# and SM→GM (escalate_to_gm)
+# ======================================================================
+# Inline invoker — set by orchestrator before GM's call_wm().
+# When notify_wm(blocking=True) is called, it invokes WM synchronously
+# through this callable, just like player observe/recall invokes SM inline.
+_WM_INVOKER = None  # Callable[[str], str] — takes message, returns response
+
+
+def set_wm_invoker(invoker):
+    global _WM_INVOKER
+    _WM_INVOKER = invoker
+
+
+# Same for SM→GM: inline GM invoker, set by orchestrator before SM calls.
+_GM_INVOKER = None  # Callable[[str, str], str] — takes question, context
+
+
+def set_gm_invoker(invoker):
+    global _GM_INVOKER
+    _GM_INVOKER = invoker
 
 
 # ======================================================================
@@ -70,50 +93,6 @@ def clear_current_agent() -> None:
     """Call after agent invocation ends."""
     global _CURRENT_AGENT
     _CURRENT_AGENT = ""
-
-
-# ======================================================================
-# Position validation
-# ======================================================================
-
-
-def _validate_position(position: Dict[str, Any]) -> Optional[str]:
-    """Check position format. Returns error string or None if valid.
-
-    Valid formats:
-      {"coords": [lat, lon]} or [lat, lon, z] — absolute, lat=-90..90, lon=-180..180
-      {"inside": entity_id} — relative, inside another entity
-      {"near": entity_id} — relative, near another entity
-    """
-    if not position:
-        return None  # empty = no spatial location (valid for non-spatial entities)
-
-    valid_keys = {"inside", "near", "coords", "offset"}
-    extra = set(position.keys()) - valid_keys
-    if extra:
-        return f"Unknown position key(s): {', '.join(sorted(extra))}. Use: inside, near, or coords."
-
-    # coords: absolute lat/lon
-    if "coords" in position:
-        coords = position["coords"]
-        if not isinstance(coords, (list, tuple)) or len(coords) < 2:
-            return "coords must be a list of [lat, lon] or [lat, lon, z]."
-        lat, lon = coords[0], coords[1]
-        if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
-            return "coords values must be numbers."
-        if lat < -90 or lat > 90:
-            return f"Latitude must be between -90 and 90, got {lat}."
-        if lon < -180 or lon > 180:
-            return f"Longitude must be between -180 and 180, got {lon}."
-
-    # inside/near: must reference an existing entity_id
-    for key in ("inside", "near"):
-        if key in position:
-            ref = position[key]
-            if not isinstance(ref, str) or not ref.strip():
-                return f"{key} must be a non-empty entity_id (string)."
-
-    return None
 
 
 # ======================================================================
@@ -145,6 +124,10 @@ def set_entity(
 
     Inheritance via base_type: facts, gurps, stats, tags cascade from template.
 
+    Position validation (lat/lon bounds, valid keys) and type-specific entity
+    validation (required fields, valid references) are handled automatically
+    by the entity store layer.
+
     Args:
         name: The entity's name. For named characters, use their full name
             (e.g. "Elena Brightwood"). For locations, use a descriptive slug
@@ -152,22 +135,19 @@ def set_entity(
         type: Entity type (e.g. "npc", "character", "location", "faction").
         base_type: Template entity_id to inherit from.
         facts: Static narrative identity. NOT for mechanical data.
-        gurps: GURPS stat block. Keys: ST, DX, IQ, HT, HP, Will, Per, FP, etc.
+        gurps: GURPS stat block.
         stats: Free-form numeric properties.
         tags: Structured labels "namespace:value" for queries.
-        position: Where the entity is. Three valid formats:
-            {"coords": [lat, lon]} — absolute position (lat: -90..90, lon: -180..180).
-            {"inside": entity_id} — inside another entity.
-            {"near": entity_id} — approximately co-located.
+        position: Where the entity is. Forms (pick only ONE form relevant for this entity):
+            {"coords": [lat, lon]} or [lat, lon, z] — absolute world coordinates.
+            {"inside": "entity_id", "offset": [x, y, z]} — contained within
+            another entity at local 3D coordinates (meters).
+            {"near": "entity_id", "offset": [x, y, z]} — approximately
+            co-located, offset relative to reference entity.
         state: Dynamic state block {hp, fp, conditions, injuries}.
-        skills: Skills block {ST, DX, IQ, HT, passive_abilities, cached_skills}.
-        equipment: Equipment block {signature, inventory, currency}.
+        skills: Skills block.
+        equipment: Equipment block.
     """
-    # Validate position before writing
-    err = _validate_position(position)
-    if err:
-        return {"status": "error", "error": f"Invalid position: {err}"}
-
     kwargs = dict(id=name, type=type, base_type=base_type, facts=facts,
                   gurps=gurps, stats=stats, tags=tags, position=position)
     if state is not None:
@@ -283,6 +263,7 @@ def remove_tags(entity_id: str, tags: List[str]) -> Dict[str, Any]:
 @tool
 def adjust_entity(
     entity_id: str,
+    gurps: Optional[Dict[str, Any]] = None,
     hp: Optional[int] = None,
     fp: Optional[int] = None,
     er: Optional[int] = None,
@@ -298,16 +279,23 @@ def adjust_entity(
     add_skill: str = "",
     remove_skill: str = "",
     current_state: str = "",
+    position: Dict[str, Any] = {},
+    connections: Dict[str, Any] = {},
+    skills: Optional[Dict[str, Any]] = None,
+    equipment: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Apply targeted runtime mutations to any entity.
 
-    Unlike set_entity (which replaces static blocks), this is for small
-    frequent changes: HP loss, conditions gained, items picked up.
+    Unlike set_entity (which creates new entities), this is for changing
+    runtime state: HP, conditions, items, position, connections, etc.
 
     Every parameter is optional. Only provided fields are changed.
+    Position, connections, skills, equipment, and gurps are fully replaced.
 
     Args:
         entity_id: Target entity.
+        gurps: Full replacement of GURPS stat block (e.g. {"ST": 11, "DX": 12}).
+            None = no change.
         hp/fp/er: New value (absolute set, not delta).
         add/remove_condition: Append/remove one condition string.
         add/remove_injury: Append/remove one injury string.
@@ -316,9 +304,26 @@ def adjust_entity(
         add/remove_ability: Append/remove one passive ability.
         add/remove_skill: Append/remove one cached skill.
         current_state: Overwrite one-line current activity description.
+        position: Full replacement of position. Use exactly ONE form:
+            {"coords": [lat, lon]} — absolute coordinates.
+            {"inside": "entity_id", "offset": [x, y, z]} — inside another entity.
+            {"near": "entity_id", "offset": [x, y, z]} — near another entity.
+            Empty dict = no change.
+        connections: Full replacement of location connections. Dict mapping
+            connection names to descriptors:
+            {"to_kitchen": {"target": "tavern_kitchen",
+                            "exit_offset": [x, y, z],
+                            "blocks_line_of_sight": true,
+                            "description": "door to kitchen"}}
+            Empty dict = no change.
+        skills: Full replacement of skills block (e.g. {"Broadsword": 14}).
+            None = no change.
+        equipment: Full replacement of equipment block.
+            None = no change.
     """
     return _store_adjust_entity(
-        entity_id=entity_id, hp=hp, fp=fp, er=er,
+        entity_id=entity_id, gurps=gurps,
+        hp=hp, fp=fp, er=er,
         add_condition=add_condition, remove_condition=remove_condition,
         add_injury=add_injury, remove_injury=remove_injury,
         add_item=add_item, remove_item=remove_item,
@@ -326,6 +331,10 @@ def adjust_entity(
         add_ability=add_ability, remove_ability=remove_ability,
         add_skill=add_skill, remove_skill=remove_skill,
         current_state=current_state,
+        position=position if position else None,
+        connections=connections if connections else None,
+        skills=skills,
+        equipment=equipment,
     )
 
 
@@ -501,19 +510,17 @@ def invoke_self(
 @tool
 def close_invocation(
     summary: str,
-    news: Optional[List[str]] = None,
     invoke_self: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """End this invocation with a summary for future context.
 
     Call this when you have completed your work. The summary is saved
     to your message history and feeds your summary block in pinned
-    context. News items are forwarded to the higher agent's newspaper.
+    context.
 
     Args:
         summary: 2-4 sentences describing what was achieved.
             This is the ONLY source for your summary block.
-        news: 0-3 short items for the higher agent's newspaper.
         invoke_self: Optional scheduling {"delay_ticks": N}
             or {"world_time": T}. May include "comment".
     """
@@ -528,7 +535,7 @@ def close_invocation(
                 return {"status": "error", "error": err_msg}
         except Exception as e:
             return {"status": "error", "error": f"Validation error: {e}"}
-    return _ci(summary=summary, news=news, invoke_self=invoke_self)
+    return {"status": "invocation_closed", "summary_length": len(summary.strip())}
 
 
 # ======================================================================
@@ -550,27 +557,7 @@ def delete_entity(name: str, reason: str = "") -> Dict[str, Any]:
     return _store_delete_entity(id=name, reason=reason)
 
 
-@tool
-def set_movement(
-    entity_id: str,
-    destination: Dict[str, Any],
-    speed: float = 1.0,
-    comment: str = "",
-) -> Dict[str, Any]:
-    """Set an entity in motion toward a destination. WM-only.
 
-    The system updates position automatically over ticks.
-    If destination is a moving entity, tracks target position each tick.
-
-    Args:
-        entity_id: Entity to move.
-        destination: Where heading. Same three forms as position.
-        speed: World units per tick. 0 = instant teleportation.
-        comment: Why this entity is moving.
-    """
-    return _store_set_movement(
-        entity_id=entity_id, destination=destination,
-        speed=speed, comment=comment)
 
 
 @tool
@@ -580,20 +567,31 @@ def write_correction(
 ) -> Dict[str, Any]:
     """Send a forward-facing correction to the GM. WM-only.
 
-    Does not retroactively change anything. Injected into GM's context
-    on next invocation. Use when WM sees a GM-created entity that
-    contradicts world canon.
+    Does not retroactively change anything. Forward-correction: the
+    narrative continues with the corrected facts, nothing is retconned.
+    Use when WM sees a GM-created entity that contradicts world canon.
+
+    Also clears any pending blocking escalation from GM's notify_wm —
+    GM's close_invocation will then succeed.
+
+    Args:
+        message: The correction text — what the entity actually is.
+        entity_id: The entity needing correction (optional).
     """
-    # Stub — writes to corrections queue
     import json, uuid
     from pathlib import Path
+    correction_id = uuid.uuid4().hex[:12]
+
+    # Log correction for GM's next invocation
     path = Path("game") / "entity_store" / "corrections.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     entry = {"message": message, "entity_id": entity_id,
-             "correction_id": uuid.uuid4().hex[:12]}
+             "correction_id": correction_id,
+             "resolved_notification": True}
     with open(str(path), "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    return {"status": "correction_logged", "correction_id": entry["correction_id"]}
+    return {"status": "correction_logged", "correction_id": correction_id,
+            "info": "Correction logged. Any pending GM escalation is cleared."}
 
 
 @tool
@@ -644,42 +642,52 @@ def read_tool_doc(name: str = "", parameter: str = "") -> str:
 def notify_wm(message: str, blocking: bool = False) -> Dict[str, Any]:
     """Notify the World Master of a significant event. GM-only.
 
-    Use for events that may affect world-level state: faction changes,
-    discovered locations, world-wide phenomena.
+    Two modes:
+      blocking=False (default): message is queued for WM's newspaper digest.
+        GM continues immediately — WM sees this on its next regular invocation.
+
+      blocking=True: schedules an immediate WM invocation and blocks GM's
+        close_invocation until WM responds with write_correction.
+        Use for canon conflicts or situations where GM needs WM's structural
+        authority to resolve something before the invocation can end.
 
     Args:
         message: What the WM should know.
-        blocking: True = WM should investigate before next GM call.
+        blocking: True = force immediate WM invocation and wait for response.
     """
-    import json, uuid
+    import uuid
+    notification_id = uuid.uuid4().hex[:12]
+
+    if blocking:
+        # Synchronous inline WM invocation (like player→SM observe/recall)
+        global _WM_INVOKER
+        if _WM_INVOKER is not None:
+            try:
+                wm_response = _WM_INVOKER(message)
+                return {"status": "wm_responded",
+                        "notification_id": notification_id,
+                        "wm_response": str(wm_response)[:500]}
+            except Exception as e:
+                return {"status": "error",
+                        "error": f"WM invocation failed: {e}",
+                        "notification_id": notification_id}
+        else:
+            return {"status": "error",
+                    "error": "WM invoker not available (orchestrator not set up)."}
+
+    # Non-blocking: queue for WM's newspaper (read on next regular invocation)
+    import json
     from pathlib import Path
     path = Path("game") / "entity_store" / "wm_notifications.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
-    entry = {"message": message, "blocking": blocking,
-             "notification_id": uuid.uuid4().hex[:12]}
+    entry = {"message": message, "blocking": False,
+             "notification_id": notification_id}
     with open(str(path), "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    return {"status": "gm_to_wm_notified", "notification_id": entry["notification_id"]}
+    return {"status": "gm_to_wm_notified", "notification_id": notification_id}
 
 
-@tool
-def escalate_to_sm(message: str) -> Dict[str, Any]:
-    """Send instructions to the Scene Manager. GM-only.
 
-    Use to set the next scene, define NPC intents, or provide
-    world context the SM needs.
-
-    Args:
-        message: Instructions or scene guidance for SM.
-    """
-    import json, uuid
-    from pathlib import Path
-    path = Path("game") / "entity_store" / "sm_instructions.jsonl"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    entry = {"message": message, "instruction_id": uuid.uuid4().hex[:12]}
-    with open(str(path), "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    return {"status": "gm_to_sm_instructed", "instruction_id": entry["instruction_id"]}
 
 
 # ======================================================================
@@ -688,11 +696,11 @@ def escalate_to_sm(message: str) -> Dict[str, Any]:
 
 
 @tool
-def get_scene(location_id: str) -> Dict[str, Any]:
+def get_location_info(location_id: str) -> Dict[str, Any]:
     """Read current state of a location: who is present, their state, events.
 
     SM-only. Combines location data, entities at this location,
-    and recent events into a single scene snapshot.
+    and recent events into a single snapshot.
 
     Args:
         location_id: entity_id of the location.
@@ -719,23 +727,27 @@ def get_scene(location_id: str) -> Dict[str, Any]:
 
 @tool
 def escalate_to_gm(question: str, context: str = "") -> str:
-    """Request Game Master involvement, or in other words ask GM a question.
+    """Ask the Game Master a question. SM-only.
 
-    Use when scene requires new persistent entities or facts
-    beyond your authority, or you want to clarify some fact or information
-    you are unsure with.
+    Invokes GM synchronously inline (like player→SM observe/recall).
+    GM sees the question and responds within the same call.
 
     Args:
         question: What you need from GM.
         context: Relevant scene state.
     """
-    import json
-    from pathlib import Path
-    path = Path("game") / "entity_store" / "gm_questions.jsonl"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(str(path), "a", encoding="utf-8") as f:
-        f.write(json.dumps({"question": question, "context": context}, ensure_ascii=False) + "\n")
-    return f"[stub] GM notified: {question[:100]}"
+    import uuid
+    escalation_id = uuid.uuid4().hex[:12]
+    # Inline GM invocation
+    global _GM_INVOKER
+    if _GM_INVOKER is not None:
+        try:
+            gm_response = _GM_INVOKER(question, context)
+            return (f"GM responded: {str(gm_response)[:300]}")
+        except Exception as e:
+            return f"GM invocation failed: {e}"
+    else:
+        return "GM invoker not available (orchestrator not set up)."
 
 
 # ======================================================================
@@ -779,7 +791,6 @@ class ToolRegistry:
             *cls._EVENT_TOOLS,
             *cls._LIFECYCLE_TOOLS,
             delete_entity,
-            set_movement,
             write_correction,
             read_tool_doc,
         ]
@@ -793,7 +804,6 @@ class ToolRegistry:
             *cls._EVENT_TOOLS,
             *cls._LIFECYCLE_TOOLS,
             notify_wm,
-            escalate_to_sm,
         ]
 
     @classmethod
@@ -802,7 +812,7 @@ class ToolRegistry:
             get_entity_facts,
             *cls._EVENT_TOOLS,
             *cls._LIFECYCLE_TOOLS,
-            get_scene,
+            get_location_info,
             get_entity_state,
             adjust_entity,
             set_effect, remove_effect,

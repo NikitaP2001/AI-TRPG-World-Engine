@@ -69,13 +69,11 @@ def _build_locations_content(world: Any) -> str:
             return "No locations yet."
         lines = []
         if isinstance(locs, dict):
-            for name, data in locs.items():
-                summary = ""
-                parent = ""
-                if isinstance(data, dict):
-                    summary = str(data.get("summary") or "").strip()
-                    parent = str(data.get("parent_location") or "").strip()
-                line = f"- {name}"
+            for eid, data in locs.items():
+                facts = str(data.get("facts") or "").strip()
+                summary = facts[:200] if facts else ""
+                parent = str(data.get("parent_location") or "").strip()
+                line = f"- {eid}"
                 if parent:
                     line += f" (in {parent})"
                 if summary:

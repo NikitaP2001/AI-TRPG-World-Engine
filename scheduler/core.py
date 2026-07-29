@@ -38,6 +38,12 @@ class CycleCount:
 
 
 @dataclass(frozen=True)
+class SessionCount:
+    """Fire every N sessions (program starts) since last execution."""
+    interval: int
+
+
+@dataclass(frozen=True)
 class ParagraphCount:
     """Fire every N paragraphs since last execution."""
     interval: int
@@ -68,7 +74,7 @@ class AfterJob:
     after: str
 
 
-Trigger = Union[CycleCount, ParagraphCount, MemoryEntryCount, WallClock, WorldTime, AfterJob]
+Trigger = Union[CycleCount, SessionCount, ParagraphCount, MemoryEntryCount, WallClock, WorldTime, AfterJob]
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +114,7 @@ class Job:
 class JobState:
     """Persisted per-job counters and status."""
     last_fired_at_cycle: int = 0
+    last_fired_at_session: int = 0
     last_fired_at_para: int = 0
     last_fired_at_entry: int = 0
     last_fired_wall: float = 0.0
@@ -129,7 +136,8 @@ class TickScheduler:
         scheduler = TickScheduler(state_path)
         scheduler.register(job1, job2, ...)
         # After each turn:
-        scheduler.tick(cycle_count=info["cycles"], para_count=info["paragraphs"],
+        scheduler.tick(cycle_count=info["cycles"], session_count=info["sessions"],
+                       para_count=info["paragraphs"],
                        world=world, character_names=[...])
     """
 
@@ -138,6 +146,7 @@ class TickScheduler:
         self._jobs: Dict[str, Job] = {}
         self._state: Dict[str, JobState] = {}
         self._loaded = False
+        self._session_count: int = 0
 
     # ------------------------------------------------------------------
     # Registration
@@ -170,12 +179,17 @@ class TickScheduler:
         if self._loaded:
             return
         self._loaded = True
+        self._session_count = 0
         try:
             raw = self._state_path.read_text(encoding="utf-8")
             data = json.loads(raw)
             if not isinstance(data, dict):
                 return
-            for jid, js in data.items():
+            self._session_count = int(data.get("_session_count", 0))
+            states = data.get("_jobs", data)  # support both old and new format
+            if not isinstance(states, dict):
+                return
+            for jid, js in states.items():
                 if jid in self._state:
                     for k, v in js.items():
                         if hasattr(self._state[jid], k):
@@ -186,9 +200,10 @@ class TickScheduler:
     def _save_state(self) -> None:
         try:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
-            data = {
+            jobs_data = {
                 jid: {
                     "last_fired_at_cycle": js.last_fired_at_cycle,
+                    "last_fired_at_session": js.last_fired_at_session,
                     "last_fired_at_para": js.last_fired_at_para,
                     "last_fired_at_entry": js.last_fired_at_entry,
                     "last_fired_wall": js.last_fired_wall,
@@ -198,6 +213,10 @@ class TickScheduler:
                     "skipped": js.skipped,
                 }
                 for jid, js in self._state.items()
+            }
+            data = {
+                "_session_count": self._session_count,
+                "_jobs": jobs_data,
             }
             self._state_path.write_text(
                 json.dumps(data, ensure_ascii=False, indent=2) + "\n",
@@ -213,6 +232,7 @@ class TickScheduler:
     @dataclass
     class TickContext:
         cycle_count: int
+        session_count: int
         paragraph_count: int
         character_entry_counts: Dict[str, int]
         world_time_str: str = ""
@@ -221,6 +241,7 @@ class TickScheduler:
         self,
         *,
         cycle_count: int,
+        session_count: int,
         paragraph_count: int,
         world: Any = None,
         character_names: List[str] = None,
@@ -244,6 +265,7 @@ class TickScheduler:
 
         return TickScheduler.TickContext(
             cycle_count=cycle_count,
+            session_count=session_count,
             paragraph_count=paragraph_count,
             character_entry_counts=entry_counts,
             world_time_str=world_time,
@@ -258,6 +280,9 @@ class TickScheduler:
 
         if isinstance(t, CycleCount):
             return (ctx.cycle_count - js.last_fired_at_cycle) >= t.interval
+
+        if isinstance(t, SessionCount):
+            return (ctx.session_count - js.last_fired_at_session) >= t.interval
 
         if isinstance(t, ParagraphCount):
             return (ctx.paragraph_count - js.last_fired_at_para) >= t.interval
@@ -288,6 +313,8 @@ class TickScheduler:
         t = job.trigger
         if isinstance(t, CycleCount):
             js.last_fired_at_cycle = ctx.cycle_count
+        elif isinstance(t, SessionCount):
+            js.last_fired_at_session = ctx.session_count
         elif isinstance(t, ParagraphCount):
             js.last_fired_at_para = ctx.paragraph_count
         elif isinstance(t, MemoryEntryCount):
@@ -307,6 +334,7 @@ class TickScheduler:
         self,
         *,
         cycle_count: int,
+        session_count: int,
         paragraph_count: int,
         world: Any = None,
         character_names: List[str] = None,
@@ -319,6 +347,7 @@ class TickScheduler:
 
         ctx = self._build_context(
             cycle_count=cycle_count,
+            session_count=session_count,
             paragraph_count=paragraph_count,
             world=world,
             character_names=character_names,
@@ -386,4 +415,16 @@ class TickScheduler:
             for jid in self._state:
                 self._state[jid] = JobState()
         self._save_state()
+
+    def increment_session(self) -> None:
+        """Call at program start to bump the persistent session counter."""
+        self._load_state()
+        self._session_count += 1
+        self._save_state()
+
+    @property
+    def session_count(self) -> int:
+        """Current session count (persistent across restarts)."""
+        self._load_state()
+        return self._session_count
 

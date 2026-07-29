@@ -779,82 +779,67 @@ def is_character_active_in_scene(world: Any, name: str) -> bool:
 
 
 def build_character_info_block(char_dir: Path) -> Optional[str]:
-    """Build a [character_info] block from all 4 files in a character directory.
+    """Build a [character_info] block from character description.json.
 
-    Static (description.json) + dynamic (state.json, skills.json, equipment.json).
-    Designed for PinnedBlockCache: pass char_dir as source_path.
+    Pinned-cache only: narrative description (general + race + personality).
+    Dynamic state/skills/equipment are NOT included — they belong in
+    invocation-scoped context, not pinned cache.
     """
-    parts: List[str] = []
-
-    # Static: description.json
     desc_path = char_dir / "description.json"
     try:
         desc = json.loads(desc_path.read_text(encoding="utf-8"))
-        parts.append(
-            "## Description\n"
-            + json.dumps(desc, ensure_ascii=False, indent=2)
-        )
+        if not isinstance(desc, dict):
+            return None
+        # Keep only narrative fields
+        clean = {}
+        if desc.get("general"):
+            clean["general"] = desc["general"]
+        if desc.get("race"):
+            clean["race"] = desc["race"]
+        if desc.get("personality"):
+            clean["personality"] = desc["personality"]
+        return "## Description\n" + json.dumps(clean, ensure_ascii=False, indent=2) if clean else None
     except Exception:
-        pass
-
-    # Dynamic: state.json, skills.json, equipment.json
-    for section, filename in [
-        ("State", "state.json"),
-        ("Skills", "skills.json"),
-        ("Equipment", "equipment.json"),
-    ]:
-        fpath = char_dir / filename
-        try:
-            data = json.loads(fpath.read_text(encoding="utf-8"))
-            if data:
-                parts.append(
-                    f"### {section}\n"
-                    + json.dumps(data, ensure_ascii=False, indent=2)
-                )
-        except Exception:
-            pass
-
-    return "\n\n".join(parts) if parts else None
+        return None
 
 
 def build_character_info_block_from_entity(entity_id: str) -> Optional[str]:
-    """Build a [character_info] block from entity_store (CompositeBackend).
+    """Build a [character_info] block from entity_store and player files.
 
-    Alternative to build_character_info_block for when character data
-    is stored as an entity rather than filesystem files.
-    Uses the same output format for compatibility with PinnedBlockCache.
+    Pinned-cache only: narrative description (facts + race + personality).
+    Dynamic state/skills/equipment are NOT included — they change every
+    turn and belong in invocation-scoped context, not pinned cache.
     """
     try:
         from world_manager.entity_core import _get_backend
+        import json as _json
+        from pathlib import Path as _P
+
+        # facts from entity store
         backend = _get_backend()
         entity = backend.get(entity_id)
         if entity is None:
             return None
 
-        import json as _json
-        parts: List[str] = []
-
-        # facts → Description
+        desc: dict = {}
         facts = entity.get("facts", "")
-        if facts:
-            parts.append("## Description\n" + _json.dumps(
-                {"general": facts}, ensure_ascii=False, indent=2))
 
-        # state → State
-        state = entity.get("state", {})
-        if state:
-            parts.append("### State\n" + _json.dumps(state, ensure_ascii=False, indent=2))
+        # Merge in race, personality from filesystem description.json
+        player_dir = _P("game") / "players" / entity_id
+        desc_file = player_dir / "description.json"
+        if desc_file.exists():
+            try:
+                raw = _json.loads(desc_file.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    if raw.get("race"):
+                        desc["race"] = raw["race"]
+                    if raw.get("personality"):
+                        desc["personality"] = raw["personality"]
+            except Exception:
+                pass
 
-        # skills → Skills
-        skills = entity.get("skills", {})
-        if skills:
-            parts.append("### Skills\n" + _json.dumps(skills, ensure_ascii=False, indent=2))
+        desc["general"] = facts
 
-        # equipment → Equipment
-        equip = entity.get("equipment", {})
-        if equip:
-            parts.append("### Equipment\n" + _json.dumps(equip, ensure_ascii=False, indent=2))
-
-        return "\n\n".join(parts) if parts else None
+        return "## Description\n" + _json.dumps(desc, ensure_ascii=False, indent=2)
     except Exception:
         return None

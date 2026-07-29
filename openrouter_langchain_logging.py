@@ -1003,6 +1003,35 @@ class OpenRouterLoggingCallback(BaseCallbackHandler):
         except Exception:
             generations_text = []
 
+        # Log prompt cache metrics from DeepSeek usage fields
+        try:
+            llm_output = getattr(response, "llm_output", None) or {}
+            usage = llm_output.get("token_usage") or llm_output.get("usage") or {}
+            hit = usage.get("prompt_cache_hit_tokens")
+            miss = usage.get("prompt_cache_miss_tokens")
+            if hit is not None or miss is not None:
+                hit_str = f"hit={hit}" if hit is not None else ""
+                miss_str = f"miss={miss}" if miss is not None else ""
+                total = usage.get("prompt_tokens", 0)
+                cache_pct = f" ({hit/(hit+miss)*100:.0f}%)" if (hit and miss and (hit+miss) > 0) else ""
+                pct_str = cache_pct if cache_pct else f" ({hit/(hit+miss)*100:.0f}%)" if (hit is not None and miss is not None and (hit+miss) > 0) else ""
+                label = str(getattr(self, "label", "") or "")
+                label_suffix = f" [{label}]" if label else ""
+                if _console_trace_enabled():
+                    _console_print(f"[cache] {self.scope}{label_suffix} prompt={total} {hit_str} {miss_str}{pct_str}")
+                # Also log to runs.jsonl for permanent analysis
+                _append_jsonl(str(Path("logs/runs.jsonl")), {
+                    "ts": _utc_now_iso(),
+                    "scope": str(self.scope or "?"),
+                    "label": str(getattr(self, "label", "") or ""),
+                    "event": "cache",
+                    "prompt_tokens": total,
+                    "prompt_cache_hit_tokens": hit,
+                    "prompt_cache_miss_tokens": miss,
+                })
+        except Exception:
+            pass
+
         # Intentionally do not log raw model outputs (they are model-related, not game state).
         # Game state is reflected by tool calls/results and the persistent JSON storage.
 

@@ -18,15 +18,21 @@ class EntityBackend(ABC):
     """
 
     @abstractmethod
-    def set(self, id: str, type: str = "", base_type: str = "",
-            facts: str = "", gurps: Optional[Dict[str, Any]] = None,
-            state: Optional[Dict[str, Any]] = None,
-            skills: Optional[Dict[str, Any]] = None,
-            equipment: Optional[Dict[str, Any]] = None,
-            stats: Optional[Dict[str, Any]] = None,
-            tags: Optional[List[str]] = None,
-            position: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Create or fully overwrite an entity. Returns result dict."""
+    def set(self, id: str = "", type: str = "", **record: Any) -> Dict[str, Any]:
+        """Create or fully overwrite an entity.
+
+        The `record` dict contains type-specific fields pre-built by
+        entity_schema.build_record(). The backend stores these fields
+        directly, adding only storage-level fields (created_at, etc.).
+
+        There is NO generic/default entity type — every record must match
+        a concrete schema (location, npc, faction, etc.).
+
+        Args:
+            id: Entity identifier.
+            type: Concrete entity type (location, npc, faction, ...).
+            **record: Type-specific record fields.
+        """
         ...
 
     @abstractmethod
@@ -81,7 +87,8 @@ class EntityBackend(ABC):
                remove_ability: str = "",
                add_skill: str = "",
                remove_skill: str = "",
-               current_state: str = "") -> Dict[str, Any]:
+               current_state: str = "",
+               gurps: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Targeted runtime mutations — only provided fields change."""
         ...
 

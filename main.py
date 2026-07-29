@@ -10,7 +10,7 @@ import os
 import sys
 from dotenv import load_dotenv
 
-from orchestrator import GameOrchestrator
+from console_app import GameOrchestrator
 from openrouter_langchain_logging import reset_logs_if_enabled
 
 

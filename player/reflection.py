@@ -481,18 +481,10 @@ def _get_known_entity_names() -> set:
     try:
         from world_manager.entity_core import _get_backend
         backend = _get_backend()
-        for e in backend.query(type_filter="character", include_templates=False, limit=100):
+        for e in backend.query(include_templates=False, limit=200):
             n = str(e.get("id") or "").strip()
             if n:
                 known.add(n.lower())
-    except Exception:
-        pass
-    try:
-        npc_data = _read_json(_game_root() / "world" / "npc.json") or {}
-        if isinstance(npc_data, dict):
-            for k in npc_data:
-                if k:
-                    known.add(str(k).lower())
     except Exception:
         pass
     return known
@@ -577,13 +569,22 @@ def _get_relevant_relationships(character_name: str) -> List[Dict[str, str]]:
 
     # Step 2: who is currently at those locations (characters + NPCs).
     game_root = _game_root()
-    npc_data = _read_json(game_root / "world" / "npc.json") or {}
+    npc_names_from_store = set()
+    try:
+        from world_manager.entity_core import _get_backend
+        backend = _get_backend()
+        for e in backend.query(include_templates=False, limit=200):
+            n = str(e.get("id") or "").strip()
+            if n:
+                npc_names_from_store.add(n.lower())
+    except Exception:
+        pass
     present_keys: set = set()
 
     try:
         from world_manager.entity_core import _get_backend
         backend = _get_backend()
-        for e in backend.query(type_filter="character", include_templates=False, limit=100):
+        for e in backend.query(include_templates=False, limit=200):
             name = str(e.get("id") or "").strip()
             pos = e.get("position", {}) or {}
             loc = str(pos.get("inside", pos.get("near", ""))).strip()
@@ -591,14 +592,6 @@ def _get_relevant_relationships(character_name: str) -> List[Dict[str, str]]:
                 present_keys.add(name.lower())
     except Exception:
         pass
-
-    if isinstance(npc_data, dict):
-        for npc_name, npc_info in npc_data.items():
-            if not isinstance(npc_info, dict):
-                continue
-            loc = str(npc_info.get("location") or "").strip()
-            if loc in recent_locs:
-                present_keys.add(str(npc_name).lower())
 
     # Step 3: filter relationships to entities that are present.
     all_rels = load_relationships(character_name)
@@ -628,8 +621,16 @@ def _get_recently_met_names(character_name: str, exclude_name: str = "") -> List
     if not recent_locs:
         return []
 
-    game_root = _game_root()
-    npc_data = _read_json(game_root / "world" / "npc.json") or {}
+    npc_names_from_store = set()
+    try:
+        from world_manager.entity_core import _get_backend
+        backend = _get_backend()
+        for e in backend.query(include_templates=False, limit=200):
+            n = str(e.get("id") or "").strip()
+            if n:
+                npc_names_from_store.add(n.lower())
+    except Exception:
+        pass
 
     names: List[str] = []
     exclude_lower = str(exclude_name or "").strip().lower()
@@ -637,7 +638,7 @@ def _get_recently_met_names(character_name: str, exclude_name: str = "") -> List
     try:
         from world_manager.entity_core import _get_backend
         backend = _get_backend()
-        for e in backend.query(type_filter="character", include_templates=False, limit=100):
+        for e in backend.query(include_templates=False, limit=200):
             name = str(e.get("id") or "").strip()
             pos = e.get("position", {}) or {}
             loc = str(pos.get("inside", pos.get("near", ""))).strip()
@@ -645,14 +646,6 @@ def _get_recently_met_names(character_name: str, exclude_name: str = "") -> List
                 names.append(name)
     except Exception:
         pass
-
-    if isinstance(npc_data, dict):
-        for npc_name, npc_info in npc_data.items():
-            if not isinstance(npc_info, dict):
-                continue
-            loc = str(npc_info.get("location") or "").strip()
-            if loc in recent_locs and str(npc_name).lower() != exclude_lower:
-                names.append(str(npc_name))
 
     return names
 

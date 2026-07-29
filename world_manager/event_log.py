@@ -11,6 +11,16 @@ import re
 import time
 import uuid
 from datetime import datetime, timezone
+
+
+def _game_time_str() -> str:
+    """Return current WorldTime as string, or UTC fallback if unavailable."""
+    try:
+        from world import World as _W
+        wt = _W().get_world_time()
+        return wt.to_string() if hasattr(wt, 'to_string') else str(wt)
+    except Exception:
+        return datetime.now(timezone.utc).isoformat()
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -81,7 +91,7 @@ def _rebuild_index() -> None:
         "count": len(_events),
         "tags": {},
         "entity_ids": {},
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": _game_time_str(),
     }
     for ev in _events:
         tag = ev.get("tag", "")
@@ -138,7 +148,7 @@ def record_event(
         "tag": tag,
         "narrative_flag": narrative_flag,
         "causal_parent": causal_parent,
-        "logged_at": datetime.now(timezone.utc).isoformat(),
+        "logged_at": _game_time_str(),
     }
     _events.append(event)
     global _dirty
@@ -166,14 +176,22 @@ def query_events(
     entity_id: str = "",
     tag: str = "",
     narrative_flag_only: bool = False,
+    since_event_id: str = "",
     causal_parent: str = "",
     limit: int = 100,
 ) -> List[Dict[str, Any]]:
     """Read from the 4D causal event log."""
     _load()
     results = []
+    found_since = not since_event_id  # if no marker, include all
 
     for ev in _events:
+        # Event ID lower bound — exclusive
+        if not found_since:
+            if ev.get("event_id", "") == since_event_id:
+                found_since = True
+            continue  # skip events before/at the marker
+
         # Time filter
         ev_tick = ev.get("tick", 0)
         if t_from >= 0 and ev_tick < t_from:
