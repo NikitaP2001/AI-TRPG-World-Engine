@@ -42,7 +42,7 @@ def build_world_meta(world: Any, **kwargs: Any) -> str:
         except Exception:
             pass
         try:
-            npcs_dict = world.get_npcs()
+            npcs_dict = world.non_player_entities()
             if isinstance(npcs_dict, dict) and npcs_dict:
                 meta["npcs"] = sorted(npcs_dict.keys())
         except Exception:
@@ -51,7 +51,7 @@ def build_world_meta(world: Any, **kwargs: Any) -> str:
             chars = world.get_players()
             if chars:
                 meta["players"] = [
-                    {k: v for k, v in c.items() if k in ("name", "location", "last_acted")}
+                    {k: v for k, v in c.items() if k in ("name", "location")}
                     for c in chars
                     if isinstance(c, dict)
                 ]
@@ -73,8 +73,6 @@ def build_character_description(world: Any, *, name: str, **kwargs: Any) -> str:
         return ""
     try:
         desc = world.get_character_description(nm)
-        if isinstance(desc, dict):
-            desc = {k: v for k, v in desc.items() if str(k) != "last_acted"}
         return json.dumps(desc, ensure_ascii=False, indent=2)
     except Exception:
         return ""
@@ -106,8 +104,9 @@ def build_npc_description(world: Any, *, name: str, **kwargs: Any) -> str:
     if not nm:
         return ""
     try:
-        npc = world.get_npc(nm)
-        return json.dumps(npc, ensure_ascii=False, indent=2) if npc else ""
+        from world_manager.entity_core import get_entity
+        entity = get_entity(nm)
+        return json.dumps(entity, ensure_ascii=False, indent=2) if entity else ""
     except Exception:
         return ""
 

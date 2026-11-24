@@ -30,20 +30,19 @@ Every `declare_intent` call produces:
     "target": str,                # entity name | "all" | "area" | "self"
     "description": str,           # narrative content
     "visibility": "public" | "private",
-    "detection_difficulty": int,  # -1 if not applicable
+    "area": dict | null,          # extent, only when target is "area"
     "interval": [                 # [t_start, t_end] in world ticks
         int | null,               # t_start — null = "from now"
         int | null                # t_end — null = persistent subscription
     ],
-    "trigger_condition": {
-        "actor": str,             # entity_id or "any"
-        "action_type": str,       # action type or "any"
-        "target_match": str,      # entity name or "any"
+    "trigger_condition": str | {  # the condition the actor waits for: a pattern
+        "actor": str,             # for the structural join, or stated in words,
+        "action_type": str,       # in which case nothing fires it by itself
+        "target_match": str,
     } | null,
-    "trigger_priority": int,      # default 0
     "on_trigger": str,            # "interrupt_with_new_decision" | "apply_prepared_reaction"
     "prepared_reaction": dict | null,  # another intent
-    "on_timeout": dict | null,    # another intent
+    "absorption": "alert" | "immersed",
 }
 ```
 
@@ -195,17 +194,39 @@ The Scene Manager plays two roles:
 
 ### 4.1 Setting Horizon T
 
-Before each resolution cycle, SM sets T (`scene_design.md` §5):
+The reached implementation: the horizon of a cycle is **the nearest moment the
+scene changes** — the closest declared start or end among the active intents
+(`nearest_change` in `scheduler/timeline.py`, whose `.at` is what `next_boundary`
+returns), and the structural pause (900s, `Orchestrator.STRUCTURAL_PAUSE_SECONDS`)
+when only standing readinesses are left. What ends in that segment is resolved;
+what runs longer is carried over with the span it declared, and the cycle that
+follows begins where this one ended.
+
+The same reading is what the phase in front of the resolution is given: the
+moment the cycle stands at, the advance it will make if the review changes
+nothing, and what that advance is estimated by (`.kind` — an attempt's end, its
+beginning, one ending where another begins, the pause, or nothing under way at
+all). The attempt whose own moment stands there is marked in the list of declared
+intents. It is a default and is stated as one: the review itself may take an
+attempt, change its span, cut it short or strike it out, and the advance follows
+what the pool becomes, not what it was.
+
+A cycle that reaches nowhere — nothing declared, nothing standing — moves the
+clock nowhere. The mechanical "no progress" stride of 30s proposed in
+`design/03_zero_progress_fallbacks.md` is gone: a stride nothing named would make
+the stated default false, and the half of that design which gave the stride meaning
+(escalating a stalled cycle to the scene manager) was never built.
+
+The manager shapes that reach through the intents themselves — declaring,
+truncating and cancelling them — rather than by naming a look-ahead point:
 
 ```
-T = earliest of:
-  - Any NPC intent SM wants to introduce
-  - Next likely trigger match given current trajectory
-  - Default cap (T = t_now + 1h if neither applies)
+T = the nearest collision, or the structural pause when there is none
 ```
 
-SM produces T as part of `describe_scene` output. Character agents receive T
-to scope their `interval.t_start` within `[t_now, T]`.
+Not implemented: the manager's own T (`scene_design.md` §5), and passing it to
+character agents to scope their `interval.t_start` within `[t_now, T]`. The
+`horizon` field in `timeline.json` is left unwritten.
 
 ### 4.2 NPC/World Intents (§7)
 
@@ -342,8 +363,10 @@ turn_runner.py               — Step 3→4→5 integration
 | Фаза | Что | Статус |
 |------|-----|--------|
 | **1** | ~IntentNormalizer~ — условие остаётся лингвистическим, SM обрабатывает | Отменено |
-| **2** | `declare_intent` с полной схемой: `trigger_priority`, `on_trigger`, `prepared_reaction` | ✅ Реализовано |
+| **2** | `declare_intent`: `trigger_condition`, `on_trigger`, `prepared_reaction` | ✅ Реализовано |
 | **3** | SegmentResolver: find_earliest_collision (LLM-based) | ✅ SM `resolve_turn` |
 | **4** | Character re-invocation: trigger context, partial context | ✅ `_run_single_character` + `gm_notice` |
-| **5** | SM as scheduler: T, NPC intents | 📋 Следующее |
-| **6** | ResolvedHistory: аккумуляция между сегментами | 📋 Следующее |
+| **5** | SM as scheduler: T, NPC intents | Частично: NPC-интенты ✅; собственный T не вводится — горизонт цикла это ближайшая граница (§4.1) |
+| **6** | ResolvedHistory: аккумуляция между сегментами | ✅ Перенос интентов между сегментами и циклами (`carry_over_intents`, `timeline.json`) |
+| **7** | Review объявленных интентов: id, отмена, прерывание | ✅ id при объявлении и в review; `manage_intent` снимает и режет, обрезанный интент зовёт владельца обратно |
+| **8** | Интент с нулевой длительностью | ✅ Оседает в том сегменте, где сделан; пустая длительность у актёра = мгновенно, у стойкой готовности = до триггера |

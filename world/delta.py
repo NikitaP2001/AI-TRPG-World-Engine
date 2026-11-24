@@ -96,9 +96,6 @@ def _build_characters_content(world: Any) -> str:
                 continue
             try:
                 desc = world.get_character_description(nm)
-                if isinstance(desc, dict):
-                    # Strip dynamic-only fields from bootstrap snapshot.
-                    desc = {k: v for k, v in desc.items() if k not in ("last_acted",)}
                 lines.append(f"- {nm}: {json.dumps(desc, ensure_ascii=False)}")
             except Exception:
                 lines.append(f"- {nm}")
@@ -109,7 +106,7 @@ def _build_characters_content(world: Any) -> str:
 
 def _build_npcs_content(world: Any) -> str:
     try:
-        npcs = world.get_npcs()
+        npcs = world.non_player_entities()
         if not npcs:
             return "No NPCs yet."
         lines = []
@@ -117,7 +114,7 @@ def _build_npcs_content(world: Any) -> str:
             for name, data in npcs.items():
                 summary = ""
                 if isinstance(data, dict):
-                    summary = str(data.get("description") or data.get("summary") or "").strip()
+                    summary = str(data.get("facts") or "").strip()
                 line = f"- {name}"
                 if summary:
                     line += f": {summary}"
@@ -177,7 +174,7 @@ def build_gm_world_meta_content(world: Any) -> str:
         except Exception:
             pass
         try:
-            npcs_dict = world.get_npcs()
+            npcs_dict = world.non_player_entities()
             if isinstance(npcs_dict, dict) and npcs_dict:
                 meta["npcs"] = sorted(npcs_dict.keys())
         except Exception:
@@ -187,7 +184,7 @@ def build_gm_world_meta_content(world: Any) -> str:
             chars = world.get_players()
             if chars:
                 meta["players"] = [
-                    {k: v for k, v in c.items() if k in ("name", "location", "last_acted")}
+                    {k: v for k, v in c.items() if k in ("name", "location")}
                     for c in chars
                     if isinstance(c, dict)
                 ]

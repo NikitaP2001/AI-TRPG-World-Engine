@@ -87,8 +87,6 @@ class HistoryInjector:
             return
         try:
             desc = world.get_character_description(nm)
-            if isinstance(desc, dict):
-                desc = {k: v for k, v in desc.items() if str(k) != "last_acted"}
             self.inject_if_absent(marker=marker, content=json.dumps(desc, ensure_ascii=False, indent=2))
         except Exception:
             return
@@ -114,8 +112,11 @@ class HistoryInjector:
         if self.history_contains(marker):
             return
         try:
-            npc = world.get_npc(nm)
-            self.inject_if_absent(marker=marker, content=json.dumps(npc, ensure_ascii=False, indent=2))
+            from world_manager.entity_core import get_entity
+            entity = get_entity(nm)
+            if entity is None:
+                return
+            self.inject_if_absent(marker=marker, content=json.dumps(entity, ensure_ascii=False, indent=2))
         except Exception:
             return
 

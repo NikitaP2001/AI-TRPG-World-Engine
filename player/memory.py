@@ -32,11 +32,10 @@ def update_cycle_memory(
     character_name: str,
     world_time: str,
     scene_location: str,
-    thoughts_to_add: Optional[List[str]] = None,
     outcome: Optional[Dict[str, Any]] = None,
     is_override: bool = False,
 ) -> None:
-    """Append thoughts and/or set outcome for the current turn.
+    """Record the current turn in the character's memory log.
 
     A "turn" is keyed by (world_time, scene_location).
     This stays stable even when scene duration is finalized later by the GM.
@@ -70,7 +69,6 @@ def update_cycle_memory(
                 "created_at": ts,
                 "updated_at": ts,
             },
-            "thoughts": [],
             "outcome": None,
         }
         data.append(entry)
@@ -85,17 +83,6 @@ def update_cycle_memory(
     if is_override:
         meta["override"] = True
     entry["meta"] = meta
-
-    thoughts = entry.get("thoughts")
-    if not isinstance(thoughts, list):
-        thoughts = []
-
-    for t in thoughts_to_add or []:
-        s = str(t or "").strip()
-        if s:
-            thoughts.append(s)
-
-    entry["thoughts"] = thoughts
 
     if outcome is not None:
         # We never overwrite an existing outcome unless explicitly asked.

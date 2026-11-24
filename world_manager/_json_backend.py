@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 import math
 import uuid
+from collections import Counter
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -60,6 +62,49 @@ def _soft_trim(value: Any, max_bytes: int) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Bounded store picture
+# ---------------------------------------------------------------------------
+# An answer about what the store holds must be readable at the same size
+# whether the store holds a dozen entities or many thousands, so the bound is
+# structural rather than a truncation of the tail: the type vocabulary is a
+# histogram capped at a fixed number of named entries with the remainder folded
+# into one, the totals are exact counts, and the returned slice carries identity
+# and placement rather than whole records.
+
+_CENSUS_TYPE_LIMIT = 12
+_FACTS_EXCERPT_CHARS = 200
+
+
+def _is_template_entity(entity: Dict[str, Any]) -> bool:
+    """Whether an entity is a template — a form, not an inhabitant of the world."""
+    etype = str(entity.get("type") or "")
+    if etype == "template" or etype.endswith("_template") or etype.endswith("_type"):
+        return True
+    for tag in entity.get("tags") or []:
+        if str(tag).startswith("template:"):
+            return True
+    return False
+
+
+def _type_histogram(counter: Counter) -> Dict[str, int]:
+    """A type vocabulary capped at a fixed number of named entries."""
+    ordered = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+    head = {name: count for name, count in ordered[:_CENSUS_TYPE_LIMIT]}
+    rest = ordered[_CENSUS_TYPE_LIMIT:]
+    if rest:
+        head["+" + str(len(rest)) + " types"] = sum(count for _, count in rest)
+    return head
+
+
+def _facts_excerpt(facts: Any) -> str:
+    """The opening of the facts, long enough to recognise the entity by."""
+    text = str(facts or "")
+    if len(text) <= _FACTS_EXCERPT_CHARS:
+        return text
+    return text[:_FACTS_EXCERPT_CHARS].rstrip() + "\u2026"
+
+
+# ---------------------------------------------------------------------------
 # Field-config defaults (applied automatically, keyed by form, not by type)
 # ---------------------------------------------------------------------------
 
@@ -83,16 +128,13 @@ _GENERIC_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "skills": {"budget": {"hard": 1024}},  # no LRU by default
     "equipment": {"budget": {"hard": 1024}},  # no LRU by default
     "state": {"budget": {"hard": 1024}},
-    "scripts": {"budget": {"count": 10}},
+    "effects": {"budget": {"count": 10}},
     "effects": {"budget": {"count": 10}},
 }
 
 # Storage-managed keys — managed by backend, not by user data
 _STORAGE_KEYS = {"id", "type", "created_at", "updated_at", "deleted_at", "delete_reason",
                  "_field_config", "_stripped"}
-
-_INVOCATION_LIMIT = 25
-_invocation_counter: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +155,17 @@ def _world_time_str() -> str:
 # ---------------------------------------------------------------------------
 
 _3D_CACHE: Dict[str, List[float]] = {}
+
+
+def _default_store_path() -> Path:
+    """Where the entity store lives, anchored at the repository root.
+
+    Anchored rather than relative: the world a process reads must be the same
+    world whatever directory it was started in. A path relative to the working
+    directory makes a second, empty world beside the first, and an agent reading
+    that one finds a world with nothing in it.
+    """
+    return Path(__file__).resolve().parent.parent / "game" / "entity_store" / "entities.json"
 
 
 def _latlon_to_3d(lat: float, lon: float) -> List[float]:
@@ -192,9 +245,9 @@ class JsonFileBackend(EntityBackend):
     In-memory cache with atomic save via .tmp rename.
     """
 
-    def __init__(self, path: Path = Path("game") / "entity_store" / "entities.json"):
-        self._path = path
-        self._dir = path.parent
+    def __init__(self, path: Optional[Path] = None):
+        self._path = Path(path) if path else _default_store_path()
+        self._dir = self._path.parent
         self._cache: Dict[str, Dict[str, Any]] = {}
         self._dirty: bool = False
         self._id_counter: int = 0
@@ -247,25 +300,6 @@ class JsonFileBackend(EntityBackend):
         return _validate_facts(facts, entity_id)
 
     # ── Entity CRUD ──
-
-    # ── Invocation rate limit ──
-
-    @classmethod
-    def reset_invocation_counter(cls) -> None:
-        """Call at the start of each agent invocation."""
-        global _invocation_counter
-        _invocation_counter = 0
-
-    @classmethod
-    def _check_invocation_limit(cls) -> None:
-        global _invocation_counter
-        _invocation_counter += 1
-        if _invocation_counter > _INVOCATION_LIMIT:
-            cls.reset_invocation_counter()
-            raise StorageLimitExceeded(
-                f"Entity creation rate limit exceeded: max {_INVOCATION_LIMIT} "
-                f"entities per invocation."
-            )
 
     # ── base_type cycle detection ──
 
@@ -355,6 +389,40 @@ class JsonFileBackend(EntityBackend):
 
     # ── Entity CRUD ──
 
+    @staticmethod
+    def _apply_inheritance(entity: Dict[str, Any], template: Dict[str, Any]) -> None:
+        """Fill an entity from a template without overriding what it states itself.
+
+        Only fields the entity leaves unstated are taken, so a template sets a
+        default and the entity's own value always wins. Inherited blocks are
+        copied, never shared, so editing the entity cannot rewrite the template.
+        """
+        skip = _STORAGE_KEYS | {"base_type", "id", "type"}
+        for field in template:
+            if field in skip:
+                continue
+            if field not in entity or not entity[field]:
+                entity[field] = deepcopy(template[field])
+        if template.get("_field_config") and "_field_config" not in entity:
+            entity["_field_config"] = dict(template["_field_config"])
+
+    @staticmethod
+    def _merge_blocks(current: Any, incoming: Any) -> Dict[str, Any]:
+        """Merge an attribute block, keeping one entry per attribute.
+
+        A key that names an existing attribute in another case replaces that
+        spelling instead of living beside it, so a block written once as "ST"
+        and once as "st" holds one attribute, not two.
+        """
+        merged = dict(current or {})
+        for key, value in (incoming or {}).items():
+            lowered = str(key).strip().lower()
+            for other in [k for k in merged
+                          if str(k).strip().lower() == lowered and k != key]:
+                del merged[other]
+            merged[key] = value
+        return merged
+
     def set(self, id: str = "", type: str = "", **record: Any) -> Dict[str, Any]:
         """Create or update an entity.
 
@@ -375,16 +443,31 @@ class JsonFileBackend(EntityBackend):
         if not id:
             id = self._generate_id()
 
-        # Rate limit check (creates only)
-        if is_new:
-            self._check_invocation_limit()
-
         fact_warnings = self.validate_facts(record.get("facts", ""), id)
 
         # cycle detection on base_type
         base_type = record.get("base_type", "")
         if base_type:
             self._detect_cycle(base_type, id, store)
+            # A template the world does not hold would silently inherit nothing,
+            # leaving the entity without the fields its form is supposed to give it.
+            if base_type not in store:
+                return {"status": "error",
+                        "error": f"Template '{base_type}' does not exist, so there is nothing to inherit from."}
+
+        if not is_new:
+            # Naming another type moves the entity into it. A type nothing in the
+            # world carries would put the entity outside the vocabulary every
+            # reader uses, so only a type already in use is accepted.
+            new_type = str(type or "").strip()
+            current_type = str(existing.get("type") or "")
+            if new_type and new_type != current_type:
+                in_use = self._types_in_use(store)
+                if new_type not in in_use:
+                    return {"status": "error",
+                            "error": f"Type '{new_type}' is not in use in the world. "
+                                     f"Types in use: {self._describe_types(in_use)}."}
+                existing["type"] = new_type
 
         if is_new:
             entity = dict(record)
@@ -393,20 +476,7 @@ class JsonFileBackend(EntityBackend):
 
             # base_type inheritance
             if base_type and base_type in store:
-                tmpl = store[base_type]
-                _skip_inherit = _STORAGE_KEYS | {"base_type", "id", "type"}
-                for field in tmpl:
-                    if field not in _skip_inherit:
-                        if field not in entity or not entity[field]:
-                            entity[field] = tmpl[field]
-                for s in tmpl.get("scripts") or []:
-                    existing_scripts = entity.setdefault("scripts", [])
-                    if s not in existing_scripts:
-                        existing_scripts.append(s)
-                # Inherit _field_config from template
-                tmpl_config = tmpl.get("_field_config")
-                if tmpl_config and "_field_config" not in entity:
-                    entity["_field_config"] = dict(tmpl_config)
+                self._apply_inheritance(entity, store[base_type])
 
             entity["created_at"] = _world_time_str()
             entity["updated_at"] = _world_time_str()
@@ -415,18 +485,25 @@ class JsonFileBackend(EntityBackend):
             operation = "created"
         else:
             entity = store[id]
-            # Merge: non-dict fields overwrite, dict fields update.
-            # gurps is always fully replaced (not merged) to avoid key conflicts
-            # like lowercase st/dx persisting alongside uppercase ST/DX.
+            # An update restates what the entity is, block by block. A block the
+            # record does not carry is left exactly as it was; a block it does
+            # carry is merged or replaced as the tool's contract states.
             for k, v in record.items():
                 if k in _STORAGE_KEYS:
                     continue  # backend-managed, not user data
-                if k == "gurps":
-                    entity[k] = v  # full replace, not merge
-                elif isinstance(v, dict) and isinstance(entity.get(k), dict):
-                    entity[k].update(v)
+                if k in ("gurps", "stats"):
+                    entity[k] = self._merge_blocks(entity.get(k), v)
+                elif k == "tags":
+                    entity[k] = sorted(set(entity.get(k) or []) | set(v or []))
+                elif k in ("state", "skills", "equipment", "position"):
+                    entity[k] = v  # whole blocks, taken as given
                 else:
                     entity[k] = v
+            # Naming a template makes its fields apply here too, without
+            # disturbing anything this entity already states itself.
+            new_base = record.get("base_type", "")
+            if new_base and new_base in store:
+                self._apply_inheritance(entity, store[new_base])
             entity["updated_at"] = _world_time_str()
             if entity.get("deleted_at"):
                 del entity["deleted_at"]
@@ -488,18 +565,38 @@ class JsonFileBackend(EntityBackend):
         self._flush()
 
         inherited_from = record.get("base_type", "")
-        inherited_scripts = 0
-        if inherited_from and inherited_from in store:
-            inherited_scripts = len(store[inherited_from].get("scripts") or [])
 
         result = {
             "entity_id": id, "operation": operation,
             "inherited_from": inherited_from,
             "tags_total": entity.get("tags", []),
-            "scripts_inherited": inherited_scripts,
             "warnings": fact_warnings,
         }
         return result
+
+    @staticmethod
+    def _types_in_use(store: Dict[str, Any]) -> Counter:
+        """The vocabulary of the world: types carried by living, non-template entities.
+
+        This is the vocabulary a query answers with and the one an error names, so
+        a type read in either place is one that can be named in a write.
+        """
+        types: Counter = Counter()
+        for entity in store.values():
+            if entity.get("deleted_at") or _is_template_entity(entity):
+                continue
+            types[str(entity.get("type") or "")] += 1
+        return types
+
+    @staticmethod
+    def _describe_types(types: Counter) -> str:
+        """Name a vocabulary in a line that cannot outgrow what it reports."""
+        ordered = sorted(types.items(), key=lambda kv: (-kv[1], kv[0]))
+        head = [f"{name} ({count})" for name, count in ordered[:_CENSUS_TYPE_LIMIT]]
+        rest = ordered[_CENSUS_TYPE_LIMIT:]
+        if rest:
+            head.append(f"and {len(rest)} more ({sum(count for _, count in rest)})")
+        return ", ".join(head) if head else "none"
 
     def get(self, id: str) -> Optional[Dict[str, Any]]:
         store = self.load()
@@ -624,10 +721,8 @@ class JsonFileBackend(EntityBackend):
                     continue
             if facts_search and not self._entity_matches_facts_search(entity, facts_search):
                 continue
-            if not include_templates:
-                etype = entity.get("type", "")
-                if etype.endswith("_template") or etype.endswith("_type"):
-                    continue
+            if not include_templates and _is_template_entity(entity):
+                continue
 
             results.append({
                 "id": entity["id"],
@@ -642,11 +737,97 @@ class JsonFileBackend(EntityBackend):
                 "tags": entity.get("tags", []),
                 "position": entity.get("position", {}),
                 "active_effects": entity.get("effects", []),
-                "script_count": len(entity.get("scripts", [])),
             })
             if len(results) >= limit:
                 break
         return results
+
+    def query_page(self, type_filter: str = "", base_type: str = "",
+                   tags: Optional[List[str]] = None,
+                   position: Optional[Dict[str, Any]] = None,
+                   radius: float = -1.0,
+                   facts_search: str = "",
+                   include_templates: bool = False,
+                   limit: int = 10,
+                   offset: int = 0) -> Dict[str, Any]:
+        """Search entities and report the store, the match, and one slice of it.
+
+        The store totals and both type vocabularies are computed over the whole
+        store in the same pass that selects the slice, so the answer stays the
+        same size and the same shape whatever the store contains.
+        """
+        store = self.load()
+        tag_set = set(tags or [])
+        pos_coords = self._get_position_coords(position or {}) if position else None
+        try:
+            slice_limit = max(0, int(limit))
+        except Exception:
+            slice_limit = 10
+        try:
+            slice_offset = max(0, int(offset))
+        except Exception:
+            slice_offset = 0
+
+        store_types: Counter = Counter()
+        store_instances = 0
+        store_templates = 0
+        matched_types: Counter = Counter()
+        matched_count = 0
+        page: List[Dict[str, Any]] = []
+
+        for entity in store.values():
+            if entity.get("deleted_at"):
+                continue
+            template = _is_template_entity(entity)
+            if template:
+                store_templates += 1
+            else:
+                store_instances += 1
+                store_types[str(entity.get("type") or "")] += 1
+
+            if type_filter and entity.get("type", "") != type_filter:
+                continue
+            if base_type and entity.get("base_type", "") != base_type:
+                continue
+            if tag_set and not tag_set.issubset(set(entity.get("tags") or [])):
+                continue
+            if pos_coords and radius > 0:
+                ecoords = self._get_position_coords(entity.get("position", {}))
+                if not ecoords:
+                    continue
+                dist = _haversine_km(pos_coords[0], pos_coords[1], ecoords[0], ecoords[1])
+                if dist > radius:
+                    continue
+            if facts_search and not self._entity_matches_facts_search(entity, facts_search):
+                continue
+            if template and not include_templates:
+                continue
+
+            matched_count += 1
+            matched_types[str(entity.get("type") or "")] += 1
+            if slice_offset <= matched_count - 1 < slice_offset + slice_limit:
+                page.append({
+                    "id": entity["id"],
+                    "type": entity.get("type", ""),
+                    "base_type": entity.get("base_type", ""),
+                    "tags": entity.get("tags", []),
+                    "position": entity.get("position", {}),
+                    "facts": _facts_excerpt(entity.get("facts", "")),
+                })
+
+        return {
+            "store": {
+                "entities": store_instances,
+                "templates": store_templates,
+                "types": _type_histogram(store_types),
+            },
+            "matched": {
+                "count": matched_count,
+                "types": _type_histogram(matched_types),
+            },
+            "page": {"offset": slice_offset, "limit": slice_limit, "returned": len(page)},
+            "entities": page,
+        }
 
     # ── Tags ──
 
@@ -683,22 +864,31 @@ class JsonFileBackend(EntityBackend):
 
     def set_effect(self, entity_id: str, effect_id: str = "",
                    stat_deltas: Optional[Dict[str, Any]] = None,
-                   per_tick: bool = True,
-                   duration_ticks: int = -1,
-                   description: str = "",
-                   aura_radius: float = -1.0) -> Dict[str, Any]:
+                   period: int = 0,
+                   duration: int = 0,
+                   description: str = "") -> Dict[str, Any]:
+        """Store a change that lands once every *period* seconds of world time.
+
+        ``period`` 0 is a change that lands once, now, and is then done.
+        ``duration`` 0 is an effect that stays until it is removed.
+        """
         store = self.load()
         entity = store.get(entity_id)
         if entity is None or entity.get("deleted_at"):
-            return {"effect_id": "", "entity_id": entity_id, "expires_at_tick": None,
+            return {"effect_id": "", "entity_id": entity_id, "expires_at": None,
                     "warnings": ["Entity not found"]}
+        from world.clock import current_tick
+
+        now = int(current_tick() or 0)
         eid = effect_id or uuid.uuid4().hex[:12]
         entry = {
             "effect_id": eid, "stat_deltas": stat_deltas or {},
-            "per_tick": per_tick, "duration_ticks": duration_ticks,
-            "description": description, "expires_at_tick": None,
-            "aura_radius": aura_radius if aura_radius > 0 else 0,
-            "created_at_tick": 0,  # filled by engine on first tick
+            "period": max(0, int(period or 0)),
+            "duration": max(0, int(duration or 0)),
+            "description": description,
+            "started_at": now,
+            "applied_at": now,
+            "expires_at": (now + int(duration)) if int(duration or 0) > 0 else None,
         }
         effects = entity.setdefault("effects", [])
         for i, ef in enumerate(effects):
@@ -709,7 +899,9 @@ class JsonFileBackend(EntityBackend):
             effects.append(entry)
         self._touch()
         self._flush()
-        return {"effect_id": eid, "entity_id": entity_id, "expires_at_tick": None, "warnings": []}
+        return {"effect_id": eid, "entity_id": entity_id,
+                "period": entry["period"], "duration": entry["duration"],
+                "expires_at": entry["expires_at"], "warnings": []}
 
     def remove_effect(self, entity_id: str, effect_id: str) -> Dict[str, Any]:
         store = self.load()
@@ -721,45 +913,6 @@ class JsonFileBackend(EntityBackend):
         self._touch()
         self._flush()
         return {"entity_id": entity_id, "effect_id": effect_id, "status": "removed"}
-
-    # ── Scripts ──
-
-    def attach_script(self, entity_id: str, script_id: str = "",
-                      trigger_type: str = "",
-                      trigger_params: Optional[Dict[str, Any]] = None,
-                      script: str = "", comment: str = "") -> Dict[str, Any]:
-        store = self.load()
-        entity = store.get(entity_id)
-        if entity is None or entity.get("deleted_at"):
-            return {"script_id": "", "entity_id": entity_id, "trigger_type": trigger_type,
-                    "warnings": ["Entity not found"]}
-        sid = script_id or uuid.uuid4().hex[:12]
-        entry = {
-            "script_id": sid, "trigger_type": trigger_type,
-            "trigger_params": trigger_params or {},
-            "script": script, "comment": comment,
-        }
-        scripts = entity.setdefault("scripts", [])
-        for i, s in enumerate(scripts):
-            if s.get("script_id") == sid:
-                scripts[i] = entry
-                break
-        else:
-            scripts.append(entry)
-        self._touch()
-        self._flush()
-        return {"script_id": sid, "entity_id": entity_id, "trigger_type": trigger_type, "warnings": []}
-
-    def detach_script(self, entity_id: str, script_id: str) -> Dict[str, Any]:
-        store = self.load()
-        entity = store.get(entity_id)
-        if entity is None or entity.get("deleted_at"):
-            return {"entity_id": entity_id, "script_id": script_id, "status": "not_found"}
-        scripts = entity.get("scripts", [])
-        entity["scripts"] = [s for s in scripts if s.get("script_id") != script_id]
-        self._touch()
-        self._flush()
-        return {"entity_id": entity_id, "script_id": script_id, "status": "removed"}
 
     # ── adjust_entity ──
 

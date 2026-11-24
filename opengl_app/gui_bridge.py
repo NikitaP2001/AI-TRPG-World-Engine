@@ -8,15 +8,12 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 # ── Engine imports ──
-from world_manager.entity_core import _get_backend, tick as engine_tick
 from world_manager.entity_store import (
     set_entity, get_entity, get_entity_facts, get_entity_state,
-    query_entities, adjust_entity, delete_entity,
-    add_tags, remove_tags, set_effect, remove_effect,
-    attach_script, detach_script,
+    query_entities, delete_entity, remove_effect,
 )
-from world_manager.event_log import query_events, record_event
-from scheduler_queue import pop_due_invocations, schedule_invocation, peek_due_invocations
+from world_manager.event_log import query_events, create_event
+from scheduler_queue import schedule_invocation, peek_due_invocations
 
 
 class GuiBridge:
@@ -84,12 +81,6 @@ class GuiBridge:
     # ── Scene ──
 
     @staticmethod
-    def get_location_info(location_id: str) -> Dict[str, Any]:
-        """Get location data: entities present, recent events."""
-        from scene_manager.tools import get_location_info as _get_location_info
-        return _get_location_info(location_id)
-
-    @staticmethod
     def get_active_scene() -> Optional[Dict[str, Any]]:
         """Get the currently active scene from World."""
         w = GuiBridge._world()
@@ -136,28 +127,12 @@ class GuiBridge:
                           stats=stats, tags=tags, position=position)
 
     @staticmethod
-    def adjust(entity_id: str, **kwargs) -> Dict[str, Any]:
-        return adjust_entity(entity_id=entity_id, **kwargs)
-
-    @staticmethod
     def delete_entity(id: str) -> Dict[str, Any]:
         return delete_entity(id=id, reason="Deleted via GUI")
 
     @staticmethod
     def remove_effect(entity_id: str, effect_id: str) -> Dict[str, Any]:
         return remove_effect(entity_id=entity_id, effect_id=effect_id)
-
-    # ── Entity sets ──
-
-    @staticmethod
-    def get_entity_sets() -> Dict[str, List[Dict[str, Any]]]:
-        """Return entities grouped by type."""
-        result = {}
-        for etype in ("npc", "character", "location", "faction", "item"):
-            entities = query_entities(type_filter=etype, include_templates=False, limit=200)
-            if entities:
-                result[etype] = entities
-        return result
 
     # ── Events ──
 
@@ -167,10 +142,10 @@ class GuiBridge:
         return query_events(entity_id=entity_id, tag=tag, limit=limit)
 
     @staticmethod
-    def record_event(description: str, entity_ids: Optional[List[str]] = None,
-                     tag: str = "", narrative_flag: bool = False) -> Dict[str, Any]:
-        return record_event(description=description, entity_ids=entity_ids or [],
-                            tag=tag, narrative_flag=narrative_flag)
+    def create_event(description: str, entity_ids: Optional[List[str]] = None,
+                     tag: str = "") -> Dict[str, Any]:
+        return create_event(description=description, entity_ids=entity_ids or [],
+                            tag=tag)
 
     # ── Agent status ──
 
@@ -179,22 +154,8 @@ class GuiBridge:
         return peek_due_invocations(current_tick=0) or []
 
     @staticmethod
-    def get_news_queue(agent: str) -> List[str]:
-        try:
-            events = query_events(narrative_flag_only=True, limit=20)
-            return [f"[{ev.get('tag','')}] {ev.get('description','')[:100]}" for ev in events]
-        except Exception:
-            return []
-
-    @staticmethod
     def invoke_agent(agent: str, comment: str = "") -> Dict[str, Any]:
         return schedule_invocation(agent=agent, delay_ticks=0, world_time=-1, comment=comment)
-
-    # ── Engine tick ──
-
-    @staticmethod
-    def tick(current_tick: int) -> Dict[str, Any]:
-        return engine_tick(current_tick)
 
     # ── Prompt introspection ──
 
@@ -203,13 +164,38 @@ class GuiBridge:
         """Return raw message history for an agent."""
         from memory_store import load_history
         from pathlib import Path
-        game = Path("game")
+        game = Path(__file__).resolve().parent.parent / "game"
         path_map = {
-            "gm": game / "gm_history" / "messages.json",
-            "sm": game / "sm_history" / "messages.json",
-            "wm": game / "wm_history" / "_wm_history.json",
+            "gm": game / "game_master_messages.json",
+            "sm": game / "scene_manager_messages.json",
+            "wm": game / "world_master_messages.json",
         }
         path = path_map.get(agent)
         if path and path.exists():
             return load_history(path)[-limit:]
         return []
+
+    # ── The engine itself ──
+
+    @staticmethod
+    def orchestrator():
+        """The engine's own orchestrator, built once and kept for the panels.
+
+        A panel that asks the engine something asks it of the same object every
+        time, so the agents it holds are not rebuilt behind a question's back.
+        """
+        if not hasattr(GuiBridge, "_orchestrator"):
+            from engine.orchestrator import Orchestrator
+            GuiBridge._orchestrator = Orchestrator()
+        return GuiBridge._orchestrator
+
+    @staticmethod
+    def forget_world() -> None:
+        """Forget what the panels were reading: the game changed under them.
+
+        A session that was played, or a return to a save point, leaves a world
+        and an engine that stand for a state of the game no longer on disk.
+        """
+        for attr in ("_world_instance", "_orchestrator"):
+            if hasattr(GuiBridge, attr):
+                delattr(GuiBridge, attr)

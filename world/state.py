@@ -20,8 +20,8 @@ from .io import (
 )
 from .migrations import (
     ensure_character_description_fields,
-    ensure_character_metadata_fields,
-    migrate_character_last_acted_to_metadata,
+    migrate_world_awareness_record,
+    migrate_world_initialization_record,
 )
 
 
@@ -66,7 +66,11 @@ class World:
     # character list entry keys in info.json
     CK_NAME = "name"
     CK_LOCATION = "location"
-    CK_LAST_ACTED = "last_acted"
+
+    # What a character's place reads as when the world holds none for him. It is
+    # not a place: nothing may be staged in it, and a session waits rather than
+    # narrating a scene nobody is standing in.
+    NO_LOCATION = "no location specified"
 
     DEFAULT_TIME = "Y0000-01-01 00:00"
 
@@ -102,11 +106,13 @@ class World:
         # Ensure characters have required fields in their description.json.
         self._ensure_character_description_fields()
 
-        # Ensure characters have required fields in their metadata.json.
-        self._ensure_character_metadata_fields()
+        # One-time migration: a world built before the initialization record
+        # existed gets the record it implies, so it is not built again.
+        self._migrate_world_initialization_record()
 
-        # One-time migration: move last_acted out of description.json.
-        self._migrate_character_last_acted_to_metadata()
+        # The same, for the world's opening: a world whose characters were already
+        # told where they stand is not opened again after a restart.
+        self._migrate_world_awareness_record()
 
         # Sync location parent→sublocations hierarchy in entity store.
         self._ensure_location_sublocations_field()
@@ -142,9 +148,6 @@ class World:
     def _character_equipment_path(self, name: str) -> Path:
         return self._character_dir(name) / "equipment.json"
 
-    def _character_metadata_path(self, name: str) -> Path:
-        return self._character_dir(name) / "metadata.json"
-
     def list_character_names(self) -> List[str]:
         chars_dir = (self._game_root / "players").resolve()
         if not chars_dir.exists():
@@ -154,11 +157,11 @@ class World:
     def _ensure_character_description_fields(self) -> None:
         ensure_character_description_fields(game_root=self._game_root)
 
-    def _ensure_character_metadata_fields(self) -> None:
-        ensure_character_metadata_fields(game_root=self._game_root)
+    def _migrate_world_initialization_record(self) -> None:
+        migrate_world_initialization_record(game_root=self._game_root)
 
-    def _migrate_character_last_acted_to_metadata(self) -> None:
-        migrate_character_last_acted_to_metadata(game_root=self._game_root)
+    def _migrate_world_awareness_record(self) -> None:
+        migrate_world_awareness_record(game_root=self._game_root)
 
     def _build_character_entries(self) -> List[Dict[str, str]]:
         out: List[Dict[str, str]] = []
@@ -176,16 +179,10 @@ class World:
                             location = str(loc).strip()
                 except Exception:
                     pass
-            try:
-                meta = self.get_character_metadata(name)
-                last_acted = str(meta.get("last_acted") or "never")
-            except Exception:
-                last_acted = "never"
             out.append(
                 {
                     self.CK_NAME: name,
-                    self.CK_LOCATION: location if location else "no location specified",
-                    self.CK_LAST_ACTED: last_acted or "never",
+                    self.CK_LOCATION: location if location else self.NO_LOCATION,
                 }
             )
         return out
@@ -228,7 +225,7 @@ class World:
         return result
 
     def get_players(self) -> List[Dict[str, str]]:
-        """Return player list from entity store: [{name, location, last_acted}].
+        """Return player list from entity store: [{name, location}].
 
         "Player" = entity whose id matches a game/players/{id}/ folder.
         Entity type is irrelevant — it's an orchestration fact,
@@ -239,8 +236,7 @@ class World:
         """
         try:
             from world_manager.entity_core import _get_backend
-            from pathlib import Path as _P
-            players_root = _P("game") / "players"
+            players_root = (self._game_root / "players")
             result = []
             # Phase 1: entities already in store
             backend = _get_backend()
@@ -257,16 +253,9 @@ class World:
                     coords = position.get("coords")
                     if coords:
                         loc = f"coords:{coords[0]},{coords[1]}"
-                last_acted = "never"
-                try:
-                    meta = _read_json(self._character_dir(name) / "metadata.json")
-                    last_acted = str(meta.get("last_acted", "never"))
-                except Exception:
-                    pass
                 result.append({
                     "name": name,
-                    "location": loc if loc else "no location specified",
-                    "last_acted": last_acted,
+                    "location": loc if loc else self.NO_LOCATION,
                 })
             # Phase 2: player folders without entity records yet (startup)
             if players_root.is_dir():
@@ -276,17 +265,9 @@ class World:
                     name = pdir.name
                     if name.lower() in seen:
                         continue
-                    loc = "no location specified"
-                    last_acted = "never"
-                    try:
-                        meta = _read_json(pdir / "metadata.json")
-                        last_acted = str(meta.get("last_acted", "never"))
-                    except Exception:
-                        pass
                     result.append({
                         "name": name,
-                        "location": loc,
-                        "last_acted": last_acted,
+                        "location": self.NO_LOCATION,
                     })
             return result
         except Exception:
@@ -322,7 +303,7 @@ class World:
             expected = sorted(set(children_of.get(eid, [])))
             current = sorted(loc.get("sublocations") or [])
             if current != expected:
-                _se(id=eid, type="location",
+                _se(id=eid,
                     facts=loc.get("facts", ""),
                     sublocations=expected)
 
@@ -333,206 +314,29 @@ class World:
             raise KeyError(f"Unknown location: {name}")
         return entity
 
-    def get_npcs(self) -> Dict[str, Any]:
-        """Return all non-player entities as {name: data} dict.
+    def non_player_entities(self, limit: int = 200) -> Dict[str, Any]:
+        """Return every entity the players do not control, as {id: record}.
 
-        UI helper — filters out entities whose id matches a game/players/{id}/
-        folder (those are player-controlled). Not a type check — the entity
-        store does not know what a "player" is.
+        "Player" is an orchestration fact, not a store concept: an entity the
+        players control is one whose id matches a game/players/{id}/ folder.
+        Everything else is returned as the store holds it — places, factions,
+        deities, creatures and people alike, each with its own type.
+
+        limit: how many the store is asked for. A world larger than this is read
+        through the query tools, which answer with counts and a bounded slice.
         """
         try:
             from world_manager.entity_core import _get_backend
             from pathlib import Path as _P
             backend = _get_backend()
-            entities = backend.query(include_templates=False, limit=200)
-            result = {}
-            for e in entities:
-                eid = e.get("id", "")
-                if not eid:
-                    continue
-                # Skip player-controlled entities
-                if (_P("game") / "players" / eid).is_dir():
-                    continue
-                loc_data = e.get("position", {})
-                loc = loc_data.get("inside", "") if isinstance(loc_data, dict) else ""
-                result[eid] = {
-                    "name": eid,
-                    "location": loc,
-                    "current_state": e.get("state", {}).get("current_state", ""),
-                    "description": e.get("facts", ""),
-                    "details": "",
-                    "last_acted": e.get("state", {}).get("last_acted", "never"),
-                }
-            return result
-        except Exception:
-            pass
-        return {}
-
-    def get_npc(self, name: str) -> Dict[str, Any]:
-        from world_manager.entity_core import get_entity as _ge
-        entity = _ge(name)
-        if entity is None:
-            raise KeyError(f"Unknown entity: {name}")
-        loc_data = entity.get("position", {})
-        loc = loc_data.get("inside", "") if isinstance(loc_data, dict) else ""
-        return {
-            "name": name,
-            "location": loc,
-            "current_state": entity.get("state", {}).get("current_state", ""),
-            "description": entity.get("facts", ""),
-            "details": "",
-            "last_acted": entity.get("state", {}).get("last_acted", "never"),
-        }
-
-    def create_npc(self, *, name: str, location: str, current_state: str, description: str) -> Dict[str, Any]:
-        from world_manager.entity_core import set_entity as _se
-        name = (name or "").strip()
-        if not name:
-            raise ValueError("NPC name is required")
-
-        # Validate no character collision
-        try:
-            for existing in self.list_character_names():
-                if str(existing).strip().lower() == name.lower():
-                    raise ValueError(
-                        f"NPC name '{name}' conflicts with existing character '{existing}'."
-                    )
-        except ValueError:
-            raise
-        except Exception:
-            pass
-
-        location = (location or "").strip()
-        if not location:
-            raise ValueError("NPC location is required")
-        _ = self.get_location(location)
-
-        # Check duplicate via entity store
-        from world_manager.entity_core import get_entity as _ge
-        if _ge(name) is not None:
-            raise ValueError(f"NPC already exists: {name}. Use update methods to modify it.")
-
-        result = _se(
-            id=name, type="npc",
-            facts=description or "",
-            state={"current_state": current_state or "", "last_acted": "never"},
-            position={"inside": location},
-        )
-        if result.get("status") == "error":
-            raise ValueError(f"Failed to create NPC: {result.get('error')}")
-        return self.get_npc(name)
-
-    def update_npc_json(self, *, name: str, pointer: str, value: str) -> Dict[str, Any]:
-        """Update a JSON field on an NPC entity using JSON Pointer."""
-        from world_manager.entity_core import get_entity as _ge, set_entity as _se
-        entity = _ge(name)
-        if entity is None:
-            raise KeyError(f"Unknown NPC: {name}")
-        parsed = _parse_value(value)
-        set_at_pointer(entity, pointer, parsed, create_missing=False)
-        result = _se(id=name, type="npc",
-            facts=entity.get("facts", ""),
-            state=entity.get("state", {}),
-            position=entity.get("position", {}),
-        )
-        if result.get("status") == "error":
-            raise ValueError(f"Failed to update NPC: {result.get('error')}")
-        return entity
-
-    def add_npc_json(self, *, name: str, pointer: str, value: str) -> Dict[str, Any]:
-        """Add/create a JSON field on an NPC entity using JSON Pointer."""
-        from world_manager.entity_core import get_entity as _ge, set_entity as _se
-        entity = _ge(name)
-        if entity is None:
-            raise KeyError(f"Unknown NPC: {name}")
-        parsed = _parse_value(value)
-        set_at_pointer(entity, pointer, parsed, create_missing=True)
-        result = _se(id=name, type="npc",
-            facts=entity.get("facts", ""),
-            state=entity.get("state", {}),
-            position=entity.get("position", {}),
-        )
-        if result.get("status") == "error":
-            raise ValueError(f"Failed to add NPC field: {result.get('error')}")
-        return entity
-
-    def delete_npc_json(self, *, name: str, pointer: str) -> Dict[str, Any]:
-        """Delete a JSON field on an NPC entity using JSON Pointer."""
-        from world_manager.entity_core import get_entity as _ge, set_entity as _se
-        entity = _ge(name)
-        if entity is None:
-            raise KeyError(f"Unknown NPC: {name}")
-        remove_at_pointer(entity, pointer)
-        result = _se(id=name, type="npc",
-            facts=entity.get("facts", ""),
-            state=entity.get("state", {}),
-            position=entity.get("position", {}),
-        )
-        if result.get("status") == "error":
-            raise ValueError(f"Failed to delete NPC field: {result.get('error')}")
-        return entity
-
-    def delete_npc(self, name: str) -> None:
-        """Remove an NPC from the entity store."""
-        from world_manager.entity_core import _get_backend
-        name = (name or "").strip()
-        if not name:
-            raise ValueError("NPC name is required")
-        backend = _get_backend()
-        if backend.get(name) is None:
-            raise KeyError(f"Unknown NPC: {name}")
-        backend.delete(name, reason="deleted via delete_npc")
-
-    def set_npc_last_acted(self, *, name: str, last_acted: str) -> Dict[str, Any]:
-        """Set an NPC's last_acted timestamp via entity store."""
-        from world_manager.entity_core import get_entity as _ge, set_entity as _se
-        entity = _ge(name)
-        if entity is None:
-            raise KeyError(f"Unknown NPC: {name}")
-        raw = str(last_acted or "").strip()
-        normalized = "never" if not raw or raw.lower() == "never" else WorldTime.parse(raw).to_string()
-        state = dict(entity.get("state", {}))
-        state["last_acted"] = normalized
-        result = _se(id=name, type="npc",
-            facts=entity.get("facts", ""),
-            state=state,
-            position=entity.get("position", {}),
-        )
-        if result.get("status") == "error":
-            raise ValueError(f"Failed to update NPC last_acted: {result.get('error')}")
-        return self.get_npc(name)
-
-    def get_character_metadata(self, name: str) -> Dict[str, Any]:
-        p = self._character_metadata_path(name)
-        if not p.exists():
+            players_root = _P("game") / "players"
             return {
-                "last_acted": "never",
+                str(e.get("id")): e
+                for e in backend.query(include_templates=False, limit=limit)
+                if e.get("id") and not (players_root / str(e.get("id"))).is_dir()
             }
-        data = _read_json(p)
-        if not isinstance(data, dict):
-            return {
-                "last_acted": "never",
-            }
-        if "last_acted" not in data:
-            data = {**data, "last_acted": "never"}
-        return data
-
-    def set_character_last_acted(self, *, name: str, last_acted: str) -> Dict[str, Any]:
-        # Validate character exists.
-        _ = self._get_character_description_raw(name)
-
-        raw = str(last_acted or "").strip()
-        if not raw or raw.lower() == "never":
-            normalized = "never"
-        else:
-            normalized = WorldTime.parse(raw).to_string()
-
-        p = self._character_metadata_path(name)
-        data = self.get_character_metadata(name)
-        data["last_acted"] = normalized
-        _write_json(p, data)
-        self._sync_info_characters()
-        return data
+        except Exception:
+            return {}
 
     def _get_character_description_raw(self, name: str) -> Dict[str, Any]:
         p = self._character_description_path(name)
@@ -545,15 +349,6 @@ class World:
 
     def get_character_description(self, name: str) -> Dict[str, Any]:
         data = self._get_character_description_raw(name)
-
-        # Inject runtime metadata fields for agent visibility, without persisting them.
-        try:
-            meta = self.get_character_metadata(name)
-            la = str(meta.get("last_acted") or "").strip()
-            if la:
-                data = {**data, "last_acted": la}
-        except Exception:
-            pass
 
         # NOTE: _stripped.json merge-back removed — non-core fields (location,
         # equipment, skills, status, appearance) now live in entity store only.
@@ -645,11 +440,6 @@ class World:
         p = self._character_description_path(name)
         parsed = _parse_value(value)
 
-        # last_acted is stored in metadata.json (runtime-managed), not description.json.
-        if str(pointer or "").strip() == "/last_acted":
-            self.set_character_last_acted(name=name, last_acted=str(parsed))
-            return self.get_character_description(name)
-
         data = self._get_character_description_raw(name)
         set_at_pointer(data, pointer, parsed, create_missing=False)
         # except for auto-updating fields
@@ -671,11 +461,6 @@ class World:
         p = self._character_description_path(name)
         parsed = _parse_value(value)
 
-        # last_acted is stored in metadata.json (runtime-managed), not description.json.
-        if str(pointer or "").strip() == "/last_acted":
-            self.set_character_last_acted(name=name, last_acted=str(parsed))
-            return self.get_character_description(name)
-
         data = self._get_character_description_raw(name)
         set_at_pointer(data, pointer, parsed, create_missing=True)
         if "/location" not in pointer:
@@ -694,10 +479,6 @@ class World:
 
     def delete_character_json(self, *, name: str, pointer: str) -> Dict[str, Any]:
         p = self._character_description_path(name)
-
-        # last_acted is runtime-managed in metadata.json and not deletable here.
-        if str(pointer or "").strip() == "/last_acted":
-            raise ValueError("/last_acted is runtime-managed and cannot be deleted via description.json")
 
         data = self._get_character_description_raw(name)
         remove_at_pointer(data, pointer)

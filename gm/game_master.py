@@ -18,12 +18,15 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 
-from memory_store import append_message, load_history, limits_from_env
+from history_pipeline import memory_at
+from memory_store import load_history
+from record_voice import spoken
 from openrouter_langchain_logging import logs_enabled
-from openrouter_llm import build_openrouter_chat_llm, openrouter_logging_callbacks, read_prompt_text
+from openrouter_llm import bind_agent_tools, build_openrouter_chat_llm, extract_reasoning, openrouter_logging_callbacks, read_prompt_text
 from world import World, WorldTime
 from gm.react_loop import react_loop_iteration
 from engine.history_meta import HistoryMeta as GMHistoryMeta
+from engine.invocation import opening
 from engine.summarizer import SummaryRunner
 
 _WORLD = World()
@@ -36,28 +39,44 @@ _WORLD = World()
 
 @tool
 def invoke_self_gm(
-    delay_ticks: int = -1,
-    world_time: int = -1,
+    delay: str = "",
     comment: str = "",
 ) -> str:
-    """Finish planning and pass control forward.
+    """Finish this invocation, and say when it should run again.
 
-    Universal scheduling primitive. Exactly one of delay_ticks or
-    world_time must be provided. Use comment to summarise what was done.
+    Nothing of this invocation carries forward beyond what was written down
+    before the call, so anything meant to last must already be recorded. This
+    call ends the invocation; the delay says when to return.
 
-    This is a termination tool — calling it ends the current invocation.
+    Args:
+        delay: How long from now the next invocation is wanted, written with its
+            unit — minutes, hours or days, as in "30m" or "2d". The wake-up is
+            served by the next turn of the world, so it comes at the first moment
+            the world reaches that time, which can be later than the delay names.
+        comment: What to attend to then. It is read first on the next run.
     """
-    return "ok"
+    from scheduler_queue import delay_seconds, schedule_invocation
+
+    try:
+        ticks = delay_seconds(delay)
+    except ValueError as exc:
+        return f"Error: {exc}"
+
+    scheduled = schedule_invocation(
+        agent="gm", delay_ticks=ticks, comment=comment,
+    )
+    if scheduled.get("status") == "error":
+        return f"Error: {scheduled.get('error')}"
+    return f"scheduled at world tick {scheduled.get('scheduled_tick')}"
 
 
 @tool
-def answer_lore_question_gm(content: str) -> str:
-    """Answer a question or provide lore information.
-
-    This is a termination tool — calling it ends the current invocation.
+def answer_lore_question(content: str) -> str:
+    """Answer a question the scene cannot settle on its own.
 
     Args:
-        content: Your answer or information to provide.
+        content: The answer, complete enough that the scene can go on without
+            asking again — what is true, and how far it extends.
     """
     return "ok"
 
@@ -105,24 +124,29 @@ class GameMaster:
         self._prompt_text = read_prompt_text(prompt_path)
         self._temperature = 0.7
         self._history_path = history_path
+        self._peer_history_path: Optional[Path] = None
         self._meta = GMHistoryMeta(
             (self._history_path.parent / "gm_history_meta.json")
             if self._history_path else Path("gm_history_meta.json"),
         )
+
+    def set_peer_history(self, path: Optional[Path]) -> None:
+        """Name the memory this agent reports its changes into (the WM's)."""
+        self._peer_history_path = path
     def inject_delta(self, content: str) -> None:
         """Inject a standalone world-state delta message into GM history."""
         if not content or not content.strip():
             return
         if not self._history_path:
             return
-        limits = limits_from_env()
-        append_message(self._history_path, role="user", content=content.strip(), limits=limits)
+        memory_at(self._history_path).record(content.strip())
         self._meta.append_entry("auto_injection", content.strip()[:60])
 
     def call_gm(
         self,
         *,
         notice: str,
+        invoked_as: str,
         context: Optional[Dict[str, Any]] = None,
         tools: Optional[List[Any]] = None,
         llm: Optional[ChatOpenAI] = None,
@@ -130,8 +154,16 @@ class GameMaster:
         """Invoke GM with a notice via ReAct loop. GM uses tools until termination.
 
         Args:
-            notice: Text explaining why GM was called.
-            context: Optional dict with world_time, players list, etc.
+            notice: What the invocation carries — the fact needed, or the reason
+                it was woken. Empty for a wake that carries nothing but itself.
+            invoked_as: How the call is stated to the Game Master, in words inside
+                the brackets: who is asking, and what for. The caller says it,
+                because the caller is the one that knows — this call serves a
+                question from the scene manager as well as a wake the framework
+                served, and only the words distinguish them.
+            context: Optional dict with world_time, players list, etc. The moment
+                the invocation happens at is stated on its opening either way: a
+                caller that does not pass one is dated by the world's clock.
             tools: Override tool list (defaults to all GM tools).
             llm: Optional LLM instance.
 
@@ -145,45 +177,60 @@ class GameMaster:
                 title_suffix="-game-master",
                 max_tokens=2000,
                 parallel_tool_calls=True,
+                thinking=True,  # adjudication is deliberation
+                effort="low",
             )
 
         from world_manager.tool_registry import ToolRegistry
 
+        stated = str(invoked_as or "").strip() or "you are invoked"
+        asked = str(notice or "").strip()
+
         all_tools = tools or [
             invoke_self_gm,
-            answer_lore_question_gm,
+            answer_lore_question,
             *ToolRegistry.for_gm(),
         ]
 
-        # Reset invocation-scoped state before each GM call.
-        from world_manager.tool_registry import reset_doc_read_tracker
-        reset_doc_read_tracker("gm")
-
         tools_by_name = {t.name: t for t in all_tools}
-        llm_with_tools = llm.bind_tools(all_tools).with_config({
-            "callbacks": openrouter_logging_callbacks(scope="game_master", label="call_gm"),
-        })
+        llm_with_tools = bind_agent_tools(
+            llm, all_tools,
+            callbacks=openrouter_logging_callbacks(scope="game_master", label="call_gm"),
+        )
 
-        # Build message: system prompt + history + notice + context
+        # Assemble message: system prompt + history + notice + context
         history_msgs: List[BaseMessage] = []
         if self._history_path and self._history_path.exists():
-            history = load_history(self._history_path)
-            for h in history:
+            for h in load_history(self._history_path):
                 role = (h.get("role") or "").strip().lower()
-                content = str(h.get("content") or "")
-                if role == "user":
-                    history_msgs.append(HumanMessage(content=content))
-                elif role == "assistant":
-                    history_msgs.append(AIMessage(content=content))
+                # Stored entries are records the framework authored, so they are
+                # read back as records whatever role they were written with, and
+                # in the world's voice: the markers are the code's.
+                said = spoken(str(h.get("content") or ""))
+                if role in ("user", "assistant") and said.strip():
+                    history_msgs.append(HumanMessage(content=said))
 
-        ctx_parts = [f"[call_gm: {notice}]"]
+        ctx_parts = [f"[{stated}: {asked}]" if asked else f"[{stated}]"]
+        world_time_str = ""
         if context:
-            world_time_str = context.get("world_time", "")
-            if world_time_str:
-                ctx_parts.append(f"\nWorld time: {world_time_str}")
+            world_time_str = str(context.get("world_time", "") or "").strip()
             # Last-call reminder so GM knows the time gap
             last_call = self._meta.last_call_time
-            if last_call:
+            if world_time_str and self._meta.last_call_tick > 0:
+                gap_days = 0
+                try:
+                    gap = (WorldTime.parse(world_time_str).to_seconds()
+                           - self._meta.last_call_tick)
+                    gap_days = max(0, gap // (24 * 60 * 60))
+                except Exception:
+                    gap_days = 0
+                if gap_days > 0:
+                    ctx_parts.append(
+                        f"World time advanced {gap_days} day(s) since the GM was last called."
+                    )
+                elif last_call:
+                    ctx_parts.append(f"GM was last called at: {last_call}")
+            elif last_call:
                 ctx_parts.append(f"GM was last called at: {last_call}")
             players = context.get("players", [])
             wt = None
@@ -197,17 +244,7 @@ class GameMaster:
                 for p in players:
                     name = p.get("name", "?")
                     loc = p.get("location", "?")
-                    la = p.get("last_acted", "?")
-                    suffix = ""
-                    if wt and la and la != "never":
-                        try:
-                            la_wt = WorldTime.parse(la)
-                            gap_h = (wt.to_seconds() - la_wt.to_seconds()) / 3600
-                            if gap_h >= 12:
-                                suffix = " | ⚠ 12h+ behind — cannot be picked"
-                        except Exception:
-                            pass
-                    ctx_parts.append(f"  {name} | location: {loc} | last_acted: {la}{suffix}")
+                    ctx_parts.append(f"  {name} | location: {loc}")
             scene = context.get("current_scene", "")
             if scene:
                 ctx_parts.append(f"\nActive scene: {scene}")
@@ -216,7 +253,10 @@ class GameMaster:
                 import json as _json
                 ctx_parts.append(f"\nPlot:\n{_json.dumps(plot, ensure_ascii=False, indent=2)}")
 
-        human_msg = "\n".join(ctx_parts)
+        # The opening carries the moment it happens at, from one place for every
+        # agent: an invocation that does not know when it is cannot say what has
+        # happened since it last looked.
+        human_msg = opening(ctx_parts, moment=world_time_str)
 
         # Set up close-invocation validation hook: prevent GM from closing
         # until all character state files are in place.
@@ -279,55 +319,106 @@ class GameMaster:
                .add_active_characters()
                .build_persistent()
         )
-        invocation = ctx.add_storage_notice().add_news_digest(
-            last_seen_event_id=self._meta.last_seen_event_id,
-        ).build_invocation()
+        invocation = ctx.add_storage_notice().build_invocation()
         sys_msgs = [SystemMessage(content=self._prompt_text), *persistent]
         messages = [*sys_msgs, *history_msgs, *invocation, HumanMessage(content=human_msg)]
+
+        from engine.change_summary import ChangeCollector, append_change_record
+        changes = ChangeCollector()
+
+        # The invocation is a branch of the GM's memory, opened when it wakes and
+        # closed by the termination tool that ends its work. Whatever it writes
+        # while the branch is open is entered then; nothing is written to the
+        # thread behind the branch's back.
+        own_memory = memory_at(self._history_path) if self._history_path else None
+        if own_memory is not None:
+            own_memory.open_branch()
 
         result = react_loop_iteration(
             messages,
             llm_with_tools,
             tools_by_name,
-            termination_tools={"invoke_self_gm", "answer_lore_question_gm", "close_invocation"},
-            readonly_tools={"get_entity", "get_entity_facts", "query_entities", "query_events"},
+            termination_tools={"invoke_self_gm", "answer_lore_question", "close_invocation"},
+            readonly_tools={"get_entity", "get_entity_facts", "get_entity_state",
+                            "query_entities", "query_events"},
             pinned_refresh_fn=ctx.rebuild_storage_notice,
+            changes=changes,
         )
 
-        # Clear validation hook and doc tracker regardless of outcome
+        # Clear the character-file validation hook regardless of outcome
         set_close_validation_hook(None)
-        from world_manager.tool_registry import clear_current_agent
-        clear_current_agent()
 
-        # Persist to GM history + tag entries
+        # What the call carries, and how it was stated. The invocation context —
+        # world time, players, scene, plot — is rebuilt for every call, so writing
+        # it here would leave a second, staler copy of facts the next call states
+        # again; a wake that carried nothing is not a record either, and the
+        # invocation itself is kept in the metadata.
         if self._history_path:
-            limits = limits_from_env()
-            append_message(self._history_path, role="user", content=human_msg, limits=limits)
+            if asked:
+                own_memory.record(f"[call_gm: {asked}]")
             self._meta.append_entry("interaction", f"call_gm: {notice[:60]}")
             for m in result["messages"]:
                 t = str(getattr(m, "type", "") or "").strip().lower()
                 content = str(getattr(m, "content", "") or "").strip()
-                if t in {"ai", "assistant"} and content:
-                    append_message(self._history_path, role="assistant", content=content, limits=limits)
+                if content.startswith("[written]"):
+                    # What this invocation wrote through its tools, in the order it
+                    # wrote it. Without it the memory keeps the deliberation and
+                    # loses the deed, and the next wake reads its own past as
+                    # thinking that led nowhere.
+                    own_memory.record(content)
+                    continue
+                # What it thought, and only what it thought: what it said inside
+                # the loop is speech to the tools, not a record of the invocation,
+                # and a record read as deliberation must not be carrying speech.
+                reasoning = extract_reasoning(m) if t in {"ai", "assistant"} else ""
+                if reasoning:
+                    own_memory.record(f"[reasoning]\n{reasoning}")
                     exit_tool = result.get("exit_tool", "")
                     self._meta.append_entry("interaction", f"GM output: {exit_tool or 'thinking'}")
+            # What this invocation changed, in outline: one aggregated record
+            # instead of the calls that caused it, sent to the World Manager —
+            # the authority above this one — so what the campaign changed reaches
+            # the memory that governs the world. Not kept here: the Game Master
+            # made these changes itself in this invocation, so a copy of them in
+            # its own memory tells it what it already knows, and pushes out what
+            # it was told by others.
+            changes_block = changes.build("gm")
+            append_change_record(self._peer_history_path, changes_block)
 
         thinking = []
         for m in result["messages"]:
             t = str(getattr(m, "type", "") or "").strip().lower()
-            content = str(getattr(m, "content", "") or "").strip()
+            content = str(getattr(m, "content", "") or "").strip() or extract_reasoning(m)
             if t in {"ai", "assistant"} and content:
                 thinking.append(content)
 
-        # Record last-call world time for future reminders
-        if context and context.get("world_time"):
-            self._meta.set_last_call_time(str(context["world_time"]))
+        # Record that this invocation happened, in world time and in ticks. The
+        # interval fallback and the reminder above are both measured from it, and
+        # it is recorded here so every caller counts the same way.
+        from engine.agent_schedule import record_call
+        record_call("gm")
 
-        # Update news digest marker on successful invocation
-        exit_tool = result.get("exit_tool")
-        if exit_tool in ("close_invocation", "invoke_self_gm", "answer_lore_question_gm"):
-            if ctx.last_digest_event_id:
-                self._meta.set_last_seen_event_id(ctx.last_digest_event_id)
+        # A self-invocation names the reason it asked to be woken again, and an
+        # answer names what the invocation ended on; a wake that closed carries
+        # nothing of its own beyond its thinking and what it wrote.
+        exit_tool = str(result.get("exit_tool") or "")
+        exit_args = result.get("exit_args") or {}
+        if self._history_path:
+            if exit_tool == "invoke_self_gm":
+                comment = str(exit_args.get("comment") or "").strip()
+                if comment:
+                    own_memory.record(f"[invoke_self] {comment}")
+            elif exit_tool == "answer_lore_question":
+                # What the invocation ended on. The memory keeps the question it
+                # was woken with and the deliberation that led to the answer; left
+                # unrecorded, the one thing it established is what it loses, and
+                # the next wake reads its own past as an answer nobody gave.
+                answer = str(exit_args.get("content") or "").strip()
+                if answer:
+                    own_memory.record(f"[answer]\n{answer}")
+            # The termination tool ended the wake: the branch closes with it, and
+            # what it kept is merged into the thread.
+            own_memory.close_branch()
 
         # Summarization triggers (every 10 invocations, every 10 paragraphs)
         inv_count = self._meta.increment_invocation()
@@ -338,11 +429,63 @@ class GameMaster:
         if para_count > 0 and para_count % 10 == 0 and inv_count % 10 != 0:
             self._run_arc_summary()
 
+        # The trims that just ran dropped the oldest records — and those records
+        # are still in this invocation's own context. So the paragraph carrying
+        # them forward is written from here, where they can be pointed at, before
+        # the next call opens on a history that begins mid-story.
+        self._cover_retired_history(history_msgs, persistent)
+
         return {
             "exit_tool": result.get("exit_tool"),
             "exit_args": result.get("exit_args"),
             "thinking": "\n\n".join(thinking),
         }
+
+    def _cover_retired_history(self, history_msgs, pinned) -> None:
+        """Turn what a trim dropped into a paragraph, while it is still in context.
+
+        ``history_msgs`` is the history as this invocation saw it, ``pinned`` the
+        blocks above it. The retirement request reuses both, so its prefix is the
+        one this invocation already paid for; only the task at its end is new.
+        """
+        if not self._history_path:
+            return
+        try:
+            from engine.history_retirement import dropped_from, pending_retirement, retire
+            from world.agent_story import append_paragraph
+
+            fell_out = dropped_from(self._history_path, history_msgs)
+            if not fell_out and not pending_retirement(self._history_path):
+                return
+
+            root = self._history_path.parent
+
+            def _write(name, summary):
+                append_paragraph(
+                    summaries_path=root / "gm_summaries.json",
+                    story_path=root / "gm_story.json",
+                    name=name or "Summary",
+                    summary=summary,
+                )
+
+            if retire(
+                self._history_path,
+                dropped=fell_out,
+                prefix=list(pinned or []),
+                history_messages=history_msgs,
+                prompt_text=self._prompt_text,
+                temperature=self._temperature,
+                scope="game_master",
+                write=_write,
+                kind="paragraph",
+                label="gm_history_retirement",
+            ):
+                self._meta.append_entry("auto_injection", "[gm_history_retirement]")
+                if logs_enabled():
+                    print("[trace] GM covered retired history")
+        except Exception as e:
+            if logs_enabled():
+                print(f"[trace] GM history retirement failed: {e}")
 
     def _run_summarization(self) -> None:
         """Run GM story summarization (every 10 invocations).

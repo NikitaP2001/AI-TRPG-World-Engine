@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
 from memory_store import load_history
+from record_voice import spoken
 from openrouter_llm import build_openrouter_chat_llm, openrouter_logging_callbacks
 from engine.history_meta import HistoryMeta
 
@@ -91,6 +92,7 @@ class SummaryRunner:
         label: str = "summary",
         extra_pinned: Optional[List[SystemMessage]] = None,
         extra_history: Optional[List[BaseMessage]] = None,
+        history_override: Optional[List[BaseMessage]] = None,
     ) -> Optional[Tuple[Optional[str], str]]:
         """Run a free-text summarization.
 
@@ -106,9 +108,15 @@ class SummaryRunner:
             label: Logging label.
             extra_pinned: Extra SystemMessages to inject (e.g. pinned summaries).
             extra_history: Extra messages appended after history (for retry corrections).
+            history_override: The history to summarise, in place of the file. Used
+                when the material being summarised is no longer in the file — a
+                history that was just retired, for instance — but the request
+                should still carry the same prefix the agent saw.
         """
         llm = self._build_llm(title_suffix, max_tokens)
-        messages = self._build_messages(task_prompt, extra_pinned, extra_history)
+        messages = self._build_messages(
+            task_prompt, extra_pinned, extra_history, history_override,
+        )
 
         callbacks = openrouter_logging_callbacks(scope=self._scope, label=label)
         try:
@@ -145,6 +153,7 @@ class SummaryRunner:
             title_suffix=title_suffix,
             max_tokens=max_tokens,
             parallel_tool_calls=False,
+            thinking=False,  # compression with an explicit length, not deliberation
         )
 
     def _load_history_msgs(self) -> List[BaseMessage]:
@@ -153,11 +162,12 @@ class SummaryRunner:
             history = load_history(self._history_path)
             for h in history:
                 role = (h.get("role") or "").strip().lower()
-                content = str(h.get("content") or "")
-                if role == "user":
-                    msgs.append(HumanMessage(content=content))
-                elif role == "assistant":
-                    msgs.append(AIMessage(content=content))
+                # The same voice the agent reads its own memory in: a summary
+                # written from bracketed records carries the brackets into
+                # everything it feeds.
+                said = spoken(str(h.get("content") or ""))
+                if role in ("user", "assistant") and said.strip():
+                    msgs.append(HumanMessage(content=said))
         return msgs
 
     def _build_messages(
@@ -165,13 +175,14 @@ class SummaryRunner:
         task_prompt: str,
         extra_pinned: Optional[List[SystemMessage]] = None,
         extra_history: Optional[List[BaseMessage]] = None,
+        history_override: Optional[List[BaseMessage]] = None,
     ) -> List[BaseMessage]:
         msgs: List[BaseMessage] = [
             SystemMessage(content=self._prompt_text),
         ]
         if extra_pinned:
             msgs.extend(extra_pinned)
-        msgs.extend(self._load_history_msgs())
+        msgs.extend(history_override if history_override is not None else self._load_history_msgs())
         if extra_history:
             msgs.extend(extra_history)
         msgs.append(HumanMessage(content=task_prompt))

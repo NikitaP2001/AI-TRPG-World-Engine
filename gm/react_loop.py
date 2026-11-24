@@ -10,6 +10,31 @@ from typing import Any, Callable, Dict, List, Optional
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
+from openrouter_llm import extract_reasoning
+from engine.change_summary import tool_failed
+from engine.tool_errors import tool_failure
+
+
+def _confirmation_line(name: str, result: Any) -> str:
+    """What a successful write says it did, in the result's own word for it.
+
+    The written thing is named: a record that says only that something was
+    created is the same record for every creation, and two of them in one wake
+    are one record to a reader who needs to know both happened.
+    """
+    subject = ""
+    operation = ""
+    if isinstance(result, dict):
+        subject = str(result.get("entity_id") or result.get("event_id")
+                      or result.get("effect_id") or result.get("id") or "").strip()
+        operation = str(result.get("operation") or result.get("status") or "").strip()
+        if not operation or operation == "error":
+            changed = result.get("mutations_applied")
+            if isinstance(changed, (list, tuple)) and changed:
+                operation = "changed " + ", ".join(str(c) for c in changed)
+    named = f" {subject}:" if subject else ""
+    return f"[tool:{name}]{named} {operation or 'wrote data'}"
+
 
 def coerce_tool_calls(tool_calls: Any) -> List[Dict[str, Any]]:
     """Return LangChain-style tool calls with safe defaults.
@@ -70,22 +95,24 @@ def sanitize_messages(messages: List[BaseMessage]) -> List[BaseMessage]:
 
         if t in {"ai", "assistant"}:
             content = str(getattr(m, "content", "") or "")
+            ak = getattr(m, "additional_kwargs", None) or {}
+            reasoning = str(ak.get("reasoning_content") or "") if isinstance(ak, dict) else ""
             raw_calls = getattr(m, "tool_calls", None)
-            if not raw_calls:
-                ak = getattr(m, "additional_kwargs", None) or {}
-                if isinstance(ak, dict):
-                    raw_calls = ak.get("tool_calls")
+            if not raw_calls and isinstance(ak, dict):
+                raw_calls = ak.get("tool_calls")
             safe_calls = coerce_tool_calls(raw_calls)
-            if safe_calls:
-                id_calls = [tc for tc in safe_calls if str(tc.get("id") or "").strip()]
-                if id_calls:
-                    for tc in id_calls:
-                        open_tool_ids.add(str(tc.get("id") or "").strip())
-                    out.append(AIMessage(content=content, tool_calls=id_calls))
-                else:
-                    out.append(AIMessage(content=content))
+            id_calls = [tc for tc in safe_calls if str(tc.get("id") or "").strip()]
+            if id_calls:
+                for tc in id_calls:
+                    open_tool_ids.add(str(tc.get("id") or "").strip())
+                rebuilt = AIMessage(content=content, tool_calls=id_calls)
             else:
-                out.append(AIMessage(content=content))
+                rebuilt = AIMessage(content=content)
+            # The backend requires the reasoning of a message it is continuing, so a
+            # rebuild must not drop it.
+            if reasoning:
+                rebuilt.additional_kwargs = {"reasoning_content": reasoning}
+            out.append(rebuilt)
             continue
 
         if t == "tool":
@@ -117,7 +144,11 @@ def sanitize_messages(messages: List[BaseMessage]) -> List[BaseMessage]:
                 if any(str(c.get("id") or "").strip() in open_tool_ids for c in tc):
                     content = str(getattr(m, "content", "") or "").strip()
                     if content:
-                        fixed.append(AIMessage(content=content))
+                        kept = AIMessage(content=content)
+                        ak = getattr(m, "additional_kwargs", None) or {}
+                        if isinstance(ak, dict) and ak.get("reasoning_content"):
+                            kept.additional_kwargs = {"reasoning_content": ak["reasoning_content"]}
+                        fixed.append(kept)
                     continue
             fixed.append(m)
         return fixed
@@ -131,7 +162,7 @@ def _replace_pinned_messages(
 ) -> None:
     """Replace existing pinned SystemMessages with fresh ones in-place.
 
-    Matches by content prefix (e.g. "[storage_notice]"). Any SystemMessage
+    Matches by content prefix (e.g. "## Storage Notice"). Any SystemMessage
     whose content starts with the same prefix as a fresh message gets replaced.
     Fresh messages without a match are appended.
     """
@@ -162,6 +193,7 @@ def react_loop_iteration(
     readonly_tools: set[str],
     max_iterations: int = 50,
     pinned_refresh_fn: Optional[Callable[[], List[SystemMessage]]] = None,
+    changes: Optional[Any] = None,
 ) -> dict:
     """Run a ReAct loop that stops on termination tools or context changes.
 
@@ -177,6 +209,8 @@ def react_loop_iteration(
             pinned messages (e.g. storage notice) after each iteration. Called only
             when at least one non-readonly tool was executed. Returned messages
             replace any existing SystemMessages with matching content prefixes.
+        changes: Optional collector that notes what each executed tool changed, so
+            the invocation can be reported to the other agent in outline.
 
     Returns:
         dict with keys: "messages" (updated history), "exit_tool" (name of termination
@@ -198,10 +232,15 @@ def react_loop_iteration(
             break
 
         content_text = str(getattr(response, "content", "") or "").strip()
+        reasoning_text = extract_reasoning(response)
         tool_calls = coerce_tool_calls(getattr(response, "tool_calls", None) or [])
 
-        # Capture thinking: text output is the agent's reasoning
+        # The reasoning belongs to the message, not to a summary of it: the backend
+        # requires it back on every request that continues this turn, so it travels in
+        # the field the provider expects instead of being folded into the text.
         msg = AIMessage(content=content_text)
+        if reasoning_text:
+            msg.additional_kwargs = {"reasoning_content": reasoning_text}
         if tool_calls:
             # tool_calls must be carried forward so sanitize_messages
             # can match ToolMessage IDs and preserve tool results.
@@ -231,12 +270,15 @@ def react_loop_iteration(
 
             tool_fn = tools_by_name.get(name)
             if not tool_fn:
-                result = f"Error: Tool '{name}' not found"
+                result = f"ERROR: Tool '{name}' not found"
             else:
                 try:
                     result = tool_fn.invoke(args)
                 except Exception as e:
-                    result = f"Error: {e}"
+                    result = tool_failure(name, e)
+
+            if changes is not None:
+                changes.record(name, args, result)
 
             messages.append(ToolMessage(content=str(result), tool_call_id=tc_id, name=name))
 
@@ -252,12 +294,17 @@ def react_loop_iteration(
                     exit_tool = name
                     exit_args = args
 
-            if name not in readonly_tools and name not in termination_tools:
-                write_confirmations.append(f"[tool:{name}] wrote data")
+            # A confirmation is a record that something was written, so it is made
+            # only for a call that actually wrote: a tool that does not exist, a
+            # refused write and a read all changed nothing.
+            if (name not in readonly_tools and name not in termination_tools
+                    and not tool_failed(result)):
+                write_confirmations.append(_confirmation_line(name, result))
 
-        # Write confirmation for non-termination mutations
+        # Write confirmation for non-termination mutations. It is a record of what
+        # was written, not a turn the model took, so it is entered as a record.
         if write_confirmations:
-            messages.append(AIMessage(content="\n".join(write_confirmations)))
+            messages.append(HumanMessage(content="[written]\n" + "\n".join(write_confirmations)))
 
         # Refresh pinned messages after mutation (e.g. storage notice)
         if write_confirmations and pinned_refresh_fn:

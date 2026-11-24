@@ -4,9 +4,9 @@ Previously routed between JsonFileBackend and CharacterFileBackend.
 CharacterFileBackend has been removed — all entities (including player
 mechanical data) now go through the single JsonFileBackend path.
 
-Player-specific files (description.json, metadata.json, memory.json,
-messages.json) remain on disk under game/players/{name}/ — the entity
-store only contains mechanical data (gurps, stats, state, skills, etc.).
+Player-specific files (description.json, memory.json, messages.json) remain
+on disk under game/players/{name}/ — the entity store only contains mechanical
+data (gurps, stats, state, skills, etc.).
 """
 from __future__ import annotations
 
@@ -39,6 +39,9 @@ class CompositeBackend(EntityBackend):
     def query(self, **kwargs) -> List[Dict[str, Any]]:
         return self._json.query(**kwargs)
 
+    def query_page(self, **kwargs) -> Dict[str, Any]:
+        return self._json.query_page(**kwargs)
+
     def delete(self, id: str, reason: str = "") -> Dict[str, Any]:
         return self._json.delete(id, reason)
 
@@ -56,12 +59,6 @@ class CompositeBackend(EntityBackend):
 
     def remove_effect(self, entity_id: str, effect_id: str) -> Dict[str, Any]:
         return self._json.remove_effect(entity_id, effect_id)
-
-    def attach_script(self, entity_id: str, **kwargs) -> Dict[str, Any]:
-        return self._json.attach_script(entity_id, **kwargs)
-
-    def detach_script(self, entity_id: str, script_id: str) -> Dict[str, Any]:
-        return self._json.detach_script(entity_id, script_id)
 
     def validate_facts(self, facts: str, entity_id: str = "") -> List[str]:
         from world_manager.entity_validation import validate_facts as _vfacts

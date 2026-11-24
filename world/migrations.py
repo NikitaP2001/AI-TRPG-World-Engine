@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -7,69 +8,125 @@ from .io import _read_json, _write_json
 from .time import WorldDuration, WorldTime
 
 
-def _latest_character_last_acted_from_story(*, story_json: Path) -> Dict[str, str]:
-    """Best-effort map of character -> latest end_time found in story turns."""
+def _read_records(path: Path) -> List[Dict[str, Any]]:
+    """A memory file as the list of records it is; empty when it is anything else.
 
-    out: Dict[str, str] = {}
+    ``_read_json`` answers a mapping, and an agent's memory is a list — reading it
+    with the wrong shape would silently say "nothing was ever told".
+    """
+    try:
+        with Path(path).open(encoding="utf-8") as handle:
+            rows = json.load(handle)
+    except Exception:
+        return []
+    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+
+def migrate_world_initialization_record(*, game_root: Path) -> None:
+    """Give a world built before the record existed the record it implies.
+
+    ``world/initialized.json`` is what tells a restarted process that the world's
+    startup step is behind it. Worlds built by an earlier version left no such
+    record, and without this they would be built a second time on the next start.
+
+    The record is written only on evidence that the world was in fact built: a
+    world setting, entities in the store, and a startup call in an agent's own
+    history. A world that is merely starting satisfies none of these.
+    """
+    root = Path(game_root)
+    marker = root / "world" / "initialized.json"
+    if marker.exists():
+        return
+    if not (root / "world_setting.json").exists():
+        return
 
     try:
-        arcs = _read_json(story_json)
+        raw = _read_json(root / "entity_store" / "entities.json")
     except Exception:
-        return out
+        return
+    store = raw.get("entities", raw) if isinstance(raw, dict) else {}
+    if not isinstance(store, dict) or not store:
+        return
 
-    if not isinstance(arcs, list) or not arcs or not isinstance(arcs[0], dict):
-        return out
-
-    arc0 = arcs[0]
-
-    def _consider_turn(turn: Any) -> None:
-        if not isinstance(turn, dict):
-            return
-
-        raw_end = str(turn.get("end_time") or "").strip()
-        if not raw_end:
-            return
-
+    startup_calls = (
+        (root / "world_master_messages.json", "[call_wm: initialize_world]"),
+        (root / "game_master_messages.json", "[call_gm: initialize]"),
+    )
+    built = False
+    for history, needle in startup_calls:
         try:
-            end_norm = WorldTime.parse(raw_end).to_string()
-            end_sec = WorldTime.parse(end_norm).to_seconds()
+            rows = _read_json(history)
         except Exception:
-            return
-
-        chars = turn.get("players")
-        if not isinstance(chars, list):
-            return
-
-        for c in chars:
-            name = str(c or "").strip()
-            if not name:
-                continue
-
-            prev = str(out.get(name) or "").strip()
-            if not prev:
-                out[name] = end_norm
-                continue
-
-            try:
-                if end_sec > WorldTime.parse(prev).to_seconds():
-                    out[name] = end_norm
-            except Exception:
-                out[name] = end_norm
-
-    paragraphs = arc0.get("paragraphs") if isinstance(arc0.get("paragraphs"), list) else []
-    for p in paragraphs:
-        if not isinstance(p, dict):
             continue
-        turns = p.get("turns") if isinstance(p.get("turns"), list) else []
-        for t in turns:
-            _consider_turn(t)
+        if isinstance(rows, list) and any(needle in str(r.get("content") or "") for r in rows):
+            built = True
+            break
+    if not built:
+        return
 
-    ongoing = arc0.get("ongoing_paragraph") if isinstance(arc0.get("ongoing_paragraph"), dict) else {}
-    ongoing_turns = ongoing.get("turns") if isinstance(ongoing.get("turns"), list) else []
-    for t in ongoing_turns:
-        _consider_turn(t)
+    payload: Dict[str, Any] = {"migrated": True}
+    try:
+        info = _read_json(root / "world" / "info.json")
+        if isinstance(info, dict) and info.get("time"):
+            payload["world_time"] = str(info["time"])
+    except Exception:
+        pass
+    payload["entities"] = len(store)
+    try:
+        _write_json(marker, payload)
+    except Exception:
+        pass
 
-    return out
+
+def migrate_world_awareness_record(*, game_root: Path) -> None:
+    """Give a world opened before the record existed the record it implies.
+
+    ``world/awareness.json`` is what tells a restarted process that the world's
+    characters have already been given their opening, so a session that follows
+    does not tell them where they stand a second time. Worlds opened by an earlier
+    version left no such record, and without this they would be opened again on
+    the next start.
+
+    The record is written only on evidence that the opening was in fact given:
+    something was told to a character and stands in his memory, or the scene
+    manager holds a perception of its own. A world that is merely starting has
+    neither.
+    """
+    root = Path(game_root)
+    marker = root / "world" / "awareness.json"
+    if marker.exists():
+        return
+
+    def _told() -> bool:
+        players = root / "players"
+        if players.is_dir():
+            for entry in sorted(players.iterdir()):
+                rows = _read_records(entry / "messages.json")
+                if any("[account]" in str(r.get("content") or "") for r in rows):
+                    return True
+        rows = _read_records(root / "scene_manager_messages.json")
+        return any("[perception →" in str(r.get("content") or "") for r in rows)
+
+    if not _told():
+        return
+
+    payload: Dict[str, Any] = {"migrated": True}
+    try:
+        info = _read_json(root / "world" / "info.json")
+        if isinstance(info, dict) and info.get("time"):
+            payload["world_time"] = str(info["time"])
+    except Exception:
+        pass
+    try:
+        payload["characters"] = sorted(
+            p.name for p in (root / "players").iterdir() if p.is_dir()
+        )
+    except Exception:
+        pass
+    try:
+        _write_json(marker, payload)
+    except Exception:
+        pass
 
 
 def migrate_scene_turn_duration(*, scene_json: Path) -> None:
@@ -78,7 +135,6 @@ def migrate_scene_turn_duration(*, scene_json: Path) -> None:
     Legacy: turn_duration_minutes
     Current: turn_duration (WorldDuration string)
     """
-
     try:
         scene = _read_json(scene_json)
     except Exception:
@@ -133,7 +189,8 @@ def ensure_character_description_fields(*, game_root: Path) -> None:
         if "location" not in data:
             data["location"] = ""  # empty = unspecified
             changed = True
-        # NOTE: last_acted is stored in metadata.json (auto-updated by runtime), not description.json.
+        # Debris from a field the framework no longer keeps: what a character
+        # last acted is not part of the world model any more.
         if "last_acted" in data:
             data.pop("last_acted", None)
             changed = True
@@ -149,8 +206,9 @@ def ensure_character_description_fields(*, game_root: Path) -> None:
                 data.pop(redundant_field, None)
                 changed = True
 
-        # Strip location from description.json — it lives in metadata.json now.
-        # Location in description.json is only a narrative starting hint, not authoritative.
+        # Strip location from description.json — the entity store is the only
+        # place a position is authoritative. Location in description.json is
+        # only a narrative starting hint.
         if "location" in data and data["location"]:
             data.pop("location", None)
             changed = True
@@ -197,144 +255,6 @@ def ensure_character_description_fields(*, game_root: Path) -> None:
         if not mem_path.exists():
             try:
                 _write_json(mem_path, [])
-            except Exception:
-                pass
-
-
-def ensure_character_metadata_fields(*, game_root: Path) -> None:
-    """Ensure required keys exist in each character's metadata.json.
-
-    metadata.json is reserved for auto-updated runtime fields that should not be
-    directly edited by the LLM (e.g., last_acted).
-    """
-
-    chars_dir = (game_root / "players").resolve()
-    if not chars_dir.exists():
-        return
-
-    names = sorted([p.name for p in chars_dir.iterdir() if p.is_dir()], key=str.lower)
-    story_fallback = _latest_character_last_acted_from_story(story_json=(game_root / "world" / "story.json").resolve())
-
-    for name in names:
-        meta_path = (chars_dir / name / "metadata.json").resolve()
-
-        try:
-            data = _read_json(meta_path) if meta_path.exists() else {}
-        except Exception:
-            data = {}
-
-        if not isinstance(data, dict):
-            data = {}
-
-        changed = False
-
-        raw = str(data.get("last_acted") or "").strip()
-        if not raw:
-            recovered = str(story_fallback.get(name) or "").strip()
-            data["last_acted"] = recovered if recovered else "never"
-            changed = True
-        elif raw.lower() == "never":
-            recovered = str(story_fallback.get(name) or "").strip()
-            if recovered:
-                data["last_acted"] = recovered
-                changed = True
-        else:
-            try:
-                normalized = WorldTime.parse(raw).to_string()
-                if normalized != raw:
-                    data["last_acted"] = normalized
-                    changed = True
-            except Exception:
-                recovered = str(story_fallback.get(name) or "").strip()
-                data["last_acted"] = recovered if recovered else "never"
-                changed = True
-
-        if changed or not meta_path.exists():
-            try:
-                _write_json(meta_path, data)
-            except Exception:
-                pass
-
-
-def migrate_character_last_acted_to_metadata(*, game_root: Path) -> None:
-    """Move last_acted from description.json into metadata.json (one-time migration).
-
-    Keeps reads backward-compatible by copying the value if present, then removing
-    it from description.json.
-    """
-
-    chars_dir = (game_root / "players").resolve()
-    if not chars_dir.exists():
-        return
-
-    names = sorted([p.name for p in chars_dir.iterdir() if p.is_dir()], key=str.lower)
-    story_fallback = _latest_character_last_acted_from_story(story_json=(game_root / "world" / "story.json").resolve())
-
-    for name in names:
-        desc_path = (chars_dir / name / "description.json").resolve()
-        meta_path = (chars_dir / name / "metadata.json").resolve()
-
-        try:
-            desc = _read_json(desc_path) if desc_path.exists() else {}
-        except Exception:
-            desc = {}
-        if not isinstance(desc, dict):
-            desc = {}
-
-        try:
-            meta = _read_json(meta_path) if meta_path.exists() else {}
-        except Exception:
-            meta = {}
-        if not isinstance(meta, dict):
-            meta = {}
-
-        migrated_val = str(desc.get("last_acted") or "").strip()
-        changed_desc = False
-        changed_meta = False
-
-        if migrated_val:
-            # Prefer explicit metadata if already present.
-            meta_existing = str(meta.get("last_acted") or "").strip()
-            if (not meta_existing) or meta_existing.lower() == "never":
-                meta["last_acted"] = migrated_val
-                changed_meta = True
-            desc.pop("last_acted", None)
-            changed_desc = True
-
-        # Ensure defaults exist.
-        meta_raw = str(meta.get("last_acted") or "").strip()
-        if not meta_raw:
-            recovered = str(story_fallback.get(name) or "").strip()
-            meta["last_acted"] = recovered if recovered else "never"
-            changed_meta = True
-        elif meta_raw.lower() == "never":
-            recovered = str(story_fallback.get(name) or "").strip()
-            if recovered:
-                meta["last_acted"] = recovered
-                changed_meta = True
-        else:
-            try:
-                normalized = WorldTime.parse(meta_raw).to_string()
-                if normalized != meta_raw:
-                    meta["last_acted"] = normalized
-                    changed_meta = True
-            except Exception:
-                recovered = str(story_fallback.get(name) or "").strip()
-                meta["last_acted"] = recovered if recovered else "never"
-                changed_meta = True
-
-        if "last_acted" not in meta:
-            meta["last_acted"] = "never"
-            changed_meta = True
-
-        if changed_meta:
-            try:
-                _write_json(meta_path, meta)
-            except Exception:
-                pass
-        if changed_desc:
-            try:
-                _write_json(desc_path, desc)
             except Exception:
                 pass
 

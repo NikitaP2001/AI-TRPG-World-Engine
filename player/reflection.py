@@ -21,8 +21,9 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 
 from memory_store import load_history
+from record_voice import spoken
 from openrouter_langchain_logging import logs_enabled, enable_direct_text_abort, disable_direct_text_abort
-from openrouter_llm import build_openrouter_chat_llm, openrouter_logging_callbacks, read_prompt_text
+from openrouter_llm import bind_agent_tools, build_openrouter_chat_llm, openrouter_logging_callbacks, read_prompt_text
 from engine.summarizer import SummaryRunner
 from world.io import _read_json as _locked_read_json, _write_json as _locked_write_json
 
@@ -32,7 +33,6 @@ from world.io import _read_json as _locked_read_json, _write_json as _locked_wri
 # ---------------------------------------------------------------------------
 
 DEFAULT_REFLECTION_INTERVAL = 5  # every N memory entries
-RECENT_THOUGHTS_COUNT = 10  # last N thought entries to inject
 MAX_RELATIONSHIPS = 12
 MAX_GOALS = 8
 MAX_BELIEFS = 20
@@ -201,11 +201,15 @@ def _has_nonempty_reflection_content(value: Any) -> bool:
 def character_reflection(
     reflection_text: str,
 ) -> str:
-    """Write your current self-reflection.
+    """Record what you have come to understand about yourself.
 
-    A single paragraph capturing your emotional state, active drives,
-    inner conflicts, and recent realizations. MAX 200 words.
-    Be honest and introspective — this is your private inner monologue.
+    The inner account, not the outer one: your present state of mind, what
+    drives you, what is unresolved in you, what you have recently understood.
+    A single paragraph, held to what matters most.
+
+    Args:
+        reflection_text: The reflection itself, as you would put it to
+            yourself alone.
     """
     return json.dumps(
         {"reflection": str(reflection_text or "").strip()},
@@ -221,15 +225,17 @@ def relationship_update(
     attitude: str,
     observation: str,
 ) -> str:
-    """Record or update your impression of a character or NPC you interacted with.
+    """Record how you now see someone you have dealt with.
 
-    Call this after a meaningful interaction to save your current view.
+    Each call adds your present view to what you already hold about them, so
+    the relationship accumulates rather than being overwritten. Worth calling
+    after an exchange that changed something between you.
 
     Args:
-        entity: Name of the character or NPC.
-        nature: Role type — e.g. ally, enemy, superior, subordinate, stranger, lover.
-        attitude: Emotional stance — e.g. trusting, suspicious, fearful, admiring, contemptuous.
-        observation: What you noticed or felt this time (max 200 chars).
+        entity: The one this concerns, by name.
+        nature: What they are to you — the place they hold in your life.
+        attitude: How you feel about them at this moment.
+        observation: What you noticed or felt this time, in a sentence.
     """
     _upsert_single_relationship(
         character_name="",
@@ -243,10 +249,13 @@ def relationship_update(
 
 @tool
 def relationship_read(name: str) -> str:
-    """Recall your memories about a specific character or NPC.
+    """Bring back what you hold about one person.
+
+    Your own accumulated view of them, as it has formed across your dealings —
+    not what the world records about them.
 
     Args:
-        name: The name of the character or NPC to recall.
+        name: The one to recall, by name.
     """
     return _format_relationship_memory(name)
 
@@ -404,37 +413,6 @@ def needs_reflection(character_name: str) -> bool:
     reflection_is_stale = (entry_count - last_reflection_entry_count) >= interval
     diary_is_stale = (entry_count - last_diary_entry_count) >= interval
     return reflection_is_stale or diary_is_stale
-
-
-# ---------------------------------------------------------------------------
-# Gather recent thoughts
-# ---------------------------------------------------------------------------
-
-def _gather_recent_thoughts(character_name: str, n: int = RECENT_THOUGHTS_COUNT) -> List[str]:
-    """Extract the last N thought strings from memory.json."""
-    p = _character_dir(character_name) / "memory.json"
-    data = _read_json(p)
-    if not isinstance(data, list):
-        return []
-
-    thoughts: List[str] = []
-    for entry in reversed(data):
-        if not isinstance(entry, dict):
-            continue
-        # Collect from 'thoughts' list
-        entry_thoughts = entry.get("thoughts")
-        if isinstance(entry_thoughts, list):
-            for t in reversed(entry_thoughts):
-                s = str(t or "").strip()
-                if s:
-                    thoughts.append(s)
-                    if len(thoughts) >= n:
-                        break
-        if len(thoughts) >= n:
-            break
-
-    thoughts.reverse()
-    return thoughts[-n:]
 
 
 # ---------------------------------------------------------------------------
@@ -674,11 +652,7 @@ def run_reflection(
     # 2. Load reflection task template
     reflection_task = read_prompt_text("agents/character_agent/reflection_task.txt")
 
-    # 3. Gather recent thoughts
-    recent_thoughts = _gather_recent_thoughts(character_name)
-    thoughts_text = "\n".join(f"- {t}" for t in recent_thoughts) if recent_thoughts else "(no recent thoughts recorded)"
-
-    # 4. Load current reflection (if any)
+    # 3. Load current reflection (if any)
     current = load_reflection(character_name)
     if current:
         # Strip internal meta before showing to character
@@ -694,7 +668,7 @@ def run_reflection(
         recently_met_names = []
 
     # 5b. Fill template
-    task_text = reflection_task.replace("{recent_thoughts}", thoughts_text).replace("{current_reflection}", current_text)
+    task_text = reflection_task.replace("{current_reflection}", current_text)
 
     if recently_met_names:
         recently_met_note = "Recently encountered characters/NPCs (last few turns): " + ", ".join(recently_met_names)
@@ -710,11 +684,11 @@ def run_reflection(
         msgs = []
         for h in history:
             role = (h.get("role") or "").strip().lower()
-            content = str(h.get("content") or "")
-            if role == "user":
-                msgs.append(HumanMessage(content=content))
-            elif role == "assistant":
-                msgs.append(AIMessage(content=content))
+            said = spoken(str(h.get("content") or ""))
+            if role == "user" and said.strip():
+                msgs.append(HumanMessage(content=said))
+            elif role == "assistant" and said.strip():
+                msgs.append(AIMessage(content=said))
         return msgs
 
     # Include some history for tone/personality continuity (last few exchanges)
@@ -745,17 +719,17 @@ def run_reflection(
         streaming=True,
         max_tokens=1500,
         title_suffix=f"-reflection-{safe_name}",
+        thinking=False,  # this phase forces its tool, which reasoning cannot share
     )
 
     callbacks = openrouter_logging_callbacks(scope="reflection", label=safe_name)
 
-    try:
-        bound_llm = llm.bind_tools(
-            [character_reflection],
-            tool_choice={"type": "function", "function": {"name": "character_reflection"}},
-        ).with_config({"callbacks": callbacks})
-    except TypeError:
-        bound_llm = llm.bind_tools([character_reflection]).with_config({"callbacks": callbacks})
+    bound_llm = bind_agent_tools(
+        llm,
+        [character_reflection],
+        callbacks=callbacks,
+        tool_choice={"type": "function", "function": {"name": "character_reflection"}},
+    )
 
     # 8. Invoke with retries
     max_attempts = 3
@@ -897,8 +871,9 @@ def run_reflection(
 #     {"summary": "..."},
 #     ...
 #   ],
-#   "arc_summaries": [                   # completed arc summaries
-#     {"summary": "..."},
+#   "arc_summaries": [                   # completed arc summaries; each keeps the
+#     {"summary": "...",                 # paragraphs it compressed, so nothing is
+#      "compressed": ["...", ...]},      # lost when paragraphs[] is cleared
 #     ...
 #   ]
 # }
@@ -906,9 +881,9 @@ def run_reflection(
 # Every reflection step, the character writes a new paragraph summarising
 # the last batch of turns from their own perspective.  After DIARY_ARC_SIZE
 # paragraphs, the oldest paragraphs are rolled into an arc summary (like
-# the world story mechanism), and those paragraphs are removed.
+# the world story mechanism): the arc replaces them in the context, and the
+# paragraphs it covers are kept inside the arc record.
 
-DIARY_MAX_PARAGRAPHS = 10
 DIARY_ARC_SIZE = 10  # roll into arc summary after this many paragraphs
 
 
@@ -999,6 +974,7 @@ def _roll_diary_arc_if_needed(character_name: str, diary: Dict[str, Any]) -> Non
             streaming=False,
             max_tokens=800,
             title_suffix=f"-diary-arc-{safe_name}",
+            thinking=False,  # compression with an explicit length, not deliberation
         )
         callbacks = openrouter_logging_callbacks(scope="diary_arc", label=safe_name)
 
@@ -1023,26 +999,94 @@ def _roll_diary_arc_if_needed(character_name: str, diary: Dict[str, Any]) -> Non
             print(f"[trace] diary arc summarization failed for {safe_name_c}: {e}")
         arc_text = combined
 
-    diary.setdefault("arc_summaries", []).append({"summary": arc_text})
+    # The arc replaces its paragraphs in the context; the paragraphs themselves are
+    # kept inside the arc record, so compressing them loses nothing.
+    diary.setdefault("arc_summaries", []).append({
+        "summary": arc_text,
+        "compressed": [
+            str(p.get("summary") or "").strip()
+            for p in paras
+            if isinstance(p, dict) and str(p.get("summary") or "").strip()
+        ],
+    })
     diary["paragraphs"] = []
 
     if logs_enabled():
         safe_name_c = _safe_name_for_logging(character_name)
-        print(f"[trace] diary arc rolled for {safe_name_c} ({len(paras)} paragraphs → arc)")
+        print(f"[trace] diary arc rolled for {safe_name_c} ({len(paras)} paragraphs -> arc)")
 
 
 @tool
 def write_diary_entry(summary: str) -> str:
-    """Write a diary entry summarizing your recent experiences.
-
-    Write a personal summary of what happened to you recently — events,
-    discoveries, conversations, feelings, lessons learned. This is YOUR
-    private diary. Include whatever you consider most valuable to remember.
+    """Write the entry that closes this stretch of your life.
 
     Args:
-        summary: Your diary entry text — a personal summary of recent events from your perspective.
+        summary: What happened to you, as you would tell it to yourself later:
+            the events that mattered, what you learned, what you felt about it.
+            It becomes part of the record your own summaries are written from,
+            so write it for a reader who was not there.
     """
     return json.dumps({"summary": str(summary or "").strip()}, ensure_ascii=False)
+
+
+def cover_retired_turns(
+    character_name: str,
+    messages_path: Path,
+    before: List[Dict[str, Any]],
+    prefix: Optional[List[Any]] = None,
+) -> bool:
+    """Cover turns a trim dropped from this character's own record.
+
+    The character's record is trimmed like any other, and what falls out is still
+    in ``before`` — the list the write started from — so the diary entry about
+    those turns is written from here, from that text, before it is gone.
+
+    ``prefix`` is the pinned blocks that sat above that record in the character's
+    own context; carrying them makes the request's prefix the one the character
+    already paid for.
+    """
+    from engine.history_retirement import dropped_from, pending_retirement, retire
+
+    try:
+        fell_out = dropped_from(messages_path, before)
+        if not fell_out and not pending_retirement(messages_path):
+            return False
+
+        diary = load_diary(character_name)
+        core_prompt = read_prompt_text("agents/character_agent/prompt.txt").replace(
+            "{name}", str(character_name or "")
+        )
+
+        def _write(name, summary):
+            diary.setdefault("paragraphs", []).append({"summary": summary})
+            _roll_diary_arc_if_needed(character_name, diary)
+            diary["_meta"] = {
+                "character": character_name,
+                "entry_count": count_memory_entries(character_name),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            _save_diary(character_name, diary)
+
+        ok = retire(
+            messages_path,
+            dropped=fell_out,
+            prefix=list(prefix or []),
+            history_messages=before,
+            prompt_text=core_prompt,
+            temperature=0.7,
+            scope="diary",
+            write=_write,
+            kind="diary",
+            label="diary_history_retirement",
+            max_tokens=800,
+        )
+        if ok and logs_enabled():
+            print(f"[trace] diary covered retired turns for {_safe_name_for_logging(character_name)}")
+        return ok
+    except Exception as e:
+        if logs_enabled():
+            print(f"[trace] diary retirement failed for {character_name}: {e}")
+        return False
 
 
 def _run_diary_summary(*, character_name: str, messages_path: Path) -> None:
@@ -1072,11 +1116,11 @@ def _run_diary_summary(*, character_name: str, messages_path: Path) -> None:
         msgs = []
         for h in hist:
             role = (h.get("role") or "").strip().lower()
-            content = str(h.get("content") or "")
-            if role == "user":
-                msgs.append(HumanMessage(content=content))
-            elif role == "assistant":
-                msgs.append(AIMessage(content=content))
+            said = spoken(str(h.get("content") or ""))
+            if role == "user" and said.strip():
+                msgs.append(HumanMessage(content=said))
+            elif role == "assistant" and said.strip():
+                msgs.append(AIMessage(content=said))
         return msgs
 
     # Load existing diary for context

@@ -1,7 +1,8 @@
 """Abstract base class for entity backends.
 
 Defines the contract that every storage backend must implement.
-Two implementations: JsonFileBackend (entity_store) and CharacterFileBackend (character files).
+Two implementations: JsonFileBackend (game/entity_store/entities.json) and
+CompositeBackend (a thin pass-through to it).
 """
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ class EntityBackend(ABC):
     
     Two implementations:
       - JsonFileBackend: reads/writes game/entity_store/entities.json
-      - CharacterFileBackend: reads/writes game/characters/{name}/*.json
+      - CompositeBackend: thin pass-through to JsonFileBackend
     """
 
     @abstractmethod
@@ -67,6 +68,18 @@ class EntityBackend(ABC):
         ...
 
     @abstractmethod
+    def query_page(self, type_filter: str = "", base_type: str = "",
+                   tags: Optional[List[str]] = None,
+                   position: Optional[Dict[str, Any]] = None,
+                   radius: float = -1.0,
+                   facts_search: str = "",
+                   include_templates: bool = False,
+                   limit: int = 10,
+                   offset: int = 0) -> Dict[str, Any]:
+        """Search entities and report the store, the match, and one slice of it."""
+        ...
+
+    @abstractmethod
     def delete(self, id: str, reason: str = "") -> Dict[str, Any]:
         """Soft-delete an entity."""
         ...
@@ -103,25 +116,13 @@ class EntityBackend(ABC):
     @abstractmethod
     def set_effect(self, entity_id: str, effect_id: str = "",
                    stat_deltas: Optional[Dict[str, Any]] = None,
-                   per_tick: bool = True,
-                   duration_ticks: int = -1,
-                   description: str = "",
-                   aura_radius: float = -1.0) -> Dict[str, Any]:
+                   period: int = 0,
+                   duration: int = 0,
+                   description: str = "") -> Dict[str, Any]:
         ...
 
     @abstractmethod
     def remove_effect(self, entity_id: str, effect_id: str) -> Dict[str, Any]:
-        ...
-
-    @abstractmethod
-    def attach_script(self, entity_id: str, script_id: str = "",
-                      trigger_type: str = "",
-                      trigger_params: Optional[Dict[str, Any]] = None,
-                      script: str = "", comment: str = "") -> Dict[str, Any]:
-        ...
-
-    @abstractmethod
-    def detach_script(self, entity_id: str, script_id: str) -> Dict[str, Any]:
         ...
 
     def validate_facts(self, facts: str, entity_id: str = "") -> List[str]:

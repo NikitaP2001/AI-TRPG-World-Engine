@@ -6,11 +6,9 @@ from world_manager.tool_registry import (
     query_entities,
     add_tags, remove_tags,
     set_effect, remove_effect,
-    attach_script, detach_script,
-    record_event, query_events,
+    create_event, query_events,
     invoke_self, close_invocation,
     delete_entity, write_correction,
-    read_tool_doc,
 )
 
 @tool

@@ -56,6 +56,20 @@ def parse_duration_seconds(text: Optional[str], *, default: int = 0) -> int:
     return value * _UNIT_SECONDS.get(unit, 1)
 
 
+def format_duration(seconds: int) -> str:
+    """A duration in the form this module reads: one number, one unit.
+
+    The inverse of ``parse_duration_seconds``, and as narrow as it is on
+    purpose: a compound shape ('1h30m') is one the reading side does not accept,
+    and a duration that cannot be read back is not one anybody can act on.
+    """
+    total = int(seconds or 0)
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if total and total % size == 0:
+            return f"{total // size}{unit}"
+    return f"{total}s"
+
+
 # ---------------------------------------------------------------------------
 # Intent
 # ---------------------------------------------------------------------------
@@ -77,14 +91,10 @@ class Intent:
     area: Optional[Dict[str, Any]] = None
     t_start: int = 0
     t_end: Optional[int] = None  # None = persistent subscription (§3.2)
-    is_hostile: bool = False
     visibility: str = "public"
-    detection_difficulty: Optional[int] = None
-    trigger_condition: Optional[Dict[str, Any]] = None
-    trigger_priority: int = 0
+    trigger_condition: Optional[Any] = None  # structural pattern, or the condition in words
     on_trigger: str = "interrupt_with_new_decision"
     prepared_reaction: Optional[Dict[str, Any]] = None
-    on_timeout: Optional[Dict[str, Any]] = None
     id: str = field(default_factory=new_intent_id)
     status: str = "active"  # active | completed | cancelled | resolved_by_trigger
     origin_cycle: int = 0
@@ -104,14 +114,10 @@ class Intent:
             "area": self.area,
             "t_start": self.t_start,
             "t_end": self.t_end,
-            "is_hostile": self.is_hostile,
             "visibility": self.visibility,
-            "detection_difficulty": self.detection_difficulty,
             "trigger_condition": self.trigger_condition,
-            "trigger_priority": self.trigger_priority,
             "on_trigger": self.on_trigger,
             "prepared_reaction": self.prepared_reaction,
-            "on_timeout": self.on_timeout,
             "status": self.status,
             "origin_cycle": self.origin_cycle,
             "absorption": self.absorption,
@@ -127,14 +133,10 @@ class Intent:
             area=d.get("area") or None,
             t_start=int(d.get("t_start") or 0),
             t_end=(int(d["t_end"]) if d.get("t_end") is not None else None),
-            is_hostile=bool(d.get("is_hostile") or False),
             visibility=str(d.get("visibility") or "public"),
-            detection_difficulty=(int(d["detection_difficulty"]) if d.get("detection_difficulty") is not None else None),
             trigger_condition=d.get("trigger_condition") or None,
-            trigger_priority=int(d.get("trigger_priority") or 0),
             on_trigger=str(d.get("on_trigger") or "interrupt_with_new_decision"),
             prepared_reaction=d.get("prepared_reaction") or None,
-            on_timeout=d.get("on_timeout") or None,
             id=str(d.get("id") or new_intent_id()),
             status=str(d.get("status") or "active"),
             origin_cycle=int(d.get("origin_cycle") or 0),
@@ -143,7 +145,7 @@ class Intent:
 
 
 def instantiate_sub_intent(spec: Dict[str, Any], *, actor: str, t_start: int) -> Intent:
-    """Build a new Intent from a ``prepared_reaction``/``on_timeout`` sub-schema."""
+    """Build a new Intent from a ``prepared_reaction`` sub-schema."""
     duration_raw = spec.get("duration") or spec.get("interval")
     t_end: Optional[int]
     if spec.get("persistent") or (isinstance(duration_raw, str) and not duration_raw.strip()):
@@ -161,14 +163,10 @@ def instantiate_sub_intent(spec: Dict[str, Any], *, actor: str, t_start: int) ->
         area=spec.get("area") or None,
         t_start=t_start,
         t_end=t_end,
-        is_hostile=bool(spec.get("is_hostile") or False),
         visibility=str(spec.get("visibility") or "public"),
-        detection_difficulty=spec.get("detection_difficulty"),
         trigger_condition=spec.get("trigger_condition") or None,
-        trigger_priority=int(spec.get("trigger_priority") or 0),
         on_trigger=str(spec.get("on_trigger") or "interrupt_with_new_decision"),
         prepared_reaction=spec.get("prepared_reaction") or None,
-        on_timeout=None,
         origin_cycle=0,
     )
 
@@ -186,13 +184,8 @@ def validate_schema(intent: Intent) -> List[str]:
         violations.append(f"unknown action_type '{at}'")
 
     if at == "cosmetic":
-        if intent.is_hostile:
-            violations.append("cosmetic intents may not set is_hostile=true")
         if intent.target == "area" or intent.area:
             violations.append("cosmetic intents may not target 'area'")
-
-    if at == "combat" and intent.visibility == "private" and intent.detection_difficulty is None:
-        violations.append("private combat intents require detection_difficulty")
 
     if at in ("speech", "movement") and intent.area:
         violations.append(f"{at} intents do not use 'area'")
@@ -219,7 +212,7 @@ class ResolvedEntry:
     target: str
     description: str
     visibility: str
-    kind: str  # action | prepared_reaction | timeout | schema_violation
+    kind: str  # action | prepared_reaction | schema_violation
     perceivers: List[str] = field(default_factory=list)
     note: str = ""
     intent_id: str = ""
@@ -267,7 +260,7 @@ def format_resolved_history_for_sm(entries: List[ResolvedEntry], base_sec: int) 
         span = f"+{rel_start}s" if rel_start == rel_end else f"+{rel_start}s..+{rel_end}s"
         tag = "" if e.kind == "action" else f" [{e.kind}]"
         vis = "" if e.visibility == "public" else " (private)"
-        line = f"  [{span}] {e.actor} {e.action_type} -> {e.target}{vis}{tag}: {e.description[:160]}"
+        line = f"  [{span}] {e.actor} {e.action_type} -> {e.target}{vis}{tag}: {e.description}"
         if e.note:
             line += f"  ({e.note})"
         lines.append(line)
@@ -319,6 +312,92 @@ def _structural_match(candidate: Intent, trigger_condition: Dict[str, Any], subs
     return True
 
 
+def is_active(intent: Intent, seg_start: int) -> bool:
+    """Whether an attempt is under way at the moment a segment begins.
+
+    An attempt with no span of its own is under way where it is made and is
+    settled by the segment that begins there; one that has run past its end has
+    settled already.
+    """
+    if intent.status in ("completed", "cancelled", "resolved_by_trigger"):
+        return False
+    if intent.t_start > seg_start:
+        return False
+    if intent.t_end is not None and intent.t_end < seg_start:
+        return False
+    return True
+
+
+@dataclass
+class Change:
+    """The nearest moment a pool of attempts changes, and what brings it about.
+
+    ``at`` is None when the pool changes nowhere at all. ``by`` names the
+    attempts whose own moment stands there — empty where the moment is time
+    being let forward rather than anything an attempt asked for.
+    """
+
+    at: Optional[int]
+    kind: str
+    by: Tuple[str, ...] = ()
+
+
+def nearest_change(intents: List[Intent], cursor: int, reach: int) -> Change:
+    """The nearest moment the pool changes, and what makes it that moment.
+
+    The pool changes where an attempt begins or ends. Where nothing does — an
+    actor standing watch that nothing ends — the only thing left to offer is the
+    point time is allowed to reach anyway, ``reach``: time let forward, not
+    anything asked for. A pool that changes nowhere and holds nothing active
+    changes nowhere at all, and says so with ``at = None``.
+
+    ``kind`` reads that moment in the engine's own terms: ``end`` where an
+    attempt reaches its end, ``start`` where one begins, ``both`` where one ends
+    at the moment another begins, ``pause`` where time is let forward, and
+    ``still`` where there is nothing to let it over.
+    """
+    near: Dict[int, List[Tuple[str, str]]] = {}
+    beyond = False
+    for i in intents:
+        if i.status in ("completed", "cancelled", "resolved_by_trigger"):
+            continue
+        ident = str(i.id or "")
+        for moment, kind in ((i.t_start, "start"), (i.t_end, "end")):
+            if moment is None or moment <= cursor:
+                continue
+            if moment > reach:
+                # Nothing of it falls inside the span time may reach: it is not
+                # what this pass is measured by.
+                beyond = True
+                continue
+            near.setdefault(int(moment), []).append((ident, kind))
+    if near:
+        at = min(near)
+        here = list(near[at])
+        settled = {ident for ident, kind in here if kind == "end"}
+        # An attempt that ends where it begins is settled there: that one moment
+        # is its end, not a beginning and an end at once.
+        here = [(ident, kind) for ident, kind in here
+                if not (kind == "start" and ident in settled)]
+        kinds = {kind for _ident, kind in here}
+        return Change(
+            at=at,
+            kind=next(iter(kinds)) if len(kinds) == 1 else "both",
+            by=tuple(sorted({ident for ident, _kind in here if ident})),
+        )
+    active = any(is_active(i, cursor) for i in intents)
+    if (beyond or active) and cursor < reach:
+        # Time is let forward: nothing the pool holds falls inside the span it
+        # may reach, so that span itself is all there is to move over.
+        return Change(at=reach, kind="pause", by=())
+    return Change(at=None, kind="pause" if active else "still", by=())
+
+
+def next_boundary(intents: List[Intent], cursor: int, reach: int) -> Optional[int]:
+    """The nearest moment the pool changes, or None when it never does."""
+    return nearest_change(intents, cursor, reach).at
+
+
 class SegmentScheduler:
     """Deterministic §4 segment-resolution engine.
 
@@ -328,7 +407,6 @@ class SegmentScheduler:
                                   perception_gate=sm.perception_check)
         result = sched.run()
     """
-
     def __init__(
         self,
         intents: List[Intent],
@@ -351,29 +429,10 @@ class SegmentScheduler:
     # -- helpers ------------------------------------------------------
 
     def _is_active(self, intent: Intent, seg_start: int) -> bool:
-        if intent.status in ("completed", "cancelled", "resolved_by_trigger"):
-            return False
-        if intent.t_start > seg_start:
-            return False
-        if intent.t_end is not None and intent.t_end <= seg_start:
-            return False
-        return True
+        return is_active(intent, seg_start)
 
     def _next_boundary(self, intents: List[Intent], cursor: int) -> Optional[int]:
-        candidates = set()
-        for i in intents:
-            if i.status in ("completed", "cancelled", "resolved_by_trigger"):
-                continue
-            if i.t_start > cursor:
-                candidates.add(min(i.t_start, self.horizon))
-            if i.t_end is not None and i.t_end > cursor:
-                candidates.add(min(i.t_end, self.horizon))
-        candidates = {c for c in candidates if c > cursor}
-        if candidates:
-            return min(candidates)
-        if cursor < self.horizon and any(self._is_active(i, cursor) for i in intents):
-            return self.horizon
-        return None
+        return next_boundary(intents, cursor, self.horizon)
 
     def _perceivers(self, intent: Intent) -> List[str]:
         observers = [a for a in self.all_actors if a != intent.actor] or [intent.actor]
@@ -408,24 +467,36 @@ class SegmentScheduler:
                 cursor = seg_end
                 continue
 
-            # Record plain (non-triggered) actions once, when they start.
+            # Record plain (non-triggered) actions where they end, once, with the
+            # span they took. An attempt that runs on past this segment has not
+            # resolved yet — it is still active, and the scene manager reads it as
+            # declared — so writing it down here would state as done what is still
+            # under way. An attempt with no span of its own ends where it is made.
             for intent in active:
-                if intent.t_start == seg_start and intent.id not in recorded_action_ids:
-                    recorded_action_ids.add(intent.id)
-                    resolved.append(ResolvedEntry(
-                        t_start=intent.t_start,
-                        t_end=intent.t_end if intent.t_end is not None else seg_end,
-                        actor=intent.actor, action_type=intent.action_type,
-                        target=intent.target, description=intent.description,
-                        visibility=intent.visibility, kind="action",
-                        perceivers=self._perceivers(intent),
-                        intent_id=intent.id,
-                    ))
+                if intent.t_end is None or intent.t_end > seg_end:
+                    continue
+                if intent.id in recorded_action_ids:
+                    continue
+                recorded_action_ids.add(intent.id)
+                resolved.append(ResolvedEntry(
+                    t_start=intent.t_start,
+                    t_end=intent.t_end,
+                    actor=intent.actor, action_type=intent.action_type,
+                    target=intent.target, description=intent.description,
+                    visibility=intent.visibility, kind="action",
+                    perceivers=self._perceivers(intent),
+                    intent_id=intent.id,
+                ))
 
             # §4 step 2 — structural join
             matches: List[Tuple[Intent, Intent]] = []
             for sub in active:
                 if not sub.trigger_condition:
+                    continue
+                if not isinstance(sub.trigger_condition, dict):
+                    # A condition stated in words is read against what happens, not
+                    # matched by pattern: it fires nothing here, and the actor waits
+                    # until whoever reads it judges the condition met.
                     continue
                 for cand in active:
                     if cand is sub or cand.actor == sub.actor:
@@ -442,9 +513,7 @@ class SegmentScheduler:
                         continue
                 passed.append((sub, cand))
 
-            # §3.4 / §4 step 4 — ascending trigger_priority
-            passed.sort(key=lambda pair: pair[0].trigger_priority)
-
+            # §4 step 4 — every match that passed, in the order the intents stand
             fired_sub_ids: set = set()
             for sub, cand in passed:
                 if sub.prepared_reaction:
@@ -472,20 +541,12 @@ class SegmentScheduler:
                     if i.id == sub_id:
                         i.status = "resolved_by_trigger"
 
-            # §4 step 5 — timeouts for bounded intents ending this segment, unmatched
+            # §4 step 5 — bounded intents ending this segment, unmatched, complete
             matched_sub_ids = {sub.id for sub, _ in passed}
             for intent in active:
-                if intent.t_end == seg_end and intent.id not in matched_sub_ids and intent.status == "active":
-                    if intent.on_timeout:
-                        new_intent = instantiate_sub_intent(intent.on_timeout, actor=intent.actor, t_start=seg_end)
-                        intents.append(new_intent)
-                        resolved.append(ResolvedEntry(
-                            t_start=seg_end, t_end=new_intent.t_end if new_intent.t_end is not None else seg_end,
-                            actor=new_intent.actor, action_type=new_intent.action_type,
-                            target=new_intent.target, description=new_intent.description,
-                            visibility=new_intent.visibility, kind="timeout",
-                            perceivers=self._perceivers(new_intent),
-                        ))
+                if intent.status != "active" or intent.id in matched_sub_ids:
+                    continue
+                if intent.t_end is not None and intent.t_end <= seg_end:
                     intent.status = "completed"
 
             cursor = seg_end

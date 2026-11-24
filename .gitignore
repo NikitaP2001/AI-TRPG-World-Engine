@@ -1,6 +1,7 @@
 .venv/*
 logs/*
 backups/*
+saves/*
 setups/*
 __pycache__/
 .tmp_*.py

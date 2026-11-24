@@ -24,10 +24,10 @@ def _validate_json_file(path: Path) -> None:
 
 
 def initialize_game_dir(*, init_root: str = "init", game_root: str = "game") -> None:
-    """Create game/ and seed game/characters from init/characters.
+    """Create game/ and seed game/players from init/players.
 
-    Copies any .json files found under init/characters/<Character>/ into
-    game/characters/<Character>/ (same filenames). Existing files are NOT overwritten.
+    Copies any .json files found under init/players/<Character>/ into
+    game/players/<Character>/ (same filenames). Existing files are NOT overwritten.
     """
 
     workspace = Path(__file__).resolve().parent

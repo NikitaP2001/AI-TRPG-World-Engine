@@ -219,7 +219,7 @@ request, but because the thing it was watching for has occurred.
 The World Manager, between sessions, is not waiting to be asked. It has registered
 interest in certain classes of events: a faction crossing a threshold, a significant
 entity dying, a sealed location being opened. When those conditions fire — via
-scripts, event queries, or scheduled self-invokes — the WM acts on its own
+event queries, corrections, or scheduled self-invokes — the WM acts on its own
 initiative: extending the world, creating consequences, setting new conditions in
 motion. It is playing its own game, which produces a world that feels alive because
 it advances along its own logic, not in response to player observation.
@@ -267,7 +267,7 @@ something matters.
 Facts for the active story are written when scenes need them — through typed
 tools into a persistent entity store and event log. Later invocations read those
 records. The system is narrative-only: there is no separate numeric geology /
-ecology / civilization simulation underneath. Simple automation (entity scripts,
+ecology / civilization simulation underneath. Simple automation (effects,
 effects, subscriptions) handles what does not need an LLM.
 
 Because the WM's tool vocabulary can be large, detailed documentation for each

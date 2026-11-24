@@ -5,21 +5,22 @@ All existing imports (from world_manager.entity_store import ...) continue to wo
 
 Storage is routed automatically:
   - NPCs, locations, factions -> game/entity_store/entities.json
-  - Player characters -> game/characters/{name}/*.json
+  - Player mechanical data -> game/entity_store/entities.json as well; the
+    player-specific files (description.json, memory.json, messages.json) stay
+    under game/players/{name}/
 """
 from __future__ import annotations
 
 from world_manager.entity_core import (
     set_entity, get_entity, get_entity_facts, set_entity_facts,
-    get_entity_state, delete_entity, query_entities,
+    get_entity_state, delete_entity, query_entities, query_page,
     add_tags, remove_tags, set_effect, remove_effect,
-    attach_script, detach_script, adjust_entity,
-    reset_creation_counter,
+    adjust_entity,
 )
 
 __all__ = [
     "set_entity", "get_entity", "get_entity_facts", "set_entity_facts",
-    "get_entity_state", "delete_entity", "query_entities",
+    "get_entity_state", "delete_entity", "query_entities", "query_page",
     "add_tags", "remove_tags", "set_effect", "remove_effect",
-    "attach_script", "detach_script", "adjust_entity",
+    "adjust_entity",
 ]

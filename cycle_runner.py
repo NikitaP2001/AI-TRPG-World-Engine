@@ -23,6 +23,169 @@ if TYPE_CHECKING:
     from engine.orchestrator import GameOrchestrator as ConsoleApp
 
 
+#: At most this many cold-path wake-ups are served in one cycle, so a chain of
+#: wake-ups cannot hold the turn loop; what is left waits for the next cycle.
+_MAX_COLD_CALLS_PER_CYCLE = 3
+
+
+def _initialized_marker_path(app: "GameOrchestrator"):
+    return app.world.game_root / "world" / "initialized.json"
+
+
+def world_is_initialized(app: "GameOrchestrator") -> bool:
+    """Whether this world has already been through its startup step.
+
+    The fact lives with the world on disk: a restarted process must not build an
+    existing world a second time, and the startup agents must never be told to
+    initialise a world that is already there.
+    """
+    try:
+        return _initialized_marker_path(app).exists()
+    except Exception:
+        return False
+
+
+def _awareness_marker_path(app: "GameOrchestrator"):
+    return app.world.game_root / "world" / "awareness.json"
+
+
+def awareness_was_given(app: "GameOrchestrator") -> bool:
+    """Whether this world has already given its characters their opening.
+
+    The fact lives with the world on disk, as the world's initialization does: a
+    restarted process is a new process, not a new world. A session of a world that
+    has been opened is informed by other channels — what the scene manager states
+    in a resolve cycle, question answering, and each character's own scene context.
+    """
+    try:
+        return _awareness_marker_path(app).exists()
+    except Exception:
+        return False
+
+
+def mark_awareness_given(app: "GameOrchestrator") -> None:
+    """Record that the world's characters have been given their opening, once."""
+    from world.io import _write_json
+
+    payload: Dict[str, Any] = {}
+    try:
+        wt = app.world.get_world_time()
+        payload["world_time"] = wt.to_string() if hasattr(wt, "to_string") else str(wt)
+    except Exception:
+        pass
+    try:
+        payload["characters"] = [
+            str(p.get("name") or "") for p in app.world.get_players() if isinstance(p, dict)
+        ]
+    except Exception:
+        pass
+    try:
+        _write_json(_awareness_marker_path(app), payload)
+    except Exception as e:
+        if logs_enabled():
+            print(f"[cycle] could not record that awareness was given: {e}")
+
+
+def mark_world_initialized(app: "GameOrchestrator") -> None:
+    """Record that the world has been built, once and for good."""
+    from world.io import _write_json
+
+    payload: Dict[str, Any] = {}
+    try:
+        wt = app.world.get_world_time()
+        payload["world_time"] = wt.to_string() if hasattr(wt, "to_string") else str(wt)
+    except Exception:
+        pass
+    try:
+        payload["players"] = [
+            str(p.get("name") or "") for p in app.world.get_players() if isinstance(p, dict)
+        ]
+    except Exception:
+        pass
+    try:
+        _write_json(_initialized_marker_path(app), payload)
+    except Exception as e:
+        if logs_enabled():
+            print(f"[cycle] could not record world initialization: {e}")
+
+
+def _cold_context(app: "GameOrchestrator") -> Dict[str, Any]:
+    """What a cold-path invocation is told: the time, and who is where."""
+    context: Dict[str, Any] = {}
+    try:
+        wt = app.world.get_world_time()
+        context["world_time"] = wt.to_string() if hasattr(wt, "to_string") else str(wt)
+    except Exception:
+        pass
+    try:
+        from scheduler_queue import current_world_tick
+        context["current_tick"] = current_world_tick()
+    except Exception:
+        pass
+    try:
+        context["players"] = app.world.get_players()
+    except Exception:
+        pass
+    return context
+
+
+def drain_cold_path(app: "GameOrchestrator") -> int:
+    """Call the agents whose wake-up is due; return how many were called.
+
+    The GM and the WM are not in the turn loop. They are called when they asked
+    to be — the wake-up queue they write to — or when the world has gone longer
+    than the fallback interval without them. Either way what happens here is an
+    ordinary invocation, and their own invocation path records that it happened.
+    """
+    try:
+        from engine.agent_schedule import due_invocations
+        from scheduler_queue import current_world_tick
+    except Exception:
+        return 0
+
+    tick = current_world_tick()
+    if tick <= 0:
+        return 0
+    due = due_invocations(tick, limit=_MAX_COLD_CALLS_PER_CYCLE)
+    if not due:
+        return 0
+
+    called = 0
+    for entry in due:
+        agent = str(entry.get("agent") or "")
+        notice = str(entry.get("notice") or "").strip()
+        if logs_enabled():
+            print(f"  [cold-path] waking {agent} ({entry.get('source')}): {notice[:80]}")
+        try:
+            if agent == "gm":
+                app._game_master.call_gm(
+                    notice=notice,
+                    invoked_as="you are woken by the schedule",
+                    context=_cold_context(app),
+                )
+            elif agent == "wm":
+                app._wm.call_wm(notice=notice, context=_cold_context(app))
+            else:
+                continue
+            called += 1
+        except Exception as e:
+            # The invocation did not happen, so what the agent asked for is still
+            # owed: it goes back in the queue rather than being dropped.
+            if entry.get("source") == "scheduled":
+                try:
+                    from scheduler_queue import schedule_invocation
+                    schedule_invocation(
+                        agent=agent,
+                        world_time=int(entry.get("scheduled_tick") or 0),
+                        comment=notice,
+                    )
+                except Exception:
+                    pass
+            if logs_enabled():
+                print(f"[cycle] cold-path call for {agent} failed: {e}")
+    return called
+
+
 def _build_public_intents_notice(
     character_name: str,
     all_intents: List[Dict[str, Any]],
@@ -106,6 +269,17 @@ def _format_active_subscriptions(app: "GameOrchestrator", character_name: str) -
         return ""
 
     cursor = int(timeline.get("cursor") or 0)
+    if cursor <= 0:
+        # A cycle that has not reached a resolution point yet leaves the cursor
+        # at zero, and a remaining measured against zero is the world's whole
+        # count of seconds — read as a span, it says nothing true.
+        try:
+            from world import WorldTime
+            from world.clock import now_string
+
+            cursor = WorldTime.parse(now_string()).to_seconds()
+        except Exception:
+            cursor = 0
 
     mine = [
         i for i in intents
@@ -126,22 +300,22 @@ def _format_active_subscriptions(app: "GameOrchestrator", character_name: str) -
         is_subscription = t_end is None
 
         if is_subscription:
-            kind = "persistent subscription"
+            kind = "waiting, with no end set"
         elif tc:
-            kind = "pending wait"
+            kind = "waiting on a condition"
         else:
-            kind = "active intent"
+            kind = "running now"
 
         # Timing info
         t_start = int(entry.get("t_start") or 0)
         timing_parts = []
         if cursor > 0 and t_start > 0:
             elapsed = max(0, cursor - t_start)
-            timing_parts.append(f"elapsed={elapsed}s")
-        if t_end is not None:
+            timing_parts.append(f"{elapsed}s behind you")
+        if t_end is not None and cursor > 0:
             remaining = max(0, int(t_end) - cursor)
-            timing_parts.append(f"remaining={remaining}s")
-        time_str = f" [{', '.join(timing_parts)}]" if timing_parts else ""
+            timing_parts.append(f"{remaining}s left")
+        time_str = f", {', '.join(timing_parts)}" if timing_parts else ""
 
         # Absorption
         absorption = str(entry.get("absorption") or "alert").strip()
@@ -152,10 +326,14 @@ def _format_active_subscriptions(app: "GameOrchestrator", character_name: str) -
         if isinstance(tc, dict) and tc:
             tc_desc = f" — fires on {tc.get('actor','any')}/{tc.get('action_type','any')}->{tc.get('target_match','any')}"
 
-        lines.append(f"- [{intent_id}] {kind}{abs_str}{time_str}: {str(entry.get('description') or '')[:100]}{tc_desc}")
+        lines.append(
+            f"- attempt {intent_id}: {kind}{abs_str}{time_str} — "
+            f"{str(entry.get('description') or '')[:100]}{tc_desc}"
+        )
 
     return (
-        "Your active intents/subscriptions (cancel via cancel_subscription(subscription_ids=[...])):\n"
+        "Your own attempts that still stand "
+        "(withdraw one by its id with cancel_subscription):\n"
         + "\n".join(lines)
     )
 
@@ -269,7 +447,7 @@ def _invoke_players(
                 gm_notice=gm_notice,
             )
         except Exception as e:
-            print(f"  ✗ {pname} error: {e}")
+            print(f"  {pname} error: {e}")
             import traceback
             traceback.print_exc()
 
@@ -285,6 +463,7 @@ def _run_single_player(
     players: List[str],
     gm_notice: str = "",
     world_time_override: str = "",
+    establish_disposition: bool = True,
 ) -> None:
     """Run one player agent and mark them acted.
 
@@ -292,6 +471,11 @@ def _run_single_player(
     scheduler's current resolution point instead of the scene's fixed start
     time — used when re-invoking on a trigger match mid-cycle (docs/scene_design.md
     §4 step 4: "the actor is re-invoked from this segment's start time forward").
+
+    ``establish_disposition`` is true at a cycle's opening, where the player is
+    called to declare an intent and states the psyche he stands on, and false for
+    every later call in that cycle — a character brought back to decide again
+    continues the cycle he is in, and his opening is not asked for twice.
     """
     scene_desc = str(scene_data.get("scene_description") or "")
     player_descriptions = scene_data.get("player_descriptions") or {}
@@ -309,9 +493,19 @@ def _run_single_player(
             ctx_parts.append(f"\nNPCs present: {', '.join(str(n) for n in npcs)}")
         char_context = "\n".join(ctx_parts)
 
-    # Add re-invoke context from SM
-    if gm_notice:
-        char_context += f"\n\n[Notice]\n{gm_notice}"
+    # What he was told since his last turn is read now, at his turn — a telling
+    # waits for the turn it belongs to. His first turn of the session is the one
+    # exception: there his memory is what is read, and the record already stands
+    # in it, so saying it again would put it in one context twice.
+    from player.agent import continues_his_turn
+
+    given = app.take_what_he_was_given(player_name)
+    if given and continues_his_turn(player_name):
+        gm_notice = "\n".join(text for text in [gm_notice, *given] if text)
+
+    # The notice reaches him once, and it is the parameter's job to state it: it
+    # is carried into the turn context with the rest of what he is given, and
+    # appending it here as well would put the same words in front of him twice.
 
     # §9.1 — surface this player's own active subscriptions/pending intents
     subs_notice = _format_active_subscriptions(app, player_name)
@@ -325,11 +519,21 @@ def _run_single_player(
     except Exception:
         pass
 
-    # Set SM resolver so observe/recall get answered immediately
+    # Set SM resolver so observe/recall get answered immediately. Answering is
+    # also a phase in which the scene manager may state what a character holds,
+    # so what it states is handed over as soon as the answer comes back.
     from player.agent import set_sm_resolver
+
+    def _resolve_and_deliver(*, player_name: str, questions: str) -> str:
+        try:
+            return app._sm.resolve_player_question(
+                player_name=player_name, questions=questions,
+            )
+        finally:
+            app.deliver_awareness()
+
     try:
-        sm_resolver = app._sm.resolve_player_question
-        set_sm_resolver(sm_resolver)
+        set_sm_resolver(_resolve_and_deliver)
     except Exception:
         set_sm_resolver(None)
 
@@ -345,6 +549,7 @@ def _run_single_player(
         require_decision=False,
         persist_history=True,
         gm_reality_notice=gm_notice,
+        establish_disposition=establish_disposition,
     )
 
     result = json.loads(result_json) if isinstance(result_json, str) else result_json
@@ -354,8 +559,6 @@ def _run_single_player(
     intent = str(result.get("action") or decision.get("intent") or decision.get("action") or "")
     declared = result.get("declared_intents") or []
     cancel_ids = result.get("cancel_subscription_ids") or []
-    # Include pre-tool reasoning (Phase 5 — character thoughts output)
-    thoughts_text = str(result.get("thoughts_text") or "").strip()
 
     if declared:
         print(f" ({len(declared)} intents)")
@@ -408,20 +611,103 @@ def _resolve_player_locations(player_list: list, app: "GameOrchestrator") -> lis
     return resolved
 
 
+def _characters_without_a_place(app: "GameOrchestrator") -> List[str]:
+    """Characters who stand nowhere the world holds.
+
+    A place is an entity: a character's place is real when the store holds the
+    entity his position names. The empty place reads as a phrase rather than as
+    an entity, so it fails the same test as any other name the world does not
+    hold — no list of forbidden names is needed, and a world that holds a place
+    by that name would be honoured.
+
+    Read from the store on every cycle, so the answer follows the world rather
+    than the moment a session first looked.
+    """
+    from world_manager.entity_core import get_entity
+
+    out: List[str] = []
+    try:
+        players = app.world.get_players()
+    except Exception:
+        return out
+    for player in players:
+        if not isinstance(player, dict):
+            continue
+        name = str(player.get("name") or "").strip()
+        place = str(player.get("location") or "").strip()
+        if not name:
+            continue
+        if place and get_entity(place) is not None:
+            continue
+        out.append(name)
+    return out
+
+
+_asked_to_place: set = set()
+
+
+def _ask_gm_to_place_characters(app: "GameOrchestrator", names: List[str]) -> None:
+    """Tell the Game Master, once, that characters stand nowhere.
+
+    Where a character begins is a campaign fact, and the Game Master owns those.
+    Asked once per set of names: a call that changes nothing would be repeated
+    every cycle, and the line printed above already says what still has to happen.
+    """
+    key = tuple(sorted(names))
+    if key in _asked_to_place:
+        return
+    _asked_to_place.add(key)
+
+    starting = ""
+    try:
+        from world.io import read_json
+        raw = read_json(app.world.game_root / "world_setting.json")
+        reference = raw.get("player_reference") if isinstance(raw, dict) else None
+        if isinstance(reference, dict):
+            starting = str(reference.get("starting_location") or "").strip()
+    except Exception:
+        pass
+
+    context: Dict[str, Any] = {
+        "players": [{"name": name, "location": "?"} for name in names],
+    }
+    try:
+        context["world_time"] = app.world.get_world_time().to_string()
+    except Exception:
+        pass
+
+    notice = "characters stand nowhere the world holds"
+    if starting:
+        notice += f"; the world begins at: {starting}"
+    try:
+        app._game_master.call_gm(
+            notice=notice,
+            invoked_as="you are invoked to place the characters",
+            context=context,
+        )
+    except Exception as e:
+        print(f"  GM could not be asked to place the characters: {e}")
+
+
 def _run_startup_agents(app: "GameOrchestrator") -> None:
     """First-time startup: invoke WM then GM with full tool access.
 
     WM creates world structure (regions, factions, templates). GM populates
     entities (NPCs, player state/skills/equipment). Both run ReAct loops
     with their full tool sets until termination.
+
+    This is the world's beginning, not a recurring step: it is gated by the
+    initialization record on disk (see world_is_initialized).
     """
-    print("\n  🌍 WM initializing world structure...")
+    ok = True
+    print("\n  WM initializing world structure...")
     try:
         app._wm.call_wm(notice="initialize_world")
     except Exception as e:
-        print(f"  ⚠ WM init error: {e}")
+        ok = False
+        print(f"  WM init error: {e}")
 
-    print("  📜 GM populating entities...")
+    print("  GM populating entities...")
     try:
         # Build player context so GM knows who needs state files
         # Read players from entity store (WM has already created entities)
@@ -434,7 +720,7 @@ def _run_startup_agents(app: "GameOrchestrator") -> None:
         player_list = _resolve_player_locations(player_list, app)
         gm_context: Dict[str, Any] = {"players": player_list}
         if player_list:
-            print(f"  📋 GM needs to initialize {len(player_list)} player(s): {', '.join(p['name'] for p in player_list)}")
+            print(f"  GM needs to initialize {len(player_list)} player(s): {', '.join(p['name'] for p in player_list)}")
         # Pass world time on first invocation
         try:
             wt = app.world.get_world_time()
@@ -469,7 +755,11 @@ def _run_startup_agents(app: "GameOrchestrator") -> None:
             return thinking[:1000] if thinking else "(WM responded)"
         set_wm_invoker(_wm_inline)
 
-        app._game_master.call_gm(notice="initialize", context=gm_context)
+        app._game_master.call_gm(
+            notice="",
+            invoked_as="you are invoked to initialise the world",
+            context=gm_context,
+        )
 
         # Strip description.json to core fields (general/race/personality) now
         # that GM has created entity store entries.
@@ -479,10 +769,22 @@ def _run_startup_agents(app: "GameOrchestrator") -> None:
                 game_root=app.world.game_root, name=_cname,
             )
     except Exception as e:
-        print(f"  ⚠ GM init error: {e}")
+        ok = False
+        print(f"  GM init error: {e}")
+
+    # The world counts as built only if both agents got through; otherwise the
+    # next cycle tries again rather than leaving a half-built world behind.
+    if ok:
+        mark_world_initialized(app)
 
 
 def run_cycle(app: "GameOrchestrator", user_msg: Optional[HumanMessage]) -> None:
+    """Execute one cycle, then let the cold path wake whoever is due."""
+    _run_cycle_body(app, user_msg)
+    drain_cold_path(app)
+
+
+def _run_cycle_body(app: "GameOrchestrator", user_msg: Optional[HumanMessage]) -> None:
     """Execute one cycle."""
     app.world.ensure_initialized()
     app._clear_cycle_temp_dir()
@@ -494,21 +796,37 @@ def run_cycle(app: "GameOrchestrator", user_msg: Optional[HumanMessage]) -> None
             print("[cycle] Waiting for world setting...")
         return
 
-    # 1b. First-time startup: WM and GM full invocations with all tools.
-    #     Only runs once, right after world setting is created.
-    if not getattr(app, '_fully_initialized', False):
+    # 1b. The world is built once, by its startup agents. Whether that has
+    #     happened is a fact about the world, recorded on disk with it, so a
+    #     restarted process does not build what is already there and no agent is
+    #     ever told to initialise an existing world.
+    if not getattr(app, '_fully_initialized', False) and not world_is_initialized(app):
         app._fully_initialized = True
         _run_startup_agents(app)
 
-    # 2. Auto-start session if not already active (§1.1 — multi-cycle session)
+    # 2. A session happens where the characters are. A character's place is an
+    #    entity the world holds: while the world is still being built, or when a
+    #    character was never put anywhere, there is no scene to stage — and a
+    #    session staged in a place that does not exist narrates a room nobody
+    #    stands in, which is the scene manager inventing the world it was meant to
+    #    read. The session waits, and the Game Master is told once, because where
+    #    the characters begin is a campaign fact.
+    nowhere = _characters_without_a_place(app)
+    if nowhere:
+        print(f"  {len(nowhere)} character(s) stand nowhere the world holds: "
+              f"{', '.join(nowhere)}")
+        _ask_gm_to_place_characters(app, nowhere)
+        return
+
+    # 3. Auto-start session if not already active (§1.1 — multi-cycle session)
     if not getattr(app, '_session_active', False):
         app.begin_session()
 
     try:
-        # 3. Bootstrap scene if none active
+        # 4. Bootstrap scene if none active
         app._bootstrap_next_scene()
 
-        # 4. Check if any players exist (no scene.json — players from entity store)
+        # 5. Check if any players exist (no scene.json — players from entity store)
         try:
             all_players = app.world.get_players()
             if not all_players:
@@ -518,14 +836,15 @@ def run_cycle(app: "GameOrchestrator", user_msg: Optional[HumanMessage]) -> None
         except Exception:
             return
 
-        # 5. Invocation by location (§5.1) — no scene.json, no acted flags.
+        # 6. Invocation by location (§5.1) — no scene.json, no acted flags.
         #    Players are grouped by location from entity store.
         try:
             all_players = app.world.get_players()
         except Exception:
             all_players = []
 
-        # Group by location, pick the largest group
+        # Group by location, pick the largest group. Every player standing here
+        # has a place the world holds — the gate above is what decides that.
         location_groups: Dict[str, List[str]] = {}
         for ch in all_players:
             if not isinstance(ch, dict):
@@ -548,7 +867,7 @@ def run_cycle(app: "GameOrchestrator", user_msg: Optional[HumanMessage]) -> None
         # Step 1: players with no active intent
         no_intent = _players_without_active_intent(app, location)
         if no_intent:
-            print(f"  🎯 Invoking {len(no_intent)} player(s) without active intent: {', '.join(no_intent)}")
+            print(f"  Invoking {len(no_intent)} player(s) without active intent: {', '.join(no_intent)}")
             _invoke_players(
                 app, no_intent,
                 location=location, start_time=start_time,
@@ -561,6 +880,24 @@ def run_cycle(app: "GameOrchestrator", user_msg: Optional[HumanMessage]) -> None
 
         # 6. Resolution loop + finalize
         app._finalize_cycle_if_ready()
+
+        # 6b. The world's own processes advance with it: every effect lands what
+        #     its period has earned over the time this cycle moved. It runs after
+        #     the clock is written, so what lands is the time the world actually
+        #     reached, and before the cold path, so an agent woken in this cycle
+        #     reads the state as it stands rather than as it was.
+        try:
+            from world.clock import current_tick as _world_seconds
+            from world_manager.entity_core import advance_world_processes
+
+            outcome = advance_world_processes(_world_seconds())
+            if logs_enabled() and (outcome.get("effects_applied")
+                                   or outcome.get("effects_expired")):
+                print(f"  [world] effects: {outcome.get('effects_applied')} landed, "
+                      f"{outcome.get('effects_expired')} ended")
+        except Exception:
+            import traceback
+            traceback.print_exc()
 
         # ── Scheduler tick: evaluate periodic jobs (summaries, etc.) ──
         try:

@@ -11,9 +11,19 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
+
+# The progress lines carry characters the Windows code page cannot spell, and a
+# redirected stdout would otherwise raise in the middle of a step that has
+# nothing to do with printing.
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 from stream_watchdog import InvalidGMOutputError
 from bootstrap import initialize_game_dir
@@ -83,12 +93,6 @@ class GameOrchestrator(Orchestrator):
             elif cmd in ("continue", "c", ""):
                 self._cmd_continue(args[1:])
 
-            # ── Advance ──
-            elif cmd == "advance":
-                result = self._cmd_advance(args[1:])
-                if result:
-                    print(result[:2000])
-
             # ── Generate world ──
             elif cmd == "generate":
                 result = self._cmd_generate(args[1:])
@@ -147,7 +151,6 @@ class GameOrchestrator(Orchestrator):
         print("""
 Commands:
   continue, c       Run one cycle
-  advance <years>   Advance world time
   generate          Generate world
   load_preset <n>   Load preset
   presets           List presets
@@ -164,11 +167,11 @@ Commands:
         try:
             self.run_full_session()
         except InvalidGMOutputError as e:
-            print(f"\n  ⚠ GM output rejected ({e}). Retrying...\n")
+            print(f"\n  GM output rejected ({e}). Retrying...\n")
         except KeyboardInterrupt:
-            print("\n  ⏹ Interrupted.")
+            print("\n  Interrupted.")
         except Exception as e:
-            print(f"\n  ✗ Error: {e}")
+            print(f"\n  Error: {e}")
             import traceback
             traceback.print_exc()
 
@@ -183,20 +186,6 @@ Commands:
             return json.dumps(result, ensure_ascii=False, indent=2) if isinstance(result, dict) else str(result)
         except Exception as e:
             return f"Generation error: {e}"
-
-    def _cmd_advance(self, args: list, debug: bool = False) -> str:
-        """Advance the world simulation by the specified duration."""
-        years_str = args[0] if args else "1"
-        try:
-            years = float(years_str)
-        except ValueError:
-            return f"Invalid years: {years_str}"
-        try:
-            from world_manager.entity_core import tick as engine_tick
-            engine_tick(years=years)
-            return f"Advanced {years} years"
-        except Exception as e:
-            return f"Advance error: {e}"
 
     def _cmd_save(self, name: Optional[str] = None) -> None:
         if not name:
@@ -251,7 +240,7 @@ Commands:
         super().load_preset(name)
 
     # ==================================================================
-    # Delegation methods (for backward compat with turn_runner / tests)
+    # Delegation methods (for backward compat with earlier entry points)
     # ==================================================================
 
     def _bootstrap_next_scene(self) -> bool:

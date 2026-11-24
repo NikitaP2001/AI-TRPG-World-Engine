@@ -21,8 +21,9 @@ from .reflection import (
     _get_known_relationships,
     _character_dir,
 )
-from openrouter_llm import build_openrouter_chat_llm, openrouter_logging_callbacks, read_prompt_text
-from memory_store import append_message, load_history, limits_from_env
+from openrouter_llm import bind_agent_tools, build_openrouter_chat_llm, openrouter_logging_callbacks, read_prompt_text
+from history_pipeline import memory_at
+from memory_store import load_history
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 
@@ -78,9 +79,9 @@ def build_encounter_list(
         except Exception:
             pass
 
-        # NPCs from npc.json
+        # Entities no player controls, so a character can know of them by name
         try:
-            npcs = world.get_npcs() or {}
+            npcs = world.non_player_entities() or {}
             for n in npcs:
                 if n:
                     known[n.lower()] = "npc"
@@ -203,7 +204,6 @@ def run_relationship_review(
 
     # Build the agent call — only relationship_update tool available
     history_path = _character_dir(character_name) / "messages.json"
-    limits = limits_from_env()
 
     llm = build_openrouter_chat_llm(
         temperature=0.7,
@@ -211,13 +211,11 @@ def run_relationship_review(
         max_tokens=1000,
         title_suffix=f"-char-rel-{character_name}",
         parallel_tool_calls=False,
+        thinking=False,  # this phase forces its tool, which reasoning cannot share
     )
     callbacks = openrouter_logging_callbacks(scope="character", label=f"{character_name}_review")
 
-    bound = llm.bind_tools(
-        [_rel_up],
-        tool_choice="required",
-    ).with_config({"callbacks": callbacks})
+    bound = bind_agent_tools(llm, [_rel_up], callbacks=callbacks, tool_choice="required")
 
     messages = [
         SystemMessage(content=(
@@ -266,8 +264,10 @@ def run_relationship_review(
                 "attitude": attitude,
                 "observation": observation,
             }, ensure_ascii=False)
-            append_message(history_path, role="assistant",
-                           content=f"[relationship_update]\n{rel_entry}", limits=limits)
+            # What he concluded about someone belongs in his memory: entered
+            # through the same pipeline as every other record, so it obeys the
+            # same rules about what is kept and what is said twice.
+            memory_at(history_path).record(f"[relationship_update]\n{rel_entry}")
             updated += 1
 
         # Append tool result and continue

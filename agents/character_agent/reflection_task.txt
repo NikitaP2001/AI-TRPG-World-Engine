@@ -4,10 +4,6 @@ Time has passed and several events have occurred. Before continuing, take a mome
 
 You are pausing to look inward — reviewing what happened, how your feelings shifted, and what you want next.
 
-Below are your recent thoughts from the last several turns:
-
-{recent_thoughts}
-
 And here is your current self-reflection (if any — it may be empty on first reflection):
 
 {current_reflection}
@@ -16,7 +12,7 @@ And here is your current self-reflection (if any — it may be empty on first re
 
 **Instructions:**
 
-Review the above and produce an updated self-reflection using the `output_reflection` tool. Treat this as a merge + refine update (not a rewrite): start from current reflection entries, integrate recent thoughts, then decide what to keep, update, merge, add, or remove within the fixed limits.
+Review the above and produce an updated self-reflection using the `output_reflection` tool. Treat this as a merge + refine update (not a rewrite): start from current reflection entries, integrate recent experience, then decide what to keep, update, merge, add, or remove within the fixed limits.
 
 Guidelines:
 - **relationships**: List entities (people, organizations, factions) you have formed an opinion about. Include their nature (ally, enemy, acquaintance, subordinate, etc.), your attitude toward them, and any relevant notes. Refine existing entries first, remove entries that are no longer relevant, and merge duplicates.

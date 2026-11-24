@@ -88,44 +88,6 @@ def _format_seconds_delta(seconds: int) -> str:
     return " ".join(parts)
 
 
-def _enrich_characters_with_time_behind(
-    info_for_prompt: Dict[str, Any],
-    world_time: WorldTime,
-) -> None:
-    """Add ``behind_world_time`` to every character entry inside *info_for_prompt* (in-place).
-
-    When a character has been without an active scene for more than 8 hours,
-    an extra ``notice`` field is added to draw the GM's attention.
-    """
-    _LONG_ABSENCE_SECONDS = 8 * 3600  # 8 hours
-
-    chars = info_for_prompt.get("players")
-    if not isinstance(chars, list):
-        return
-    wt_sec = world_time.to_seconds()
-    for entry in chars:
-        if not isinstance(entry, dict):
-            continue
-        la = str(entry.get("last_acted") or "").strip()
-        if not la or la == "never":
-            entry["behind_world_time"] = "unknown"
-            continue
-        try:
-            la_wt = WorldTime.parse(la)
-            la_sec = la_wt.to_seconds()
-            delta = wt_sec - la_sec
-            delta = max(delta, 0)
-            entry["behind_world_time"] = _format_seconds_delta(delta)
-            entry["time_of_day"] = la_wt.time_of_day()
-            if delta >= _LONG_ABSENCE_SECONDS:
-                entry["notice"] = (
-                    f"This player has not been in an active scene for over "
-                    f"{_format_seconds_delta(delta)}. Consider giving them a scene soon."
-                )
-        except Exception:
-            entry["behind_world_time"] = "unknown"
-
-
 def _as_str_list(value: Any) -> List[str]:
     if not isinstance(value, list):
         return []
@@ -190,8 +152,6 @@ def _all_character_descriptions_for_context(
             continue
         try:
             desc = world.get_character_description(nm)
-            if isinstance(desc, dict):
-                desc = {k: v for k, v in desc.items() if str(k) != "last_acted"}
             out.append({"name": nm, "description": desc})
         except Exception as e:  # noqa: BLE001
             out.append({"name": nm, "error": str(e)})
@@ -623,22 +583,9 @@ def build_game_master_context_block(world: Any) -> str:
 
     wt = world.get_world_time()
 
-    # Enrich character entries with how far each is behind world time.
+    # Inject entity ids the players do not control, so the GM sees who exists.
     try:
-        _enrich_characters_with_time_behind(info_for_prompt, wt)
-    except Exception:
-        pass
-
-    # Keep GM world-info compact: scene-pick task message carries dedicated
-    # character timing appendix, so avoid duplicating helper timing fields here.
-    for ch in (info_for_prompt.get("players") or []):
-        if isinstance(ch, dict):
-            ch.pop("time_of_day", None)
-            ch.pop("behind_world_time", None)
-
-    # Inject NPC names from npc.json so the GM sees who exists.
-    try:
-        npcs_dict = world.get_npcs()
+        npcs_dict = world.non_player_entities()
         if isinstance(npcs_dict, dict) and npcs_dict:
             info_for_prompt["npcs"] = sorted(npcs_dict.keys())
     except Exception:
@@ -684,14 +631,16 @@ def build_game_master_context_block(world: Any) -> str:
             npc_names = scene.get("npcs") if isinstance(scene, dict) else None
             npc_details: List[Dict[str, Any]] = []
             if isinstance(npc_names, list):
+                from world_manager.entity_core import get_entity
                 for npc_name in npc_names:
                     nm = str(npc_name).strip()
                     if not nm:
                         continue
                     try:
-                        npc_details.append(world.get_npc(nm))
+                        entity = get_entity(nm)
+                        npc_details.append(entity or {"id": nm, "error": "not found"})
                     except Exception:
-                        npc_details.append({"name": nm, "error": "not found"})
+                        npc_details.append({"id": nm, "error": "not found"})
             if npc_details:
                 scene_npc_details_section = npc_details
         except Exception:

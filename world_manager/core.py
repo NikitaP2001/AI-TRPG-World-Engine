@@ -10,13 +10,22 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 
-from memory_store import append_message, load_history, limits_from_env
+from history_pipeline import memory_at
+from memory_store import load_history
+from record_voice import spoken
 from openrouter_langchain_logging import logs_enabled, _safe_label
-from openrouter_llm import build_openrouter_chat_llm, openrouter_logging_callbacks, read_prompt_text
-from gm.react_loop import coerce_tool_calls, react_loop_iteration
+from openrouter_llm import bind_agent_tools, build_openrouter_chat_llm, extract_reasoning, openrouter_logging_callbacks, read_prompt_text
+from gm.react_loop import coerce_tool_calls, react_loop_iteration, sanitize_messages
 from engine.history_meta import HistoryMeta as WMHistoryMeta
+from engine.invocation import opening
 
 
 WORLD_SETTING_FIELDS = [
@@ -25,10 +34,24 @@ WORLD_SETTING_FIELDS = [
     "initial_world_time",
 ]
 
+#: A notice that names only the mode of the wake. It says nothing a later reader
+#: can use, so it is not a record: the invocation itself is kept in the metadata.
+_BARE_NOTICES = {"initialize_world"}
+
 
 # ======================================================================
 # Invocation log helper
 # ======================================================================
+
+
+def _game_root() -> Path:
+    """Where the world lives, anchored where the code lives.
+
+    Anchored rather than relative to the working directory: the World Manager
+    reads the preset's characters from here, and a start from another directory
+    would show it a world with nothing in it.
+    """
+    return Path(__file__).resolve().parent.parent / "game"
 
 
 def _invocation_log_dir() -> Path:
@@ -100,9 +123,8 @@ class WorldManager:
         self._prompt_text = read_prompt_text(prompt_path)
         self._temperature = temperature
         self._history_path = history_path
-        self._last_call_tick: int = 0
+        self._peer_history_path: Optional[Path] = None
         self._last_summary: str = ""
-        self._last_digest_event_id: str = ""
         self._meta = WMHistoryMeta(
             (self._history_path.parent / "wm_history_meta.json")
             if self._history_path else Path("wm_history_meta.json"),
@@ -126,6 +148,8 @@ class WorldManager:
             max_tokens=3000,
             parallel_tool_calls=True,
             timeout=120.0,
+            thinking=True,  # world building is deliberation
+            effort="low",
         )
 
         callbacks = openrouter_logging_callbacks(scope="world_manager", label="create_setting")
@@ -195,12 +219,7 @@ class WorldManager:
             HumanMessage(content=human_msg),
         ]
 
-        try:
-            bound_llm = llm.bind_tools(
-                [world_setting_result],
-            ).with_config({"callbacks": callbacks})
-        except TypeError:
-            bound_llm = llm.bind_tools([world_setting_result]).with_config({"callbacks": callbacks})
+        bound_llm = bind_agent_tools(llm, [world_setting_result], callbacks=callbacks)
 
         max_retries = 3
         required_top_level = {"world_essence", "gurps_calibration", "initial_world_time"}
@@ -208,19 +227,41 @@ class WorldManager:
         required_tier_keys = {"stat_range", "advantage_budget", "skill_ceiling"}
         required_spectrum_keys = {"frequency", "essence", "ceiling", "societal_impact"}
 
+        def _reject(note: str, call_id: str = "") -> None:
+            """Answer the call that failed the way a tool result answers a call.
+
+            A call answered by a user message is not a conversation this backend
+            accepts, so the retry would be refused for a second reason while the
+            first was still unfixed — and the world would never get built.
+            """
+            # A world that is refused three times and says nothing about why is
+            # a wall with no door: whoever reads the console has to guess.
+            if logs_enabled():
+                print(f"[trace] world setting not accepted: {note[:300]}")
+            if call_id:
+                messages.append(ToolMessage(content=note, tool_call_id=call_id,
+                                            name="world_setting_result"))
+            else:
+                messages.append(HumanMessage(content=note))
+
         for _attempt in range(max_retries):
             try:
-                out = bound_llm.invoke(messages)
-            except Exception:
+                out = bound_llm.invoke(sanitize_messages(messages))
+            except Exception as exc:
+                from engine.incidents import record_incident
+
+                record_incident("wm.create_world_setting", exc)
+                # The rejection reports itself; the attempt needs no second line.
+                _reject(f"[error] the request failed: {type(exc).__name__}: {exc}")
                 continue
 
             tool_calls = coerce_tool_calls(getattr(out, "tool_calls", None) or [])
             if not tool_calls:
-                messages.append(AIMessage(content="(text output suppressed)"))
-                messages.append(HumanMessage(content="ERROR: You MUST call world_setting_result."))
+                _reject("[error] No world_setting_result call was made.")
                 continue
 
             tc = tool_calls[0]
+            call_id = str(tc.get("id") or "")
             args = tc.get("args") if isinstance(tc, dict) else {}
             if not isinstance(args, dict):
                 args = {}
@@ -228,89 +269,81 @@ class WorldManager:
             raw_json = str(args.get("setting_json") or "").strip()
             if not raw_json:
                 messages.append(out)
-                messages.append(HumanMessage(content="ERROR: setting_json is empty. Provide JSON."))
+                _reject("ERROR: setting_json is empty. Provide JSON.", call_id)
                 continue
 
             try:
                 parsed = json.loads(raw_json)
             except Exception as e:
                 messages.append(out)
-                messages.append(HumanMessage(content=f"ERROR: Invalid JSON: {e}"))
+                _reject(f"ERROR: Invalid JSON: {e}. The argument carries one JSON "
+                        f"object and nothing after it.", call_id)
                 continue
 
             if not isinstance(parsed, dict):
+                messages.append(out)
+                _reject("ERROR: setting_json must be one JSON object.", call_id)
                 continue
 
             # --- Validate top-level keys ---
             missing_top = [f for f in required_top_level if f not in parsed]
             if missing_top:
                 messages.append(out)
-                messages.append(HumanMessage(
-                    content=f"ERROR: Missing top-level keys: {', '.join(missing_top)}"
-                ))
+                _reject(f"ERROR: Missing top-level keys: {', '.join(missing_top)}", call_id)
                 continue
 
             # world_essence must be non-empty
             essence = str(parsed.get("world_essence") or "").strip()
             if not essence:
                 messages.append(out)
-                messages.append(HumanMessage(content="ERROR: world_essence is empty."))
+                _reject("ERROR: world_essence is empty.", call_id)
                 continue
 
             # gurps_calibration must be a dict with required sub-keys
             gc = parsed.get("gurps_calibration")
             if not isinstance(gc, dict):
                 messages.append(out)
-                messages.append(HumanMessage(content="ERROR: gurps_calibration must be a JSON object."))
+                _reject("ERROR: gurps_calibration must be a JSON object.", call_id)
                 continue
             missing_gc = [k for k in required_gurps_keys if k not in gc]
             if missing_gc:
                 messages.append(out)
-                messages.append(HumanMessage(
-                    content=f"ERROR: gurps_calibration missing keys: {', '.join(missing_gc)}"
-                ))
+                _reject(f"ERROR: gurps_calibration missing keys: {', '.join(missing_gc)}", call_id)
                 continue
 
             # power_tiers must have at least "average" and "unique"
+            problem = ""
             tiers = gc.get("power_tiers")
             if not isinstance(tiers, list) or len(tiers) < 2:
+                problem = "power_tiers must be an array with at least 2 entries."
+            else:
+                tier_names = set()
+                for i, t in enumerate(tiers):
+                    if not isinstance(t, dict):
+                        problem = f"power_tiers[{i}] must be a JSON object."
+                        break
+                    tier_names.add(str(t.get("tier") or "").strip().lower())
+                    missing_tier = [k for k in required_tier_keys if k not in t]
+                    if missing_tier:
+                        problem = f"power_tiers[{i}] missing keys: {', '.join(missing_tier)}"
+                        break
+                if not problem and ("average" not in tier_names or "unique" not in tier_names):
+                    problem = "power_tiers must include at least 'average' and 'unique' tiers."
+            if problem:
                 messages.append(out)
-                messages.append(HumanMessage(
-                    content="ERROR: power_tiers must be an array with at least 2 entries."
-                ))
-                continue
-            tier_names = set()
-            for i, t in enumerate(tiers):
-                if not isinstance(t, dict):
-                    continue
-                name = str(t.get("tier") or "").strip().lower()
-                tier_names.add(name)
-                missing_tier = [k for k in required_tier_keys if k not in t]
-                if missing_tier:
-                    messages.append(out)
-                    messages.append(HumanMessage(
-                        content=f"ERROR: power_tiers[{i}] missing keys: {', '.join(missing_tier)}"
-                    ))
-                    continue
-            if "average" not in tier_names or "unique" not in tier_names:
-                messages.append(out)
-                messages.append(HumanMessage(
-                    content="ERROR: power_tiers must include at least 'average' and 'unique' tiers."
-                ))
+                _reject(f"ERROR: {problem}", call_id)
                 continue
 
             # supernatural_spectrum must have required keys
             ss = gc.get("supernatural_spectrum")
             if not isinstance(ss, dict):
                 messages.append(out)
-                messages.append(HumanMessage(content="ERROR: supernatural_spectrum must be a JSON object."))
+                _reject("ERROR: supernatural_spectrum must be a JSON object.", call_id)
                 continue
             missing_ss = [k for k in required_spectrum_keys if k not in ss]
             if missing_ss:
                 messages.append(out)
-                messages.append(HumanMessage(
-                    content=f"ERROR: supernatural_spectrum missing keys: {', '.join(missing_ss)}"
-                ))
+                _reject(f"ERROR: supernatural_spectrum missing keys: {', '.join(missing_ss)}", call_id)
                 continue
 
             # --- Validate initial_world_time ---
@@ -331,27 +364,23 @@ class WorldManager:
                 parsed_wt = WorldTime.parse(wt)
                 if parsed_wt.year <= 1:
                     messages.append(out)
-                    messages.append(HumanMessage(content="ERROR: initial_world_time must be meaningful, not year 0000/0001"))
+                    _reject("ERROR: initial_world_time must be meaningful, not year 0000/0001", call_id)
                     continue
             except Exception:
                 messages.append(out)
-                messages.append(HumanMessage(
-                    content=f"ERROR: initial_world_time format invalid. "
+                _reject(
+                    f"ERROR: initial_world_time format invalid. "
                     f"Must be a calendar date/time like \"Y1479-03-15 18:00\". "
-                    f"Current value: {wt!r}"
-                ))
+                    f"Current value: {wt!r}",
+                    call_id,
+                )
                 continue
 
             # --- Save to history ---
             if self._history_path:
-                limits = limits_from_env()
-                append_message(self._history_path, role="user", content="WORLD_SETTING creation", limits=limits)
-                append_message(
-                    self._history_path,
-                    role="assistant",
-                    content=json.dumps(parsed, ensure_ascii=False, indent=2),
-                    limits=limits,
-                )
+                own_memory = memory_at(self._history_path)
+                own_memory.record("WORLD_SETTING creation")
+                own_memory.record("[world_setting]\n" + json.dumps(parsed, ensure_ascii=False, indent=2))
 
             if logs_enabled():
                 print(f"[trace] World setting created: {essence[:80]}")
@@ -409,6 +438,10 @@ class WorldManager:
             tools=tools,
         )
 
+    def set_peer_history(self, path: Optional[Path]) -> None:
+        """Name the memory this agent reports its changes into (the GM's)."""
+        self._peer_history_path = path
+
     def call_wm(
         self,
         *,
@@ -436,28 +469,38 @@ class WorldManager:
                 title_suffix="-world-manager",
                 max_tokens=4000,
                 parallel_tool_calls=True,
+                thinking=True,  # world building is deliberation
+                effort="low",
             )
 
         from world_manager.tool_registry import ToolRegistry
 
         all_tools = tools or ToolRegistry.for_wm()
 
-        from world_manager.tool_registry import reset_doc_read_tracker, clear_current_agent
-        reset_doc_read_tracker("wm")
-
         tools_by_name = {t.name: t for t in all_tools}
-        llm_with_tools = llm.bind_tools(all_tools).with_config({
-            "callbacks": openrouter_logging_callbacks(scope="world_manager", label="call_wm"),
-        })
+        llm_with_tools = bind_agent_tools(
+            llm, all_tools,
+            callbacks=openrouter_logging_callbacks(scope="world_manager", label="call_wm"),
+        )
 
         # ── Build intro message ────────────────────────────────────
         intro_parts = [f"[call_wm: {notice}]"]
 
-        # Elapsed time since last call
+        # Elapsed time since this agent was last called, from its own record.
+        # The interval fallback is measured from the same record, so a call the
+        # clock made and a call a trigger made read the same way here.
         elapsed_days = 0
-        if context and context.get("world_time"):
-            # Orchestrator provides days_since_last_call
-            elapsed_days = context.get("days_since_last_call", 0)
+        world_time_str = str((context or {}).get("world_time") or "").strip()
+        if world_time_str:
+            from engine.agent_schedule import last_call_tick
+            since = last_call_tick("wm")
+            if since > 0:
+                try:
+                    from world.time import WorldTime
+                    gap = WorldTime.parse(world_time_str).to_seconds() - since
+                    elapsed_days = max(0, gap // (24 * 60 * 60))
+                except Exception:
+                    elapsed_days = 0
 
         if elapsed_days > 0:
             intro_parts.append(f"World time advanced {elapsed_days} days since last call.")
@@ -466,7 +509,7 @@ class WorldManager:
         if notice == "initialize_world":
             # Inject character descriptions from preset files + plot
             from world.io import _read_json as _read_json_file
-            game_root = Path("game")
+            game_root = _game_root()
             char_dir = (game_root / "players").resolve()
             char_blocks = []
             plot_text = ""
@@ -515,9 +558,9 @@ class WorldManager:
 
         # Last summary from previous invocation
         if self._last_summary:
-            intro_parts.append(f"\n[last_summary]\n{self._last_summary}")
+            intro_parts.append(f"\n## Last Summary\n{self._last_summary}")
 
-        human_msg = "\n".join(intro_parts)
+        human_msg = opening(intro_parts, moment=world_time_str)
 
         # ── Build remaining messages ────────────────────────────────
 
@@ -535,51 +578,51 @@ class WorldManager:
             pass
         if context and context.get("world_registry"):
             persistent.append(SystemMessage(
-                content=f"[world_registry]\n{json.dumps(context['world_registry'], indent=2)}"
+                content=f"## World Registry\n{json.dumps(context['world_registry'], indent=2)}"
             ))
         if context and context.get("world_orientation"):
             persistent.append(SystemMessage(
-                content=f"[world_orientation]\n{json.dumps(context['world_orientation'], indent=2)}"
+                content=f"## World Orientation\n{json.dumps(context['world_orientation'], indent=2)}"
             ))
 
         # History: previous WM write-tool calls (reads are NOT saved)
         history_msgs: List[BaseMessage] = []
         if self._history_path and self._history_path.exists():
-            history = load_history(self._history_path)
-            for h in history:
+            for h in load_history(self._history_path):
                 role = (h.get("role") or "").strip().lower()
-                content = str(h.get("content") or "")
-                if role == "user":
-                    history_msgs.append(HumanMessage(content=content))
-                elif role == "assistant":
-                    history_msgs.append(AIMessage(content=content))
+                # Stored entries are records the framework authored, so they are
+                # read back as records whatever role they were written with, and
+                # in the world's voice: the markers are the code's.
+                said = spoken(str(h.get("content") or ""))
+                if role in ("user", "assistant") and said.strip():
+                    history_msgs.append(HumanMessage(content=said))
 
         # Invocation context (fresh each call)
         invocation = []
         if context:
             if context.get("subscription_trigger"):
                 invocation.append(SystemMessage(
-                    content=f"[subscription_trigger]\n{json.dumps(context['subscription_trigger'], indent=2)}"
+                    content=f"## Subscription Trigger\n{json.dumps(context['subscription_trigger'], indent=2)}"
                 ))
             if context.get("event_summary"):
                 invocation.append(SystemMessage(
-                    content=f"[event_summary]\n{context['event_summary']}"
+                    content=f"## Event Summary\n{context['event_summary']}"
                 ))
             if context.get("pending_events"):
                 invocation.append(SystemMessage(
-                    content=f"[pending_events]\n{json.dumps(context['pending_events'], indent=2)}"
+                    content=f"## Pending Events\n{json.dumps(context['pending_events'], indent=2)}"
                 ))
             if context.get("faction_snapshot"):
                 invocation.append(SystemMessage(
-                    content=f"[faction_snapshot]\n{json.dumps(context['faction_snapshot'], indent=2)}"
+                    content=f"## Faction Snapshot\n{json.dumps(context['faction_snapshot'], indent=2)}"
                 ))
             if context.get("world_debt"):
                 invocation.append(SystemMessage(
-                    content=f"[world_debt]\n{json.dumps(context['world_debt'], indent=2)}"
+                    content=f"## World Debt\n{json.dumps(context['world_debt'], indent=2)}"
                 ))
             if context.get("active_intents"):
                 invocation.append(SystemMessage(
-                    content=f"[active_intents]\n{json.dumps(context['active_intents'], indent=2)}"
+                    content=f"## Active Intents\n{json.dumps(context['active_intents'], indent=2)}"
                 ))
 
         # ── Assemble and invoke ──────────────────────────────────────
@@ -591,7 +634,7 @@ class WorldManager:
         if notice == "initialize_world":
             try:
                 from world.io import _read_json as _read_json_file
-                char_dir = (Path("game") / "players").resolve()
+                char_dir = (_game_root() / "players").resolve()
                 if char_dir.exists():
                     for pdir in sorted(char_dir.iterdir()):
                         if not pdir.is_dir():
@@ -623,18 +666,22 @@ class WorldManager:
 
         set_close_validation_hook(_validate_wm_close)
 
-        # ── News digest ──────────────────────────────────────────────
-        news_digest = self._build_news_digest()
-        news_msgs = [SystemMessage(content=news_digest)] if news_digest else []
-
         messages = [
             SystemMessage(content=self._prompt_text),
             *persistent,
             *history_msgs,
-            *news_msgs,
             *invocation,
             HumanMessage(content=human_msg),
         ]
+
+        from engine.change_summary import ChangeCollector, append_change_record
+        changes = ChangeCollector()
+
+        # The invocation is a branch of the WM's memory, opened when it wakes and
+        # closed by the termination tool that ends its work.
+        own_memory = memory_at(self._history_path) if self._history_path else None
+        if own_memory is not None:
+            own_memory.open_branch()
 
         result = react_loop_iteration(
             messages,
@@ -642,9 +689,10 @@ class WorldManager:
             tools_by_name,
             termination_tools={"invoke_self", "close_invocation"},
             readonly_tools={
-                "read_tool_doc", "get_entity", "get_entity_facts",
+                "get_entity", "get_entity_facts", "get_entity_state",
                 "query_entities", "query_events",
             },
+            changes=changes,
         )
 
         # ── Extract thinking ─────────────────────────────────────────
@@ -652,7 +700,7 @@ class WorldManager:
         thinking_parts = []
         for m in result["messages"]:
             t = str(getattr(m, "type", "") or "").strip().lower()
-            content = str(getattr(m, "content", "") or "").strip()
+            content = str(getattr(m, "content", "") or "").strip() or extract_reasoning(m)
             if t in {"ai", "assistant"} and content:
                 thinking_parts.append(content)
 
@@ -668,71 +716,69 @@ class WorldManager:
             thinking=thinking,
         )
 
-        # ── Persist to history (only write-tools, not reads) ────────
-        WRITE_TOOLS = {
-            "set_entity", "set_entity_facts",
-            "add_tags", "remove_tags",
-            "record_event",
-            "attach_script", "detach_script",
-            "set_effect", "remove_effect",
-            "delete_entity",
-            "write_correction",
-        }
+        # ── Persist to history ──────────────────────────────────────
+        # In the order the invocation lived: the notice it was woken with, its
+        # deliberation, and what it wrote through its tools. The intro is per-call
+        # context — characters, plot, trigger — and is rebuilt for every call, so
+        # persisting it would duplicate facts that the next call states again; a
+        # notice naming only the mode is the same kind of non-news.
 
         if self._history_path:
-            limits = limits_from_env()
-            # Save the intro as user message
-            append_message(self._history_path, role="user", content=human_msg, limits=limits)
+            if str(notice or "").strip().lower() not in _BARE_NOTICES:
+                own_memory.record(f"[call_wm: {notice}]")
+
+            # What the manager reasoned is kept as a record of its own deliberation.
+            if thinking:
+                own_memory.record(f"[reasoning]\n{thinking}")
+
+            # What it wrote through its tools, in the order it wrote it. Without it
+            # the memory keeps the deliberation and loses the deed, and the next
+            # wake reads its own past as thinking that led nowhere.
+            for m in result["messages"]:
+                body = str(getattr(m, "content", "") or "").strip()
+                if body.startswith("[written]"):
+                    own_memory.record(body)
+
+            # What this invocation changed, in outline: one aggregated record
+            # instead of the calls that caused it, sent to the Game Master — the
+            # authority below this one — so what the world gained reaches the
+            # campaign's memory. Not kept here: the World Manager made these
+            # changes itself in this invocation, so a copy of them in its own
+            # memory tells it what it already knows, and pushes out what it was
+            # told by others.
+            changes_block = changes.build("wm")
+            append_change_record(self._peer_history_path, changes_block)
 
             # Extract exit args from result messages
             exit_tool_name = result.get("exit_tool", "")
             exit_tool_args = result.get("exit_args") or {}
 
-            # Save write-tool calls from the ReAct loop (chronological order)
-            for m in result["messages"]:
-                t = str(getattr(m, "type", "") or "").strip().lower()
-                if t in {"ai", "assistant"}:
-                    tcalls = getattr(m, "tool_calls", None) or []
-                    for tc in tcalls:
-                        name = str(tc.get("name", "") or "")
-                        if name in WRITE_TOOLS:
-                            args = tc.get("args", {}) or {}
-                            args_str = " ".join(f"{k}={v}" for k, v in args.items() if k not in ("world_summary", "fallback_interval_days"))
-                            line = f"[{name}] {args_str}"[:500]
-                            append_message(
-                                self._history_path, role="assistant",
-                                content=line, limits=limits,
-                            )
-
-            # Save terminal tool result AFTER write-tools (chronological end)
+            # Save terminal tool result (chronological end)
             if exit_tool_name == "invoke_self":
                 comment = exit_tool_args.get("comment", "") or ""
                 if comment:
-                    append_message(
-                        self._history_path, role="assistant",
-                        content=f"[invoke_self] {comment}", limits=limits,
-                    )
+                    own_memory.record(f"[invoke_self] {comment}")
             elif exit_tool_name == "write_correction":
                 msg = exit_tool_args.get("message", "") or ""
                 if msg:
-                    append_message(
-                        self._history_path, role="assistant",
-                        content=f"[correction] {msg[:200]}", limits=limits,
-                    )
+                    own_memory.record(f"[correction] {msg[:200]}")
+            # The termination tool ended the wake: the branch closes with it, and
+            # what it kept is merged into the thread.
+            own_memory.close_branch()
 
         from world_manager.tool_registry import set_close_validation_hook as _clear_hook
         _clear_hook(None)
-        clear_current_agent()
 
-        # ── Update last_call_tick ───────────────────────────────────
-        if context and context.get("current_tick"):
-            self._last_call_tick = int(context["current_tick"])
+        # ── Record this invocation ──────────────────────────────────
+        # In world time and in ticks, persisted: what the cycle's wake-up drain
+        # and the elapsed-time line above are both measured from.
+        from engine.agent_schedule import record_call
+        record_call("wm")
 
-        # ── Update news digest marker on successful invocation ──────
-        exit_tool = result.get("exit_tool")
-        if exit_tool in ("close_invocation", "invoke_self"):
-            if self._last_digest_event_id:
-                self._meta.set_last_seen_event_id(self._last_digest_event_id)
+        # What the trims just dropped is still in this invocation's own context,
+        # so the paragraph about it is written from here, before the next call
+        # opens on a history that starts mid-story.
+        self._cover_retired_history(history_msgs=history_msgs, pinned=persistent)
 
         # ── Summarization triggers (every 10 invocations, every 10 paragraphs) ──
         inv_count = self._meta.increment_invocation()
@@ -748,6 +794,52 @@ class WorldManager:
             "exit_args": result.get("exit_args"),
             "thinking": thinking,
         }
+
+    def _cover_retired_history(self, *, history_msgs, pinned) -> None:
+        """Turn what a trim dropped into a paragraph, while it is still in context.
+
+        ``history_msgs`` is the history as this invocation saw it, ``pinned`` the
+        blocks above it. The request reuses both, so its prefix is the one this
+        invocation already paid for and only the task at its end is new.
+        """
+        if not self._history_path:
+            return
+        try:
+            from engine.history_retirement import dropped_from, pending_retirement, retire
+            from world.agent_story import append_paragraph
+
+            fell_out = dropped_from(self._history_path, history_msgs)
+            if not fell_out and not pending_retirement(self._history_path):
+                return
+
+            root = self._history_path.parent
+
+            def _write(name, summary):
+                append_paragraph(
+                    summaries_path=root / "wm_summaries.json",
+                    story_path=root / "wm_story.json",
+                    name=name or "World Summary",
+                    summary=summary,
+                )
+
+            if retire(
+                self._history_path,
+                dropped=fell_out,
+                prefix=list(pinned or []),
+                history_messages=history_msgs,
+                prompt_text=self._prompt_text,
+                temperature=self._temperature,
+                scope="world_manager",
+                write=_write,
+                kind="paragraph",
+                label="wm_history_retirement",
+            ):
+                self._meta.append_entry("auto_injection", "[wm_history_retirement]")
+                if logs_enabled():
+                    print("[trace] WM covered retired history")
+        except Exception as e:
+            if logs_enabled():
+                print(f"[trace] WM history retirement failed: {e}")
 
     def _run_paragraph_summary(self) -> None:
         """Run WM paragraph summary (every 10 invocations).
@@ -843,40 +935,3 @@ class WorldManager:
         except Exception as e:
             if logs_enabled():
                 print(f"[trace] WM _run_arc_summary error: {e}")
-
-    def _build_news_digest(self) -> str:
-        """Build news digest from narrative_flag events since last invocation."""
-        try:
-            from world_manager.event_log import query_events
-            from world.time import WorldTime
-
-            last_id = self._meta.last_seen_event_id
-            events = query_events(
-                narrative_flag_only=True,
-                since_event_id=last_id,
-                limit=20,
-            )
-        except Exception:
-            return ""
-
-        if not events:
-            return ""
-
-        try:
-            wt = WorldTime.now() if hasattr(WorldTime, 'now') else None
-            now_str = wt.to_string() if wt else "?"
-        except Exception:
-            now_str = "?"
-
-        lines = [f"[news_digest] Since your last invocation — current time ({now_str})"]
-        for ev in events:
-            ev_tick = ev.get("tick", 0)
-            desc = str(ev.get("description", "")).strip()
-            tag = str(ev.get("tag", "")).strip()
-            if tag:
-                lines.append(f"  [{tag}] {desc[:200]}")
-            else:
-                lines.append(f"  - {desc[:200]}")
-            self._last_digest_event_id = ev.get("event_id", "")
-
-        return "\n".join(lines)

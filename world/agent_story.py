@@ -206,7 +206,7 @@ def build_agent_summaries_block(summaries_path: Path) -> Optional[str]:
             a_name = str(arc.get("name") or "").strip()
             a_summary = str(arc.get("summary") or "").strip()
             if a_name and a_summary:
-                lines.append(f"[ARC] {a_name}: {a_summary[:500]}")
+                lines.append(f"Arc — {a_name}: {a_summary[:500]}")
 
     # Then remaining (not-yet-arc'd) paragraphs
     for para in (data.get("paragraphs") or []):

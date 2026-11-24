@@ -146,53 +146,10 @@ def _safe_label(label: Optional[str]) -> str:
     return s if s else "unknown"
 
 
-def _last_prompt_path(*, scope: str, label: Optional[str]) -> Path:
-    safe_scope = _safe_label(scope)
-    safe_label = _safe_label(label)
-    return logs_dir() / "last_prompts" / f"{safe_scope}__{safe_label}.txt"
-
-
 def _last_request_path(*, scope: str, label: Optional[str]) -> Path:
     safe_scope = _safe_label(scope)
     safe_label = _safe_label(label)
     return logs_dir() / "last_requests" / f"{safe_scope}__{safe_label}.json"
-
-
-def _format_messages_for_prompt(messages: List[List[BaseMessage]], *, scope: str = "", label: str = "") -> str:
-    lines: List[str] = []
-    # Add timestamp header for debugging context changes
-    header = f"# PROMPT CAPTURED: {_utc_now_iso()}"
-    if scope or label:
-        header += f" | scope={scope} label={label}"
-    lines.append(header)
-    lines.append("")
-    
-    for thread in messages or []:
-        for m in thread or []:
-            role = getattr(m, "type", m.__class__.__name__).lower()
-            if role == "human":
-                role = "user"
-            elif role == "ai":
-                role = "assistant"
-
-            content = str(getattr(m, "content", "") or "")
-            lines.append(f"[{role}]")
-            lines.append(content)
-            lines.append("")
-    return "\n".join(lines).rstrip() + "\n"
-
-
-def _save_last_prompt(*, scope: str, label: Optional[str], text: str) -> None:
-    try:
-        p = _last_prompt_path(scope=scope, label=label)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(p.suffix + ".tmp")
-        with tmp.open("w", encoding="utf-8") as f:
-            f.write(text)
-        tmp.replace(p)
-    except Exception:
-        # Never block the app for debug capture.
-        pass
 
 
 def _save_last_request(*, scope: str, label: Optional[str], data: Dict[str, Any]) -> None:
@@ -389,13 +346,11 @@ class LiveStreamCallback(BaseCallbackHandler):
         _set_shared_in_tool_call(False)  # Reset shared state for watchdog
         self._append(f"\n{self._prefix()}<llm_start { _utc_now_iso() }>\n")
 
-        # Best-effort: persist last prompt for UI debug (fallback for string prompts).
+        # Tell the transport capture which invocation is running.
         try:
-            if prompts:
-                # Add timestamp header
-                header = f"# PROMPT CAPTURED: {_utc_now_iso()} | scope={self.scope} label={self.label}\n\n"
-                text = header + "\n\n".join([str(p or "") for p in prompts])
-                _save_last_prompt(scope=self.scope, label=self.label, text=text)
+            from api_wire_capture import set_current_scope
+
+            set_current_scope(self.scope, self.label)
         except Exception:
             pass
 
@@ -407,10 +362,12 @@ class LiveStreamCallback(BaseCallbackHandler):
         with self._in_tool_call_lock:
             self._in_tool_call = False
         _set_shared_in_tool_call(False)  # Reset shared state for watchdog
-        # Best-effort: persist last prompt for UI debug (preferred for chat models).
+        # The request that follows belongs to this invocation: the capture on the
+        # transport writes it down, and this is what tells it which one it is.
         try:
-            text = _format_messages_for_prompt(messages, scope=self.scope, label=self.label)
-            _save_last_prompt(scope=self.scope, label=self.label, text=text)
+            from api_wire_capture import set_current_scope
+
+            set_current_scope(self.scope, self.label)
         except Exception:
             pass
 

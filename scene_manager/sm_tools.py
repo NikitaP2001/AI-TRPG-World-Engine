@@ -6,7 +6,7 @@ They are NOT character tools — they use SM authority to modify the scene.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from langchain_core.tools import tool
 
@@ -14,10 +14,38 @@ from langchain_core.tools import tool
 # Reset at the start of each SM turn, consumed by orchestrator at resolution.
 _SM_AUTHORED_INTS: List[Dict[str, Any]] = []
 
+#: The hand that can call a character back in the middle of a review, and answer
+#: with what he now attempts. The orchestrator holds it for the length of the
+#: resolve phase: outside it a management of an attempt is a request applied
+#: when the phase ends. Signature: (intent_id, action, cut_after, reason) ->
+#: what the review reads back.
+_CALL_BACK: Optional[Callable[[str, str, str, str], str]] = None
+
+# The session's narrative, recorded by write_session_narrative and read when the
+# session closes. It is the account of the session a later reader gets.
+_SESSION_NARRATIVE: List[str] = []
+
 
 def reset_sm_intents() -> None:
     """Call at start of each SM invocation."""
     _SM_AUTHORED_INTS.clear()
+
+
+def set_callback_resolver(fn: Optional[Callable[[str, str, str, str], str]]) -> None:
+    """Name (or clear) the hand that manages an attempt and takes the new decision.
+
+    Installed by the orchestrator for the length of the resolve phase. While it
+    is there, managing an attempt is answered inside the same review: the owner
+    is called back and the review is told what he now attempts — under the id it
+    can go on to act by.
+    """
+    global _CALL_BACK
+    _CALL_BACK = fn
+
+
+def has_callback_resolver() -> bool:
+    """Is a management of an attempt answered here and now, or when the phase ends?"""
+    return _CALL_BACK is not None
 
 
 def get_sm_intents() -> List[Dict[str, Any]]:
@@ -27,6 +55,16 @@ def get_sm_intents() -> List[Dict[str, Any]]:
     return result
 
 
+def get_session_narrative() -> str:
+    """The session's narrative as recorded, or '' when none was."""
+    return _SESSION_NARRATIVE[-1] if _SESSION_NARRATIVE else ""
+
+
+def clear_session_narrative() -> None:
+    """Forget the session's narrative. Called when a new close begins."""
+    _SESSION_NARRATIVE.clear()
+
+
 def _parse_time_sec(text: str, default: int = 0) -> int:
     """Parse a time string like '0s', '5m', '2h', '1d' to seconds."""
     from scheduler.timeline import parse_duration_seconds
@@ -34,46 +72,19 @@ def _parse_time_sec(text: str, default: int = 0) -> int:
 
 
 @tool
-def proceed_to_narration() -> str:
-    """All intents resolved. Narrate the turn.
-    
-    Only available during the resolve phase — signals the SM is ready
-    to move from reviewing intents to producing narration.
-    """
-    return "ready"
+def write_session_narrative(narrative: str) -> str:
+    """Record the events a stretch of cycles came to, as a narrative of them.
 
-
-@tool
-def publish_narrative_block(
-    narration: Dict[str, str],
-    factual_summary: str,
-) -> str:
-    """
-    Use this to deliver the resolved action to players as immersive prose.
-    This is distinct from record_event, which writes structured facts to
-    the event log and does not produce narrative text.
-
-    Call this when you have reviewed the resolved history and are ready
-    to describe what happened.
-
-    For each active character, write a short narrative from their
-    perspective — what they saw, heard, felt. Write in Russian,
-    third-person objective, novelistic tone, matching character knowledge.
-
-    Also write a factual summary: 2-4 dry, objective sentences covering
-    only what actually occurred, without personalization.
+    Immersive third-person prose narration of what took place in those cycles.
 
     Args:
-        narration: Dict mapping each active character name to their
-            personal narrative. Key = character name, value = what
-            this character experienced. Must include all active characters.
-        factual_summary: 2-4 dry, objective sentences — only facts,
-            no personalization. What actually happened this cycle.
+        narrative: Those events, narrated in prose.
     """
-    parts = []
-    for name, text in narration.items():
-        parts.append(f"[{name}]\n{text}")
-    return "\n\n".join(parts)
+    text = str(narrative or "").strip()
+    if not text:
+        return "ERROR: the narrative is empty. Write the events."
+    _SESSION_NARRATIVE.append(text)
+    return f"ok\nnarrative recorded ({len(text)} characters)"
 
 
 @tool
@@ -82,38 +93,58 @@ def manage_intent(
     action: str,
     reason: str,
     interrupt_at_offset: str = "",
-    character_name: str = "",
 ) -> str:
-    """Manage a player's intent — remove it entirely or interrupt it mid-execution.
+    """Notify a player that he may need to adjust his character intent.
 
-    Use ``action="remove"`` when the intent was impossible, contradictory,
-    or misdirected — it is cancelled entirely and the player is re-invoked.
+    This is NOT tool to spoiler his intent will fail badly in future, it just a tool to expand
+    player knowledge about what his character know or noticed something unexpected, player did not 
+    considered on the moment he planned intent.
 
-    Use ``action="interrupt"`` when the intent was valid and partially resolved,
-    but new circumstances override it from this point forward. The intent's
-    ``t_end`` is set to ``now + interrupt_at_offset``, letting the resolved
-    portion stand while cutting off the remainder. The player is re-invoked
-    to decide what to do after the interrupt point.
+    The player is invoked right within this cycle given a posibility to adjust 
+    his intents. He is told to plan starting from the moment of the begining of the cycle again,
+    in case "remove" is used, otherwise he is told to plan like interrupt_at_offset 
+    time since cycle start already passed, and he has to plan since then. 
+    So interrupt usage like moves the player by interrupt_at_offset time forward,
+    and remove usage make him redecide from the same time point.
 
-    Interruption is constrained by the player's own ``absorption`` declaration:
-    - "alert" players: freely available for any significant event.
-    - "immersed" players: only for direct physical threat to that player.
+    In result of this call you will receive new player intents if any and updated expected
+    cycle advance estimation, if current player intent changed it.
 
     Args:
-        intent_id: The intent to manage.
-        action: ``"remove"`` to cancel entirely, ``"interrupt"`` to cut short.
-        reason: Why this action is taken. The player sees this.
-            Must reference a specific resolved event when interrupting.
-        interrupt_at_offset: Only for ``action="interrupt"`` — a duration string
-            for how long the intent still runs before being cut off.
-            If empty, the interrupt is immediate (t_end = now).
-            Valid units: s, m, h, d.
-        character_name: The player who owns this intent. If empty, inferred
-            from the current turn's declared intents.
+        intent_id: The intent to act on, by the id it carries in the review of
+            declared intents.
+        action: "remove" discards the intent outright; "interrupt" cuts it
+            short from the stated point.
+        reason: Why this is happening passed to the player. An interruption must 
+            name the resolved event that overrides the intent: this text is what 
+            its owner is given when he is called back.
+        interrupt_at_offset: For "interrupt" — how much longer the intent
+            still runs before it is cut off, as a duration (s, m, h, d).
+            Empty cuts it off at once.
     """
-    mode = "removed" if action == "remove" else "interrupted"
-    extra = f" at +{interrupt_at_offset}" if interrupt_at_offset else ""
-    return f"[{mode}:{intent_id}]{extra} {reason}"
+    iid = str(intent_id or "").strip()
+    mode = str(action or "").strip().lower()
+    why = str(reason or "").strip()
+    if not iid:
+        return "ERROR: name the intent to act on, by the id it carries in the review."
+    if mode not in ("remove", "interrupt"):
+        return 'ERROR: action must be "remove" or "interrupt".'
+    if not why:
+        return "ERROR: say why — an interruption is what its owner is told."
+    if _CALL_BACK is not None:
+        # He is called back here, from the moment the action leaves him standing
+        # at, and the review reads his decision as this call's answer.
+        return _CALL_BACK(iid, mode, str(interrupt_at_offset or "").strip(), why)
+    patch: Dict[str, Any] = {"_patched": True, "id": iid, "_review": mode, "reason": why}
+    if mode == "interrupt":
+        patch["_cut_after_raw"] = str(interrupt_at_offset or "").strip()
+    _SM_AUTHORED_INTS.append(patch)
+    if mode == "remove":
+        return f"[removed:{iid}] {why}"
+    cut = patch["_cut_after_raw"]
+    return (f"Attempt {iid} was cut short"
+            + (f" after {cut}" if cut else " at once")
+            + f" — {why}")
 
 
 @tool
@@ -125,44 +156,59 @@ def declare_intent(
     t_start: str = "0s",
     duration: str = "",
     visibility: str = "public",
-    is_hostile: bool = False,
     area: Optional[Dict[str, Any]] = None,
-    detection_difficulty: Optional[int] = None,
-    trigger_condition: Optional[Dict[str, Any]] = None,
-    trigger_priority: int = 0,
+    trigger_condition: str = "",
     on_trigger: str = "interrupt_with_new_decision",
     prepared_reaction: str = "",
-    on_timeout: str = "",
     absorption: str = "alert",
 ) -> str:
-    """Declare an intent on behalf of any entity (NPC, world object, or player).
+    """State an intent on behalf of any entity in the scene.
 
-    Use this to give NPCs actions, have environment react, or correct a player
-    intent's details. The intent is merged with player-declared intents before
-    resolution by the SegmentScheduler.
+    An intent asserts what an actor means to attempt, and over what span; it
+    is not a guarantee and not a record of something already done. The actor
+    may be any entity in the scene — a character, a fixture, a location, or
+    the environment itself. Declared intents are resolved together with all
+    other active intents, so nothing here settles on its own.
 
     Args:
-        actor: entity_id of the acting entity (NPC, location, or player).
-        action_type: speech / movement / combat / cosmetic.
-        target: who or what this action targets.
-        description: narrative prose of the action.
-        t_start: when it starts. "0s" = now. Suffix: s, m, h, d.
-        duration: how long it lasts. Empty = instant (resolves in one segment).
-        visibility: "public" or "private".
-        is_hostile: only for combat. Default false.
-        area: area-of-effect data for target="area".
-        detection_difficulty: for private actions with mechanical effect.
-        trigger_condition: conditional activation. {"actor": "...", "action_type": "...", "target_match": "..."}.
-        trigger_priority: lower fires first. Default 0.
-        on_trigger: "interrupt_with_new_decision" or "apply_prepared_reaction".
-        prepared_reaction: pre-written sub-intent on trigger.
-        on_timeout: sub-intent if duration expires without trigger.
-        absorption: "alert" or "immersed".
+        actor: The acting entity, by entity id.
+        action_type: The kind of behaviour — speech, movement, combat, or
+            cosmetic. The kind decides which of the remaining fields are
+            meaningful.
+        target: What the behaviour is directed at: an entity, "all", "area",
+            or "self".
+        description: What the actor attempts, in prose. It states the attempt
+            and its observable form, not its outcome.
+        t_start: When the attempt begins, as a duration from now (s, m, h, d);
+            "0s" begins immediately.
+        duration: How long the attempt is sustained. Empty means it is
+            instantaneous and settles within one segment.
+        visibility: "public" makes the attempt apparent to anyone who could
+            notice it; "private" means an observer learns of it only if a
+            perception check succeeds.
+        area: The extent affected when the target is "area".
+        trigger_condition: Turns the intent into a standing readiness rather
+            than an immediate act: the condition, in words, under which the
+            attempt comes to pass. It is held until the condition does.
+        on_trigger: What the actor does when the condition is met — interrupt
+            the actor for a new decision, or apply the prepared reaction
+            automatically instead.
+        prepared_reaction: The attempt that replaces this one when the
+            condition is met and it is answered by applying the prepared
+            reaction rather than by interrupting.
+        absorption: How available the actor stays to events beyond its own
+            declared condition, for as long as the intent lasts: "alert" keeps
+            background awareness, "immersed" commits attention to the attempt
+            and answers only to direct threat.
     """
     t_start_sec = _parse_time_sec(t_start, default=0)
     t_end_sec = None
     if duration:
         t_end_sec = t_start_sec + _parse_time_sec(duration, default=0)
+    elif not str(trigger_condition or "").strip():
+        # No span and nothing to wait for: the attempt is made and settled where
+        # it stands, which is what an empty duration says it is.
+        t_end_sec = t_start_sec
 
     intent = {
         "actor": actor,
@@ -170,16 +216,12 @@ def declare_intent(
         "target": target,
         "description": description,
         "visibility": visibility,
-        "is_hostile": is_hostile,
         "area": area or None,
-        "detection_difficulty": detection_difficulty,
         "t_start": t_start_sec,
         "t_end": t_end_sec,
-        "trigger_condition": trigger_condition or None,
-        "trigger_priority": trigger_priority,
+        "trigger_condition": str(trigger_condition or "").strip() or None,
         "on_trigger": on_trigger,
         "prepared_reaction": {"description": prepared_reaction} if prepared_reaction.strip() else None,
-        "on_timeout": {"description": on_timeout} if on_timeout.strip() else None,
         "absorption": absorption,
         "_origin": "sm",
     }
@@ -192,28 +234,27 @@ def modify_intent(
     intent_id: str,
     duration: str = "",
     visibility: str = "",
-    is_hostile: Optional[bool] = None,
-    detection_difficulty: Optional[int] = None,
-    trigger_condition: Optional[Dict[str, Any]] = None,
-    trigger_priority: Optional[int] = None,
+    trigger_condition: str = "",
     on_trigger: str = "",
     absorption: str = "",
 ) -> str:
-    """Modify an existing intent by its ID.
+    """Change fields of an intent that is already declared.
 
-    Only provided fields are changed — omitted fields keep their current value.
-    To change actor, remove the intent and declare a new one.
+    Only the fields given are changed; everything else stays as declared.
+    The actor, its target and the description of an intent are not editable —
+    cancel the intent and declare a new one to change those.
 
     Args:
-        intent_id: The intent's id (returned by declare_intent).
-        duration: New duration string. Empty = keep current.
-        visibility: New visibility.
-        is_hostile: New hostility flag.
-        detection_difficulty: New detection difficulty.
-        trigger_condition: New trigger condition.
-        trigger_priority: New priority.
-        on_trigger: New trigger response.
-        absorption: New absorption level.
+        intent_id: The intent to change, as identified in the review of
+            declared intents.
+        duration: New span for the attempt, as a duration (s, m, h, d).
+            Empty keeps the current span.
+        visibility: New visibility, "public" or "private". Empty keeps it.
+        trigger_condition: The condition in words under which the attempt comes
+            to pass. Empty keeps the one it has.
+        on_trigger: New response to the condition being met. Empty keeps it.
+        absorption: New availability of the actor to outside events, "alert"
+            or "immersed". Empty keeps it.
     """
     from scheduler.timeline import parse_duration_seconds
     patch: Dict[str, Any] = {}
@@ -222,14 +263,8 @@ def modify_intent(
         patch["_duration_raw"] = duration
     if visibility:
         patch["visibility"] = visibility
-    if is_hostile is not None:
-        patch["is_hostile"] = is_hostile
-    if detection_difficulty is not None:
-        patch["detection_difficulty"] = detection_difficulty
-    if trigger_condition is not None:
-        patch["trigger_condition"] = trigger_condition or None
-    if trigger_priority is not None:
-        patch["trigger_priority"] = trigger_priority
+    if trigger_condition:
+        patch["trigger_condition"] = str(trigger_condition).strip() or None
     if on_trigger:
         patch["on_trigger"] = on_trigger
     if absorption:
@@ -243,26 +278,53 @@ def modify_intent(
 
 
 @tool
-def answer_player_question(answer: str) -> str:
-    """Respond to a player's observe or recall query.
+def answer_player_question(question_id: str, answer: str) -> str:
+    """Answer one question a character asked.
+
+    One call answers one question: the text passed here is the whole of what the
+    player receives for that question, and anything written outside the call is
+    not delivered. The questions are carried by their ids, and a question left
+    unanswered reaches the character as unanswered.
 
     Args:
-        answer: What the character perceives or recalls,
-            from their perspective. Immersive prose in Russian.
+        question_id: The id that question carries in the request.
+        answer: What that character perceives or recalls, from their own
+            perspective and within their knowledge — what they can notice or
+            remember, not what is true of the world beyond them.
     """
-    return f"[player_answer] {answer}"
+    return f"[answer recorded: {question_id}]"
 
 
 @tool
-def update_awareness(character_names: List[str], context: str) -> str:
-    """Provide players with their personal full perception narration.
-    They are re-invoked with this information added to their turn context.
-    Use when relevant, for example where significant or relevant changes 
-    around player happen, which his (player`s) character should have 
-    noticed, but player stil is not aware about it.
+def add_perception(
+    player: str,
+    perception: str,
+    knowledge: List[int] = [],
+) -> str:
+    """Give a character something to know. This is soft way to tell
+    something to a player, that his character noticed.
+
+    What is given here is his from now on, and he reads it when his next cycle
+    comes: it is not an interruption, what he is doing now does not change because
+    of it, and the cycle it was given in runs on without him. Breaking into the
+    cycle a character is already in is a separate act — his attempt cut short —
+    and manage_intent is the hand that does it.
 
     Args:
-        character_names: Which players to update.
-        context: immersive full desription from their perspective
+        player: The player who comes to know it.
+        perception: What he perceives, from his point of view within his
+            senses and limits.
+        knowledge[opt]: optional list of knowledge ids, which are stated as a
+            number beside the piece it names ("knowledge 7") wherever the piece
+            stands in your context.
     """
-    return f"[awareness:{','.join(character_names)}] {context}"
+    from scene_manager.awareness import ledger
+
+    name = str(player or "").strip()
+    if not name:
+        return "ERROR: name a player."
+    book = ledger()
+    said: List[str] = [book.perceive(name, perception)]
+    if knowledge:
+        said.append(book.give(name, knowledge=knowledge))
+    return "\n".join(said)

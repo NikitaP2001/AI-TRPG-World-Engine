@@ -12,17 +12,25 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 
-from memory_store import append_message, approx_token_count, limits_from_env, load_history
+from history_pipeline import memory_at
+from memory_store import approx_token_count, limits_from_env
+from record_voice import spoken
 from openrouter_langchain_logging import logs_enabled
-from openrouter_llm import build_openrouter_chat_llm, openrouter_logging_callbacks, read_prompt_text
-from world.story import PinnedBlockCache
+from openrouter_llm import bind_agent_tools, build_openrouter_chat_llm, extract_reasoning, openrouter_logging_callbacks, read_prompt_text
+from world.story import get_pinned_block_cache
+from engine.tool_errors import tool_failure
 from player.reflection import build_character_arc_block, build_character_paragraph_block, _character_dir
 
 from .memory import update_cycle_memory
 
 
 _HISTORY_NOTICE_PRINTED: set[str] = set()
-_PINNED_CACHES: Dict[str, PinnedBlockCache] = {}
+
+# Reasoning is not part of a character's context by default. Measured on a real
+# context, the deliberation it adds is tool planning in an operator's register rather
+# than the character's own impulse, and it doubles the number of tool calls. The
+# blocks stay switchable, for inspecting how a character perceives its scene.
+_THOUGHTS_BLOCKS_IN_CONTEXT = (os.getenv("LLM_WORLD_THOUGHTS_BLOCKS", "0") or "0").strip() == "1"
 
 # Per-invocation context for observe/recall/declare_intent tools
 _CHARACTER_NAME: Optional[str] = None
@@ -41,6 +49,10 @@ _NOW_SECONDS: int = 0  # Anchor for this invocation's t_start offsets (scheduler
 _SESSION_CONTEXTS: Dict[str, Dict[str, Any]] = {}
 _SESSION_HISTORY_PATHS: Dict[str, Path] = {}  # history_path per character (for end_session save)
 _SESSION_LIMITS: Optional[Any] = None
+# What each character asked and was told in the turn he is in, in the order he
+# learned it. Entered into his memory where the turn ends, not where the answer
+# arrives: the situation he was given stands before them.
+_SESSION_ANSWERS: Dict[str, List[str]] = {}
 
 
 def begin_session():
@@ -48,39 +60,125 @@ def begin_session():
     global _SESSION_CONTEXTS, _SESSION_HISTORY_PATHS
     _SESSION_CONTEXTS.clear()
     _SESSION_HISTORY_PATHS.clear()
+    _SESSION_ANSWERS.clear()
+
+
+def _valid_baseline(parsed: Any) -> bool:
+    """Is this the shape a standing psychological baseline is stated in?"""
+    if not isinstance(parsed, dict):
+        return False
+    core = parsed.get("psyche_core")
+    ego = parsed.get("ego_rationalization")
+    shape = parsed.get("compromise_formation")
+    if not isinstance(core, dict):
+        return False
+    if "affective_impulse" not in core or "phantasm" not in core:
+        return False
+    if not isinstance(ego, dict):
+        return False
+    if "internal_talk" not in ego or "defense_mechanism" not in ego:
+        return False
+    return isinstance(shape, str) and bool(shape.strip())
+
+
+def record_turn(
+    character_name: str,
+    *,
+    path: Path,
+    situation: str,
+    answers: List[str] = [],
+    decision: str = "",
+) -> int:
+    """Enter one turn into a character's memory, in the order the turn lived.
+
+    The situation he was given, what he asked and was told, then what he decided —
+    appended to his branch where the turn ends. Appended here and not at the
+    session's close because the branch is a queue: a record entered at the close
+    would stand after everything the world delivered in the meantime, and the
+    session would read as if he had been told what happened before he was told
+    where he stood.
+
+    The file is named by the caller, which holds it where the turn is run: a
+    lookup done here can find nothing — the file is registered at the end of the
+    turn — and the turn would go unrecorded without a word.
+    """
+    if not path:
+        from engine.incidents import record_incident
+
+        record_incident(
+            "character.record_turn:no_file",
+            ValueError(f"{character_name}: the turn has no memory file to enter it in"),
+        )
+        return 0
+    memory = memory_at(path, limits=_SESSION_LIMITS)
+    entered = 0
+    for text in [situation, *answers, decision]:
+        if str(text or "").strip():
+            memory.record(str(text))
+            entered += 1
+    return entered
 
 
 def end_session():
-    """End session. Save each character's essential data to disk once."""
+    """End session. Close each character's memory once — the one write to a file."""
     global _SESSION_CONTEXTS, _SESSION_HISTORY_PATHS, _SESSION_LIMITS
     for char_name, ctx in list(_SESSION_CONTEXTS.items()):
-        context_blob = ctx.get("context_blob", "")
-        decision_block = ctx.get("decision_block", "")
         memory_data = ctx.get("memory_data")
         history_path = _SESSION_HISTORY_PATHS.get(char_name)
-        if not history_path or not context_blob:
+        if not history_path:
             continue
+        own_memory = memory_at(history_path, limits=_SESSION_LIMITS)
+        if not own_memory.branch_open:
+            continue
+        memory: list = []
+        outcome: dict = {}
         try:
-            append_message(history_path, role="user", content=context_blob, limits=_SESSION_LIMITS)
-            if decision_block:
-                append_message(history_path, role="assistant", content=decision_block, limits=_SESSION_LIMITS)
-        except Exception:
-            pass
+            # What he read, in the order he read it — needed below, because the
+            # merge may trim the front of it away.
+            memory = own_memory.records()
+            # The session's branch closes here: what it wrote that is durable is
+            # merged into his memory, and the rest is dropped.
+            outcome = own_memory.close_branch()
+        except Exception as e:
+            memory, outcome = [], {}
+            print(f"  {char_name}: closing his memory failed: {e}")
+        else:
+            print(f"  {char_name}: memory closed "
+                  f"({outcome.get('merged', 0)} record(s) entered)")
+        # Whatever the merge just dropped from this record is still in hand, so
+        # the diary entry covering it is written now rather than lost — from the
+        # same prompt, the same pinned blocks and the same records he read.
+        if outcome.get("trimmed_out") and memory:
+            # One summary call per character, after that character's file is
+            # already final: it is said out loud, or the close looks finished
+            # while it is still running.
+            print(f"  {char_name}: covering {len(outcome['trimmed_out'])} retired "
+                  f"turn(s) — one summary call…")
+            try:
+                from player.reflection import cover_retired_turns
+                cover_retired_turns(
+                    char_name, history_path, memory,
+                    prefix=character_pinned_blocks(char_name),
+                )
+                print(f"  {char_name}: retired turns covered")
+            except Exception as e:
+                print(f"  {char_name}: covering retired turns failed: {e}")
         if memory_data:
             try:
                 from player.memory import update_cycle_memory as _utm
-                _utm(
-                    memory_data["memory_path"],
-                    character_name=char_name,
-                    world_time=memory_data.get("world_time", ""),
-                    scene_location=memory_data.get("scene_location", ""),
-                    thoughts_to_add=memory_data.get("thoughts", []),
-                    outcome=memory_data.get("outcome", {}),
-                )
+                for _turn in memory_data.get("turns") or []:
+                    _utm(
+                        memory_data["memory_path"],
+                        character_name=char_name,
+                        world_time=_turn.get("world_time", ""),
+                        scene_location=_turn.get("scene_location", ""),
+                        outcome=_turn.get("outcome", {}),
+                    )
             except Exception:
                 pass
     _SESSION_CONTEXTS.clear()
     _SESSION_HISTORY_PATHS.clear()
+    _SESSION_ANSWERS.clear()
     _SESSION_LIMITS = None
 
 
@@ -88,6 +186,20 @@ def set_sm_resolver(resolver):
     """Set the SM resolver function for observe/recall."""
     global _SM_RESOLVER
     _SM_RESOLVER = resolver
+
+
+def continues_his_turn(character_name: str) -> bool:
+    """Whether this character's next turn continues the one he is already in.
+
+    A character in a turn reads the conversation his turn is running in: a record
+    entered in his memory while it runs is not part of that conversation, so what
+    he was told reaches him only if it is carried to him. A character whose turn is
+    the first of his session reads his memory where the turn begins, and what was
+    entered before it already stands there — carried to him as well, it would stand
+    twice in one context.
+    """
+    ctx = _SESSION_CONTEXTS.get(str(character_name or "").strip())
+    return bool(ctx and ctx.get("messages"))
 
 
 def _flush_pending_to_sm(player_name: str, pending: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
@@ -132,19 +244,56 @@ def _flush_pending_to_sm(player_name: str, pending: Dict[str, List[Dict[str, Any
     except Exception as e:
         return {pid: {"result": f"(SM error: {e})"} for pid in id_map}
 
-    # Parse SM answer — expected format is a JSON dict {pending_id: answer}
-    # but SM may return free text. Try JSON first, fall back to assigning
-    # the full answer to all pending items.
+    # An answer belongs to the question it was written for. What comes back is
+    # one answer per question id; anything a question did not receive stays
+    # unanswered rather than being filled with another question's text.
     if isinstance(answer, str) and answer.strip().startswith("{"):
         try:
             parsed = json.loads(answer)
-            if isinstance(parsed, dict):
-                return {pid: {"result": parsed.get(pid, str(parsed))} for pid in id_map}
         except Exception:
-            pass
+            parsed = None
+        if isinstance(parsed, dict):
+            out: Dict[str, Any] = {}
+            for pid in id_map:
+                text = str(parsed.get(pid) or "").strip()
+                out[pid] = {"result": text} if text else {"result": "(no answer)"}
+            return out
 
-    # Fallback: distribute the answer text across all pending items
-    return {pid: {"result": answer} for pid in id_map}
+    if logs_enabled():
+        print(f"[trace] {player_name}: the SM returned no per-question answers "
+              f"for {len(id_map)} question(s)")
+    return {pid: {"result": "(no answer)"} for pid in id_map}
+
+
+def _answers_to_records(
+    pending: Dict[str, List[Dict[str, Any]]],
+    answers: Dict[str, Any],
+) -> List[str]:
+    """What a character's questions and answers are, as records of his own.
+
+    A question he asked and an answer he was given are his: nothing else keeps
+    them, and a turn that ends without them leaves him unable to say what he was
+    told. The question stands in his own words, the answer as it was written for
+    him, and one that came back empty is not entered at all — nothing was learned.
+    """
+    out: List[str] = []
+    items = list(pending.get("observes") or []) + list(pending.get("recalls") or [])
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        pid = str(item.get("id") or "").strip()
+        question = " ".join(str(item.get("query") or "").split())
+        if not pid or not question:
+            continue
+        answer = str((answers.get(pid) or {}).get("result") or "").strip()
+        if not answer or answer in ("(no answer)", "(SM unavailable)"):
+            continue
+        if answer.startswith("(SM error"):
+            continue
+        # No id: the number addresses a question inside one batch and is spent
+        # when that batch is answered. What he asked is his question's own words.
+        out.append(f"[player_answer] {question}\n  {answer}")
+    return out
 
 
 @dataclass
@@ -234,10 +383,15 @@ def _save_character_prompt_snapshot(
 
 @tool
 def observe(query: str = "") -> dict:
-    """Ask the Scene Manager what you perceive.
+    """Ask what you perceive around you.
+
+    Perception is how the scene reaches you beyond what you were given when
+    the turn began: it answers with what this character could notice from where
+    they stand, and with nothing else. Recall answers from memory instead.
 
     Args:
-        query: What to focus on.
+        query: What to attend to — a person, an object, a region, or a quality
+            of the surroundings. Empty asks for general awareness.
     """
     global _CHARACTER_NAME
     
@@ -265,96 +419,87 @@ def declare_intent(
     t_start: str,
     duration: str,
     visibility: str = "public",
-    is_hostile: bool = False,
     area: dict = {},
-    detection_difficulty: int = 0,
-    trigger_condition: dict = {},
-    trigger_priority: int = 0,
+    trigger_condition: str = "",
     on_trigger: str = "interrupt_with_new_decision",
     prepared_reaction: str = "",
-    on_timeout: str = "",
     absorption: str = "alert",
 ) -> str:
-    """Declare an action on the shared scene timeline.
+    """State what you intend to attempt, and over what span.
 
-    Put ALL narrative prose (speech, movement, reactions) in **description**.
-    The tool registers your action; the scheduler resolves it against everyone else's.
+    An intent is an attempt, not an outcome: it says what you mean to do and is
+    resolved together with everything else active in the scene, so nothing
+    declared here settles on its own. Declare once you know what you are doing,
+    then commit the decision so that time may advance.
 
-    ---
-    **action_type** — one of: speech, movement, combat, cosmetic.
-      speech:   talking, shouting, whispering. target = addressee.
-      movement: going somewhere. target = location/feature reference.
-      combat:   attack, defend, grapple, spell. May set is_hostile=true.
-      cosmetic: minor non-interactive action (sigh, adjust gear, glance). No mechanical effect.
-    **target** — who or what this action targets.
-      "self"     — yourself (self-buff - cast on self)
-      "all"      — everyone present (public speech or speech to unknown targets).
-      "area"     — area-of-effect. Provide area dict if action_type=combat.
-      otherwise  — character name, location/object reference, or unknown if name not known.
-    **description** — what the character does and says. ALL narrative prose goes here.
-      Include speech text, movement description, combat narration.
-      This is what the scheduler records and the SM narrates.
-    **t_start** — when this action starts, relative to now.
-      Format: number + suffix. Examples: "0s" (now), "Xm" (in X minutes), "Yh" (in Y hours).
-      Required. Use "0s" for immediate actions.
-    **duration** — how long the action lasts.
-      Format: number + suffix. Examples: "Xs", "Ym", "Zh", "Nd".
-      Empty + trigger_condition set → persistent subscription (stands until triggered).
-      Empty + NO trigger_condition → completes instantly (t_end = t_start, resolved in one segment).
-    **visibility** — public (default) or private.
-      public:  anyone aware of you can perceive this action.
-      private: concealed attempt. Provide detection_difficulty for mechanical effects.
-    **is_hostile** — only for action_type=combat. Default false.
-    **area** — area-of-effect data. Only valid when target="area".
-      Format: {"shape": "circle", "radius": "Xm"} or {"shape": "cone", "length": "Xm", "width": "Ym"}.
-    **detection_difficulty** — required if visibility=private AND has mechanical effect.
-      Integer difficulty for perception checks against this concealed action.
-    **trigger_condition** — what this intent watches for before it activates.
-      Format: {"actor": "any"|"character_name", "action_type": "any"|"speech"|"...", "target_match": "any"|"target_string"}.
-      Example for "wait for Marek to speak": {"actor": "Marek Stonehand", "action_type": "speech", "target_match": "any"}.
-      Empty dict = no trigger (action starts immediately at t_start).
-    **trigger_priority** — lower values fire first on multi-match. Default 0.
-    **on_trigger** — what happens when trigger_condition matches.
-      "interrupt_with_new_decision" (default) — re-invoke you; describe what you noticed.
-      "apply_prepared_reaction" — automatically execute prepared_reaction without re-invocation.
-    **prepared_reaction** — pre-written response that fires automatically on trigger match.
-      Only used when on_trigger="apply_prepared_reaction".
-      Format: same as a declare_intent call but without trigger fields.
-      Example: {"action_type": "speech", "target": "Marek", "description": "\\"I heard that.\\"", "duration": "5s"}
-    **on_timeout** — what happens if duration expires without trigger matching.
-      Format: same as a declare_intent call but without trigger/timing fields.
-      Only meaningful for persistent subscriptions with bounded duration.
-    **absorption** — how available you are to the world during this action.
-      "alert" (default) — retain background awareness. May be interrupted.
-      "immersed" — fully committed. Only interruptible by direct physical threat.
+    Args:
+        action_type: The kind of behaviour — speech, movement, combat, or
+            cosmetic. The kind decides which of the remaining fields carry
+            meaning.
+        target: What the behaviour is directed at: an entity, "self" when it is
+            turned on yourself, "all" when it is addressed to whoever is
+            present, or "area" when it covers a region rather than a thing.
+        description: Everything the character does and says, written out: the
+            words spoken, the movement, the manner of it. The scene is narrated
+            from this text, so nothing observable may be left out of it.
+        t_start: When the attempt begins, as a duration from now (s, m, h, d);
+            "0s" begins immediately.
+        duration: How long the attempt is sustained, in the same units. Empty
+            with no trigger makes it instantaneous; empty with a trigger makes
+            it a standing readiness that holds until the trigger fires.
+        visibility: "public" makes the attempt apparent to anyone who could
+            notice you; "private" is a concealed attempt, learned of by others
+            only if a perception check succeeds.
+        area: The extent affected when the target is "area" — its shape and
+            its size.
+        trigger_condition: Turns the intent into a standing readiness rather
+            than an immediate act: in words, what you are watching for. It is
+            held until the condition does.
+        on_trigger: What happens when the condition is met — interrupt you for
+            a new decision, or carry out the prepared reaction without asking
+            you again.
+        prepared_reaction: What you do when the condition is met, written out in
+            advance so that no new decision is needed. It is a declaration of
+            the same shape, without the trigger fields.
+        absorption: How available you stay to events beyond your own attempt,
+            for as long as it lasts: "alert" keeps background awareness,
+            "immersed" commits your attention to the attempt and answers only
+            to direct physical threat.
     """
     if logs_enabled():
         print(f"[trace] {_CHARACTER_NAME} declares: {action_type} -> {target}")
-    return f"[intent] {_CHARACTER_NAME}: {action_type} on {target} ({visibility})\n{description}"
+    return f"Declared: {action_type} on {target} ({visibility}).\n{description}"
 
 
 @tool
 def cancel_subscription(subscription_ids: List[str]) -> str:
-    """Cancel one or more of your own active persistent subscriptions (declare_intent
-    calls made earlier with an empty ``duration``).
+    """Withdraw standing intents you declared earlier.
+
+    Only your own, and only those that wait for a trigger: an attempt that was
+    going to happen at a set time cannot be withdrawn this way.
 
     Args:
-        subscription_ids: Subscription ids to cancel (as given to you in your context).
+        subscription_ids: The intents to withdraw, by the ids given to you in
+            your context.
     """
     global _CANCELLED_SUBSCRIPTION_IDS
     ids = [str(x).strip() for x in (subscription_ids or []) if str(x).strip()]
     _CANCELLED_SUBSCRIPTION_IDS.extend(ids)
     if logs_enabled():
         print(f"[trace] {_CHARACTER_NAME} cancels subscriptions: {ids}")
-    return f"[cancelled] {', '.join(ids) if ids else '(none)'}"
+    return (f"You withdrew: {', '.join(ids)}." if ids
+            else "You withdrew nothing.")
 
 
 @tool
 def recall(query: str) -> dict:
-    """Ask the Scene Manager what you remember.
+    """Ask what you remember.
+
+    Memory answers about what has passed — earlier turns, earlier places, what
+    you were told and by whom. What stands in front of you now is observe.
 
     Args:
-        query: What to recall.
+        query: What to remember — an event, a person, a place, a question.
     """
     global _CHARACTER_NAME
     
@@ -374,53 +519,14 @@ def recall(query: str) -> dict:
     return {"result": "(pending)", "pending_id": pending_id}
 
 
-@tool
-def establish_disposition(
-    psyche_core: str,
-    ego_rationalization: str,
-    compromise_formation: str,
-) -> str:
-    """Define your psychological baseline for this session.
-
-    Call this ONLY ONCE at the start of a session.
-    Establishes standing internal state independent of present circumstance.
-    Idempotent — subsequent calls return success without re-recording.
-
-    Args:
-        psyche_core (MAX 100 WORDS): JSON string capturing the primary internal
-            vector, standing and independent of present circumstance.
-            Must include:
-              affective_impulse: the dominant internal tension, drive, or state
-                of inertia generated by baseline constitution.
-              phantasm: the structural formula defining cognitive orientation
-                toward external entities — as subjects, instruments, or obstacles.
-            Omit a key only if that substrate is genuinely inert.
-
-        ego_rationalization (MAX 100 WORDS): JSON string capturing the standing
-            processing layer through which psyche_core is habitually filtered.
-            Must include:
-              internal_talk: the habitual operational calculus and
-                tactical reasoning, independent of present circumstance.
-              defense_mechanism: the cognitive loop maintaining coherence with
-                own history and self-image.
-
-        compromise_formation (MAX 100 WORDS): the standing resolution this
-            foundation produces between drive and constraint — what is sought,
-            avoided, guarded against, or open to. Not a plan, not a prediction
-            of events; the durable shape the compromise takes independent of
-            what has not yet happened.
-    """
-    ch = str(_CHARACTER_NAME or "").strip()
-    if logs_enabled():
-        print(f"[trace] {ch}: disposition established")
-    return "[disposition: " + ch + "] established"
-
 
 @tool
 def commit_decision() -> str:
-    """End this invocation. Call when you are done.
+    """Declare your planning finished, so that time may advance.
 
-    Signals that your turn is complete. Any declared intents are saved automatically.
+    Use it once everything you mean to attempt has been declared: the turn then
+    runs forward, the declared attempts are resolved together, and what comes
+    of them reaches you with the next turn.
     """
 
     runtime_character_name = str(_CHARACTER_NAME or "").strip()
@@ -431,6 +537,44 @@ def commit_decision() -> str:
         "character": runtime_character_name,
         "intent": "",
     }, ensure_ascii=False, indent=2)
+
+
+def character_pinned_blocks(character_name: str) -> List[SystemMessage]:
+    """The blocks that sit above this character's history in its own context.
+
+    The description is pinned here: it is the one thing about a character that
+    does not change, so it lives above the history instead of being written into
+    it and re-inserted whenever a trim drops it. The summaries come from the
+    diary through the shared cache, so a block asked for twice in one process is
+    the same object the character's invocation already paid for.
+    """
+    blocks: List[SystemMessage] = []
+    try:
+        cache = get_pinned_block_cache()
+        char_dir = _character_dir(character_name)
+        desc_path = char_dir / "description.json"
+        if desc_path.exists():
+            block = cache.get("identity", desc_path, _build_description_block)
+            if block:
+                blocks.append(SystemMessage(content=f"## Character — {character_name}\n{block}"))
+        diary_path = char_dir / "diary.json"
+        if diary_path.exists():
+            block = cache.get("arc", diary_path, build_character_arc_block)
+            if block:
+                blocks.append(SystemMessage(content=f"## Arc Summaries\n{block}"))
+            block = cache.get("paragraph", diary_path, build_character_paragraph_block)
+            if block:
+                blocks.append(SystemMessage(content=f"## Paragraph Summaries\n{block}"))
+    except Exception as e:
+        if logs_enabled():
+            print(f"[trace] character {character_name}: pinned blocks failed: {e}")
+    return blocks
+
+
+def _build_description_block(description_path: Path) -> str:
+    """The character's narrative description, as its own pinned block."""
+    from world.context import build_character_info_block
+    return build_character_info_block(description_path.parent) or ""
 
 
 def run_player_agent(
@@ -446,8 +590,10 @@ def run_player_agent(
     previous_intent: str = "",
     require_decision: bool = False,
     persist_history: bool = True,
+    establish_disposition: bool = True,
     prompt_path: str = "agents/character_agent/prompt.txt",
     llm: Optional[ChatOpenAI] = None,
+    memory_file: Optional[Path] = None,
 ) -> str:
     global _CHARACTER_NAME, _CURRENT_SCENE_CONTEXT, _SCENE_LOCATION, _WORLD_TIME, _DECLARED_INTENTS
     global _CANCELLED_SUBSCRIPTION_IDS, _NOW_SECONDS
@@ -456,6 +602,7 @@ def run_player_agent(
     _SCENE_LOCATION = scene_location or ""
     _WORLD_TIME = world_time or ""
     _DECLARED_INTENTS = []
+    _SEEN_INTENT_KEYS = set()
     _CANCELLED_SUBSCRIPTION_IDS = []
     try:
         from world.time import WorldTime as _WT
@@ -465,8 +612,24 @@ def run_player_agent(
     
     prompt_text = read_prompt_text(prompt_path).replace("{name}", str(character_name or ""))
 
+    # The character's own text is its inner state. It is kept small because it is
+    # replayed in the session transcript and written into the character's memory.
+    _THOUGHTS_MAX_CHARS = int(os.getenv("LLM_WORLD_CHARACTER_THOUGHTS_MAX_CHARS", "1200") or "1200")
+
     def _truncate_thoughts_text(text: str) -> str:
-        return (text or "").strip()
+        t = (text or "").strip()
+        if len(t) <= _THOUGHTS_MAX_CHARS:
+            return t
+        return t[:_THOUGHTS_MAX_CHARS].rstrip() + " [...truncated]"
+
+    def _record_thoughts(reasoning: str) -> None:
+        """Record the model's own reasoning as inner state, when switched on."""
+        if not _THOUGHTS_BLOCKS_IN_CONTEXT:
+            return
+        t = _truncate_thoughts_text(reasoning)
+        if not t:
+            return
+        state["messages"].append(HumanMessage(content=f"[thoughts]\n{t}"))
 
     if llm is None:
         # Keep character agents' free-text output small so they don't waste tokens
@@ -491,6 +654,7 @@ def run_player_agent(
             max_tokens=max_out,
             title_suffix=f"-character-{int(max_out or 0)}t",
             parallel_tool_calls=True,
+            thinking=False,  # a character acts; adjudicating its own actions is not its part
         )
 
     callbacks = openrouter_logging_callbacks(scope="character", label=character_name)
@@ -502,10 +666,7 @@ def run_player_agent(
     def _build_bound_llm(*, tool_choice: Any = None):
         allowed_tools = [observe, recall, declare_intent,
                          cancel_subscription, commit_decision]
-        try:
-            return llm.bind_tools(allowed_tools, tool_choice=tool_choice).with_config({"callbacks": callbacks})
-        except TypeError:
-            return llm.bind_tools(allowed_tools).with_config({"callbacks": callbacks})
+        return bind_agent_tools(llm, allowed_tools, callbacks=callbacks, tool_choice=tool_choice)
 
     bound_llm = _build_bound_llm()
 
@@ -513,18 +674,26 @@ def run_player_agent(
     limits = limits_from_env()
     workspace_root = Path(__file__).resolve().parent.parent
     game_root = (workspace_root / "game").resolve()
-    history_path = (game_root / "players" / character_name / "messages.json").resolve()
-    memory_path = (game_root / "players" / character_name / "memory.json").resolve()
+    # Where his memory lives: what the game gives him, or what a caller names when
+    # it runs a turn outside the game — and then both of his files stand together.
+    if memory_file:
+        history_path = Path(memory_file).resolve()
+        memory_path = history_path.parent / "memory.json"
+    else:
+        history_path = (game_root / "players" / character_name / "messages.json").resolve()
+        memory_path = (game_root / "players" / character_name / "memory.json").resolve()
 
     def _history_to_messages(history: List[Dict[str, str]]):
+        # Every stored entry is a record the framework authored — never a turn of
+        # the model's own — so all of them are read back the same way, whatever
+        # role they were written with, and in the world's voice: what the file
+        # keeps for the code is not what he reads.
         msgs = []
         for h in history:
             role = (h.get("role") or "").strip().lower()
-            content = str(h.get("content") or "")
-            if role == "user":
-                msgs.append(HumanMessage(content=content))
-            elif role == "assistant":
-                msgs.append(AIMessage(content=content))
+            said = spoken(str(h.get("content") or ""))
+            if role in ("user", "assistant") and said.strip():
+                msgs.append(HumanMessage(content=said))
         return msgs
 
     # Inject self-reflection (if it exists) into the context blob.
@@ -576,14 +745,25 @@ def run_player_agent(
     # в”Ђв”Ђ Build character identity block в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     # This will be persisted in history (not injected into SystemMessage)
     # to enable prefix caching like the Storage Assistant does.
-    _identity_parts = [
-        "## Your Character",
-        json.dumps(
-            {"character": character_name, "description": character_description},
-            ensure_ascii=False, indent=2,
-        ),
-    ]
-    identity_block = "\n\n".join(_identity_parts)
+    # -- The character's own sheet --
+    # Every block whose content changed is written into his history, beside the
+    # record it changed from: nothing is taken out of his memory — what leaves is
+    # what a trim takes. The description is not here: it never changes, so it is
+    # pinned above the history.
+    #
+    # His session works on a branch of his own memory: what he is told, and what
+    # his sheet becomes, are entered there and merged when the session ends. He
+    # reads the branch and the thread as one, so nothing he was told is visible
+    # only to a later session.
+    own_memory = memory_at(history_path)
+    if persist_history:
+        own_memory.open_branch()
+        try:
+            from .entity_blocks import sync_character_sheet
+            sync_character_sheet(character_name, history_path, limits)
+        except Exception as e:
+            if logs_enabled():
+                print(f"[trace] character {character_name}: sheet sync failed: {e}")
 
     # Build dynamic memory block (reflection + relationships + diary) - placed after stable history
     # so the stable persisted turns remain a clean cacheable prefix
@@ -593,46 +773,21 @@ def run_player_agent(
         _memory_parts.append(json.dumps(reflection_data, ensure_ascii=False, indent=2))
     if stale_rels_note:
         _memory_parts.append(stale_rels_note)
-    if diary_text:
+    # The diary travels in the pinned Arc Summaries / Paragraph Summaries blocks,
+    # which persist across trims, so it is not repeated here as well. It is only
+    # carried in this block when no persisted history means no pinned blocks.
+    if diary_text and not persist_history:
         _memory_parts.append("## Your Diary")
         _memory_parts.append(diary_text)
     memory_block = "\n\n".join(_memory_parts)
 
-    # Load existing history
-    history_msgs = _history_to_messages(load_history(history_path) if history_path.exists() else [])
+    # Load existing history — the thread plus what this session's branch has
+    # added, so a record entered mid-session is read in the same session.
+    history_msgs = _history_to_messages(own_memory.records())
 
-    # Check if identity block exists in history (marker-based detection)
-    IDENTITY_MARKER = "[character_identity_v1]"
-    identity_exists = any(
-        IDENTITY_MARKER in str(getattr(m, "content", "") or "")
-        for m in history_msgs
-    )
-
-    # If identity doesn't exist in history, inject it as the first user message
-    # This happens on first turn or after history trimming removes it
-    if not identity_exists:
-        identity_msg = HumanMessage(content=f"{IDENTITY_MARKER}\n{identity_block}")
-        history_msgs = [identity_msg] + history_msgs
-        # Persist the identity immediately so it's in history for next time
-        if persist_history:
-            append_message(history_path, role="user", content=f"{IDENTITY_MARKER}\n{identity_block}", limits=limits)
-
-    # Load last turn's thoughts for short-term continuity.
-    prev_cycle_thoughts: Optional[str] = None
-    try:
-        if memory_path.exists():
-            import json as _json_mem
-            _mem_data = _json_mem.loads(memory_path.read_text(encoding="utf-8"))
-            if isinstance(_mem_data, list) and _mem_data:
-                _last = _mem_data[-1]
-                if isinstance(_last, dict):
-                    _ts = _last.get("thoughts")
-                    if isinstance(_ts, list) and _ts:
-                        _t = str(_ts[-1] or "").strip()
-                        if _t:
-                            prev_cycle_thoughts = _t
-    except Exception:
-        pass
+    # What the character reasoned is not re-read here: within a session the
+    # conversation itself already carries every [thoughts] record, and across
+    # sessions reasoning is not part of the character's memory.
 
     # Dynamic per-turn context only.
     # Plain text, no JSON — avoids redundancy with scene_location/world_time.
@@ -652,9 +807,7 @@ def run_player_agent(
             context_parts.extend(filtered)
     reality_notice = str(gm_reality_notice or "").strip()
     if reality_notice:
-        context_parts.append(f"[Notice]\n{reality_notice}")
-    if prev_cycle_thoughts:
-        context_parts.append(f"[Previous thoughts]\n{prev_cycle_thoughts}")
+        context_parts.append(f"What you are told:\n{reality_notice}")
 
     context_blob = "\n".join(context_parts)
 
@@ -664,33 +817,25 @@ def run_player_agent(
     if existing_ctx and existing_ctx.get("messages"):
         # Reinvoke: restore previous LLM conversation + append new context
         _DECLARED_INTENTS = list(existing_ctx.get("declared_intents", []))
+        _SEEN_INTENT_KEYS = {
+            (character_name, d.get("action_type",""), str(d.get("target","")), str(d.get("description",""))[:80])
+            for d in _DECLARED_INTENTS if isinstance(d, dict)
+        }
         _CANCELLED_SUBSCRIPTION_IDS = list(existing_ctx.get("cancelled_subscriptions", []))
         state = {"messages": list(existing_ctx["messages"])}
         state["messages"].append(HumanMessage(
-            content=f"[Reinvoke]\n{context_blob}"
+            content=f"What has happened since you decided:\n{context_blob}"
         ))
         if logs_enabled():
             print(f"[trace] character {character_name}: reinvoked, {len(state['messages'])} messages in turn context")
     else:
         # First call this turn вЂ” build fresh context
-        # Build pinned summaries from diary via PinnedBlockCache (only rebuilds on trim)
+        # Build pinned summaries from the diary. The block is rebuilt only when
+        # diary.json itself changes, and the shared cache serves every character:
+        # the source path is part of the cache key.
         pinned_msgs: List[SystemMessage] = []
         if persist_history:
-            try:
-                cache = _PINNED_CACHES.get(character_name)
-                if cache is None:
-                    cache = PinnedBlockCache(history_path)
-                    _PINNED_CACHES[character_name] = cache
-                diary_path = _character_dir(character_name) / "diary.json"
-                if diary_path.exists():
-                    block = cache.get("arc", diary_path, build_character_arc_block)
-                    if block:
-                        pinned_msgs.append(SystemMessage(content=f"[arc_summaries]\n{block}"))
-                    block = cache.get("paragraph", diary_path, build_character_paragraph_block)
-                    if block:
-                        pinned_msgs.append(SystemMessage(content=f"[paragraph_summaries]\n{block}"))
-            except Exception:
-                pass
+            pinned_msgs = character_pinned_blocks(character_name)
         
         state = {
         "messages": [
@@ -701,19 +846,12 @@ def run_player_agent(
                 [HumanMessage(content=memory_block)]
                 if memory_block else []
             ),  # Reflection + diary - after stable history, before scene context
-            HumanMessage(content=f"[session_start]\n{context_blob}"),  # Dynamic scene context
+            HumanMessage(content=context_blob),  # Dynamic scene context
         ]
     }
 
-        _save_character_prompt_snapshot(
-            character_name=character_name,
-            messages=list(state.get("messages") or []),
-            scene_location=scene_location,
-            world_time=world_time,
-        )
-
         if logs_enabled() and history_path.exists() and character_name not in _HISTORY_NOTICE_PRINTED:
-            loaded = load_history(history_path)
+            loaded = own_memory.records()
             if loaded:
                 approx_tokens = 0
                 for h in loaded:
@@ -845,9 +983,7 @@ def run_player_agent(
         return []
 
     max_attempts = int(os.getenv("LLM_WORLD_CHARACTER_TOOL_RETRY_MAX", "8") or "8")
-    max_info_calls = int(os.getenv("LLM_WORLD_CHARACTER_MAX_INFO_CALLS", "4") or "4")
     attempt = 0
-    info_call_count = 0
 
     ai_msg: Any = None
     pre_tool_text = ""
@@ -862,21 +998,17 @@ def run_player_agent(
             parts.append(f"Tool call error: {err}")
         return HumanMessage(content="\n".join(parts))
 
-    # ── Phase 1: Disposition — once per session, skip on reinvoke ──
-    _existing_disp = _SESSION_CONTEXTS.get(character_name, {}).get("disposition")
-    if _existing_disp:
-        _DISP_HUMAN = HumanMessage(content="[disposition_request] (already established)")
-        state["messages"].append(_DISP_HUMAN)
-        state["messages"].append(AIMessage(
-            content=json.dumps(_existing_disp, ensure_ascii=False, indent=2)
-        ))
-    else:
-        _DISPOSITION_TEXT: Optional[str] = None
-        _DISP_HUMAN = HumanMessage(content=(
-            "[disposition_request]\n"
-            "Establish your psychological baseline for this session.\n"
+    # ── Phase 1: Disposition — the opening of a cycle ──
+    # A cycle opens with the psyche he stands on. It is asked at every opening he
+    # is called to declare an intent at, and what he states is entered in his own
+    # memory where it was stated, so his history keeps how he stood at each of
+    # them. Within one cycle he is not asked twice: a character called back to
+    # decide again continues the cycle he is in, and his opening stands.
+    _DISPOSITION_TEXT: Optional[str] = None
+    if establish_disposition:
+        _DISP_QUESTION = (
+            "Establish your standing psychological baseline.\n"
             "Establishes standing internal state independent of present circumstance.\n"
-            "Idempotent — subsequent calls return success without re-recording.\n"
             "\n"
             "Output a JSON object with exactly these fields:\n"
             "{\n"
@@ -892,7 +1024,8 @@ def run_player_agent(
             "}\n"
             "MAX 100 WORDS per string field. Omit a key only if that substrate is genuinely inert.\n"
             "Output ONLY valid JSON — no markdown, no explanations."
-        ))
+        )
+        _DISP_HUMAN = HumanMessage(content="[disposition_request]\n" + _DISP_QUESTION)
         _disposition_llm = _build_bound_llm(tool_choice="none")  # same LLM, tools disabled — prefix cache preserved
         for _disp_attempt in range(3):
             try:
@@ -925,26 +1058,34 @@ def run_player_agent(
                 _parsed = json.loads(_disp_cleaned)
             except Exception:
                 continue
-            if not isinstance(_parsed, dict):
-                continue
-            _pc = _parsed.get("psyche_core")
-            _er = _parsed.get("ego_rationalization")
-            _cf = _parsed.get("compromise_formation")
-            if not isinstance(_pc, dict) or "affective_impulse" not in _pc or "phantasm" not in _pc:
-                continue
-            if not isinstance(_er, dict) or "internal_talk" not in _er or "defense_mechanism" not in _er:
-                continue
-            if not isinstance(_cf, str) or not _cf.strip():
+            if not _valid_baseline(_parsed):
                 continue
             # Valid — store and inject into state (agent sees its disposition in Phase 2)
             _DISPOSITION_TEXT = json.dumps(_parsed, ensure_ascii=False, indent=2)
             _SESSION_CONTEXTS[character_name] = _SESSION_CONTEXTS.get(character_name, {})
             _SESSION_CONTEXTS[character_name]["disposition"] = _parsed
+            if persist_history:
+                # The opening belongs in his memory: what he states here is what
+                # he stood on in this cycle, and the record of it is read beside
+                # the turns he made in it.
+                own_memory.record(
+                    "[disposition]\nYour standing psychological baseline:\n"
+                    + _DISPOSITION_TEXT
+                )
             if logs_enabled():
                 print(f"[trace] {character_name}: disposition established ({len(_DISPOSITION_TEXT)} chars)")
-            state["messages"].append(_DISP_HUMAN)
-            state["messages"].append(AIMessage(content=_DISPOSITION_TEXT))
+            state["messages"].append(HumanMessage(content=(
+                "Your standing psychological baseline:\n"
+                + _DISPOSITION_TEXT
+            )))
             break
+
+    _save_character_prompt_snapshot(
+        character_name=character_name,
+        messages=list(state.get("messages") or []),
+        scene_location=scene_location,
+        world_time=world_time,
+    )
 
     # ── Phase 2: Tool-based turn (tools available, model decides when to use them) ──
     bound_llm = _build_bound_llm(tool_choice=None)
@@ -961,14 +1102,11 @@ def run_player_agent(
         ai_msg = bound_llm.invoke(state["messages"])
 
         pre_tool_text = _truncate_thoughts_text((getattr(ai_msg, "content", "") or ""))
+        ai_reasoning = extract_reasoning(ai_msg)
         tool_calls = _extract_tool_calls(ai_msg)
         allowed_tool_names = _current_allowed_tool_names()
 
         recognized = [tc for tc in tool_calls if str(tc.get("name") or "").strip() in allowed_tool_names]
-
-        # Batch-aware validation
-        recognized_names = [str(tc.get("name", "")).strip() for tc in recognized]
-        BATCH_INFO_TOOLS = {"observe", "recall"}
 
         if len(recognized) == 0:
             why = "no tool call"
@@ -980,27 +1118,18 @@ def run_player_agent(
             _debug_log_invalid_model_output(why=why, msg=ai_msg)
             if logs_enabled():
                 print(f"[trace] character {character_name}: {why} — ending turn without intent")
-            # Save the agent's thoughts (internal monologue, reasoning)
-            if pre_tool_text:
-                state["messages"].append(AIMessage(content=pre_tool_text))
+            # What the model reasoned is the character's inner state; text it wrote
+            # outside a call is not, and is retained in no form.
+            _record_thoughts(ai_reasoning)
             break  # ← same as GM/WM: no tool call = agent has nothing actionable, end turn
 
-        # Allow multiple info-gathering calls, reject mixed batches with non-info
-        if len(recognized) > 1:
-            non_info = [n for n in recognized_names if n not in BATCH_INFO_TOOLS]
-            if non_info:
-                _debug_log_invalid_model_output(why="multiple tool calls", msg=ai_msg)
-                if logs_enabled():
-                    print(f"[trace] character output invalid ({character_name}): multiple tool calls; retrying")
-                state["messages"].append(_retry_instruction(why="multiple tool calls"))
-                continue
-
+        # The model may emit any combination of calls in one response; they are
+        # executed in the order given.
         # в”Ђв”Ђ Batch execution в”Ђв”Ђ
         batch_ai_contents: List[str] = []
         batch_tool_msgs: List[ToolMessage] = []
         is_done = False
         exit_payload = None
-        batch_hit_limit = False
         last_tool_name = ""
 
         try:
@@ -1019,25 +1148,6 @@ def run_player_agent(
                 ai_content = str(getattr(ai_msg, "content") or "")
 
                 if tool_name in ("observe", "recall"):
-                    info_call_count += 1
-                    if info_call_count >= max_info_calls:
-                        guidance = (
-                            f"INFO GATHERING LIMIT REACHED ({info_call_count} queries). "
-                            f"observe and recall are now BLOCKED. "
-                            f"Call declare_intent to declare your action, "
-                            f"then commit_decision to finish."
-                        )
-                        retry_msg = HumanMessage(content="\n".join([
-                            INTERNAL_RETRY_MARKER,
-                            guidance,
-                        ]))
-                        state["messages"].append(retry_msg)
-                        if logs_enabled():
-                            print(f"[trace] {character_name}: info call limit reached ({info_call_count}), blocking observe/recall")
-                        batch_hit_limit = True
-                        attempt -= 1
-                        break
-
                     tool_fn = observe if tool_name == "observe" else recall
                     tool_content = tool_fn.invoke(args, config={"callbacks": callbacks})
                     result_str = json.dumps(tool_content, ensure_ascii=False, indent=2) if isinstance(tool_content, dict) else str(tool_content)
@@ -1045,16 +1155,6 @@ def run_player_agent(
                     batch_tool_msgs.append(ToolMessage(content=result_str, tool_call_id=tool_call_id, name=tool_name))
                     if logs_enabled():
                         print(f"[trace] {character_name} used {tool_name}: {str(args)[:120]}")
-
-                elif tool_name == "establish_disposition":
-                    # Call establish_disposition once per session
-                    tool_content = establish_disposition.invoke(args, config={"callbacks": callbacks})
-                    batch_ai_contents.append(ai_content)
-                    batch_tool_msgs.append(ToolMessage(
-                        content=str(tool_content), tool_call_id=tool_call_id, name=tool_name,
-                    ))
-                    if logs_enabled():
-                        print(f"[trace] {character_name}: disposition established")
 
                 elif tool_name == "declare_intent":
                     # в”Ђв”Ђ Validation в”Ђв”Ђ
@@ -1076,34 +1176,44 @@ def run_player_agent(
                     else:
                         tc_clean = str(tc).strip() if tc else {}
 
-                    from scheduler.timeline import parse_duration_seconds as _parse_dur_sec
+                    from scheduler.timeline import (
+                        new_intent_id,
+                        parse_duration_seconds as _parse_dur_sec,
+                    )
                     t_start_sec = _NOW_SECONDS + _parse_dur_sec(str(args.get("t_start", "0s")), default=0)
                     duration_raw = str(args.get("duration", "")).strip()
-                    has_trigger = bool(args.get("trigger_condition") or {})
+                    has_trigger = bool(str(args.get("trigger_condition") or "").strip())
                     if not duration_raw:
                         t_end_sec = None if has_trigger else t_start_sec
                     else:
                         t_end_sec = t_start_sec + max(0, _parse_dur_sec(duration_raw, default=0))
-                    detection_difficulty_raw = args.get("detection_difficulty")
-                    on_timeout_raw = str(args.get("on_timeout", "")).strip()
+
+                    # Skip if identical intent already declared (deduplicate)
+                    _dup_key = (character_name, _action_type, str(args.get("target", "")).strip(), str(args.get("description", "")).strip()[:80])
+                    if _dup_key in _SEEN_INTENT_KEYS:
+                        if logs_enabled():
+                            print(f"[trace] {character_name}: skipping duplicate declare_intent ({_action_type} -> {args.get('target','?')})")
+                        batch_ai_contents.append(ai_content)
+                        batch_tool_msgs.append(ToolMessage(
+                            content="(duplicate — already declared)", tool_call_id=tool_call_id, name=tool_name,
+                        ))
+                        continue
+                    _SEEN_INTENT_KEYS.add(_dup_key)
 
                     _DECLARED_INTENTS.append({
+                        "id": new_intent_id(),
                         "actor": character_name,
-                        "action_type": str(args.get("action_type", "")).strip(),
+                        "action_type": _action_type,
                         "target": str(args.get("target", "")).strip(),
                         "description": str(args.get("description", "")).strip(),
                         "visibility": str(args.get("visibility", "public")).strip(),
-                        "is_hostile": bool(args.get("is_hostile") or False),
                         "area": (args.get("area", {}) if isinstance(args.get("area", {}), dict) and args.get("area", {}) else None),
-                        "detection_difficulty": (int(detection_difficulty_raw) if detection_difficulty_raw else None),
                         "t_start": t_start_sec,
                         "t_end": t_end_sec,
                         "trigger_condition": tc_clean or None,
-                        "trigger_priority": args.get("trigger_priority", 0),
                         "on_trigger": str(args.get("on_trigger", "interrupt_with_new_decision")).strip(),
                         "prepared_reaction": ({"description": str(args.get("prepared_reaction", "")).strip()}
                                                if str(args.get("prepared_reaction", "")).strip() else None),
-                        "on_timeout": ({"description": on_timeout_raw} if on_timeout_raw else None),
                         "absorption": str(args.get("absorption", "alert")).strip(),
                     })
                     batch_ai_contents.append(ai_content)
@@ -1137,8 +1247,8 @@ def run_player_agent(
                         "declared_intents": list(_DECLARED_INTENTS),
                         "cancel_subscription_ids": list(_CANCELLED_SUBSCRIPTION_IDS),
                     }
-                    if pre_tool_text:
-                        exit_payload["thoughts_text"] = pre_tool_text
+                    if ai_reasoning:
+                        exit_payload["thoughts_text"] = ai_reasoning
                     is_done = True
                     batch_ai_contents.append(ai_content)
                     batch_tool_msgs.append(ToolMessage(
@@ -1148,13 +1258,14 @@ def run_player_agent(
                 else:
                     raise ValueError(f"unrecognized tool: {tool_name}")
 
-            if batch_hit_limit:
-                continue
-
             # в”Ђв”Ђ Flush pending buffer through one SM call в”Ђв”Ђ
             if _PENDING_OBSERVES or _PENDING_RECALLS:
                 all_pending = {"observes": list(_PENDING_OBSERVES), "recalls": list(_PENDING_RECALLS)}
                 answers = _flush_pending_to_sm(character_name, all_pending)
+                # What he asked and what he was told are his from here on: the
+                # session keeps them, and they enter his memory when it closes.
+                _SESSION_ANSWERS.setdefault(character_name, []).extend(
+                    _answers_to_records(all_pending, answers))
                 # Replace stub results with real answers in batch_tool_msgs
                 for i, tm in enumerate(batch_tool_msgs):
                     if tm.name in ("observe", "recall"):
@@ -1175,17 +1286,20 @@ def run_player_agent(
 
             # ── Add batch results to state ──
             # Single AIMessage with ALL tool_calls, then all ToolMessages
+            # The text that accompanied the calls is the character's own inner
+            # state and is recorded as such; the call carries no content.
             if batch_ai_contents:
                 first_content = batch_ai_contents[0]
                 tool_calls_list = [
                     {"name": tm.name, "args": {}, "id": tm.tool_call_id, "type": "tool_call"}
                     for tm in batch_tool_msgs
                 ]
-                if first_content.strip() or tool_calls_list:
-                    state["messages"].append(AIMessage(
-                        content=first_content,
-                        tool_calls=tool_calls_list if tool_calls_list else None,
-                    ))
+                _record_thoughts(ai_reasoning)
+                if tool_calls_list:
+                    _batch_msg = AIMessage(content="", tool_calls=tool_calls_list)
+                    if ai_reasoning:
+                        _batch_msg.additional_kwargs = {"reasoning_content": ai_reasoning}
+                    state["messages"].append(_batch_msg)
             for tm in batch_tool_msgs:
                 state["messages"].append(tm)
 
@@ -1196,21 +1310,63 @@ def run_player_agent(
                         user_mem = json.dumps(mem_obj, ensure_ascii=False, indent=2)
                     except Exception:
                         user_mem = context_blob
-                    decision_block = "[decision]"
-                    _SESSION_CONTEXTS[character_name] = {
-                        "context_blob": user_mem,
-                        "decision_block": decision_block,
-                        "memory_data": {
+                    # The decision block is what this character committed to, taken
+                    # from the declared intents themselves — not generated text and
+                    # never a placeholder. Empty when nothing was declared, and an
+                    # empty block is not written at all.
+                    _lines: List[str] = []
+                    for _it in _DECLARED_INTENTS:
+                        _t0 = int(_it.get("t_start") or 0) - int(_NOW_SECONDS or 0)
+                        _span = f"+{_t0}s"
+                        if _it.get("t_end") is not None:
+                            _span += f"..+{int(_it['t_end']) - int(_NOW_SECONDS or 0)}s"
+                        _lines.append(
+                            f"[intent] {_it.get('action_type', '?')} -> {_it.get('target', '?')} "
+                            f"({_it.get('visibility', 'public')}, {_span})"
+                        )
+                        _desc = str(_it.get("description") or "").strip()
+                        if _desc:
+                            _lines.append("  " + _desc)
+                    if _CANCELLED_SUBSCRIPTION_IDS:
+                        _lines.append("[cancelled] " + ", ".join(_CANCELLED_SUBSCRIPTION_IDS))
+                    decision_block = "\n".join(_lines)
+                    # The turn enters its own records where it ends: the situation
+                    # he was given, what he asked and was told, then what he decided.
+                    # Entered here and not at the session's close, so that they stand
+                    # before whatever the world delivers in the meantime.
+                    try:
+                        record_turn(
+                            character_name,
+                            path=history_path,
+                            situation=user_mem,
+                            answers=_SESSION_ANSWERS.pop(character_name, []),
+                            decision=decision_block,
+                        )
+                    except Exception as e:
+                        if logs_enabled():
+                            print(f"[trace] character {character_name}: turn records failed: {e}")
+                    # Every turn this session produced is kept, so the session
+                    # closes by writing all of them — not only the last one.
+                    _prior_turns = list(
+                        (_SESSION_CONTEXTS.get(character_name, {}) or {})
+                        .get("memory_data", {})
+                        .get("turns", [])
+                    )
+                    _prior_turns.append({
+                        "world_time": world_time,
+                        "scene_location": scene_location,
+                        "outcome": {},
+                    })
+                    _SESSION_CONTEXTS[character_name] = dict(
+                        _SESSION_CONTEXTS.get(character_name) or {},
+                        memory_data={
                             "memory_path": memory_path,
-                            "world_time": world_time,
-                            "scene_location": scene_location,
-                            "thoughts": [],
-                            "outcome": {},
+                            "turns": _prior_turns,
                         },
-                        "messages": list(state["messages"]),
-                        "declared_intents": list(_DECLARED_INTENTS),
-                        "cancelled_subscriptions": list(_CANCELLED_SUBSCRIPTION_IDS),
-                    }
+                        messages=list(state["messages"]),
+                        declared_intents=list(_DECLARED_INTENTS),
+                        cancelled_subscriptions=list(_CANCELLED_SUBSCRIPTION_IDS),
+                    )
                     _SESSION_HISTORY_PATHS[character_name] = history_path
                     _SESSION_LIMITS = limits
                 return json.dumps(exit_payload, ensure_ascii=False, indent=2)
@@ -1219,7 +1375,7 @@ def run_player_agent(
             if logs_enabled():
                 print(f"[trace] character tool execution failed ({character_name}): {last_tool_name}: {e}; retrying")
             if last_tool_name == "commit_decision":
-                err_text = str(e or "")
+                err_text = tool_failure(last_tool_name, e)
                 guidance = (
                     "Fix the arguments and call commit_decision again. "
                     "Do not call observe or recall вЂ” you already have the information you need."
@@ -1230,9 +1386,51 @@ def run_player_agent(
                     guidance,
                 ]))
                 state["messages"].append(retry_msg)
+            elif last_tool_name == "declare_intent":
+                err_text = tool_failure(last_tool_name, e)
+                retry_msg = HumanMessage(content="\n".join([
+                    INTERNAL_RETRY_MARKER,
+                    f"declare_intent failed: {err_text}",
+                ]))
+                state["messages"].append(retry_msg)
             else:
-                state["messages"].append(_retry_instruction(why="tool call failed to execute", err=str(e)))
+                state["messages"].append(_retry_instruction(why="tool call failed to execute", err=tool_failure(last_tool_name, e)))
             continue
+
+    # Agent ended turn without declaring intent. Its text is still its own state:
+    # the turn's thoughts are merged into the session record so the session-end
+    # flush writes them, and the conversation is kept for the next invocation.
+    if persist_history:
+        _skip_ctx = dict(_SESSION_CONTEXTS.get(character_name) or {})
+        _skip_mem = dict(_skip_ctx.get("memory_data") or {})
+        _skip_turns = list(_skip_mem.get("turns") or [])
+        _skip_turns.append({
+            "world_time": world_time,
+            "scene_location": scene_location,
+            "outcome": {},
+        })
+        _skip_mem["memory_path"] = memory_path
+        _skip_mem["turns"] = _skip_turns
+        _skip_ctx["memory_data"] = _skip_mem
+        _skip_ctx["messages"] = list(state["messages"])
+        _skip_ctx.setdefault("declared_intents", list(_DECLARED_INTENTS))
+        _skip_ctx.setdefault("cancelled_subscriptions", list(_CANCELLED_SUBSCRIPTION_IDS))
+        _SESSION_CONTEXTS[character_name] = _skip_ctx
+        _SESSION_HISTORY_PATHS[character_name] = history_path
+        _SESSION_LIMITS = limits
+        # A turn that decided nothing still happened: the situation he was given
+        # and what he asked are his, and they enter his memory where the turn ends.
+        try:
+            record_turn(
+                character_name,
+                path=history_path,
+                situation=context_blob,
+                answers=_SESSION_ANSWERS.pop(character_name, []),
+                decision="",
+            )
+        except Exception as e:
+            if logs_enabled():
+                print(f"[trace] character {character_name}: turn records failed: {e}")
 
     # Agent ended turn without declaring intent — return skip
     return json.dumps({

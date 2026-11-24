@@ -11,7 +11,6 @@ import time
 import json
 import shutil
 from pathlib import Path
-from typing import Optional
 
 _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _project_root not in sys.path:
@@ -21,14 +20,13 @@ import glfw
 import moderngl as mgl
 import imgui
 from imgui.integrations.glfw import GlfwRenderer
-from opengl_app.camera import Camera
 from opengl_app.gui_bridge import GuiBridge as B
 
 # Import panel functions but they're only used in debug mode
 from opengl_app.gui_panels import (
     panel_scene_view, panel_entity_browser, panel_entity_editor,
     panel_story_timeline, panel_event_log, panel_agent_dashboard,
-    panel_prompt_inspector, panel_script_monitor,
+    panel_prompt_inspector, panel_effect_monitor,
     editor_open, _init_style,
 )
 
@@ -38,11 +36,9 @@ class GameState:
     MENU = 0
     PLAYING = 1
     PAUSED = 2
+    READER = 3
 
 state = GameState.MENU
-_save_list: list = []
-_save_slots: list = []
-_selected_slot: int = -1
 _debug_mode: bool = False
 _show_demo: bool = False
 _show_new_game_popup: bool = False
@@ -123,7 +119,7 @@ def _start_game(preset: str = "") -> None:
                 _status_timer = time.time() + 5.0
                 return
 
-            # 1. Copy characters/ from preset to game/characters/
+            # 1. Copy player files from the preset into game/players/
             preset_chars = preset_dir / "players"
             if preset_chars.exists() and preset_chars.is_dir():
                 game_chars.mkdir(parents=True, exist_ok=True)
@@ -462,6 +458,7 @@ def _render_main_menu(display_w: int, display_h: int):
     global _show_new_game_popup, _show_settings, _selected_preset, _init_presets, _show_create_preset_popup
     global _preset_name_input, _preset_plot_input, _preset_create_result
     global _preset_characters, _preset_editing_char, _preset_char_form_data
+    global state
 
     # Responsive panel — fills most of the window nicely
     pw = int(display_w * 0.55)
@@ -616,11 +613,18 @@ def _render_main_menu(display_w: int, display_h: int):
 
     # Vertical center for button block
     saves = _list_saves()
-    num_btns = 4  # New Game, Create Preset, Settings, Exit
+    num_btns = 5  # Sessions, New Game, Create Preset, Settings, Exit
     if saves:
         num_btns += 2  # Continue + Load Game
     total_btn_h = btn_h * num_btns + spacing * (num_btns - 1)
     y = int((ph - total_btn_h) * 0.58)
+
+    imgui.set_cursor_pos(((pw - btn_w) // 2, y))
+    if imgui.button("Sessions", btn_w, btn_h):
+        from opengl_app import reader_panels as _reader
+        _reader.open_reader()
+        state = GameState.READER
+    y += btn_h + spacing
 
     imgui.set_cursor_pos(((pw - btn_w) // 2, y))
     if imgui.button("New Game", btn_w, btn_h):
@@ -929,10 +933,6 @@ def _render_debug_panels(display_w: int, display_h: int):
             imgui.menu_item("Prompt Inspector", None, True)
             imgui.menu_item("Automations", None, True)
             imgui.end_menu()
-        if imgui.begin_menu("Tools"):
-            if imgui.menu_item("Tick (effects+scripts)")[0]:
-                B.tick(current_tick=int(time.time()))
-            imgui.end_menu()
         imgui.end_main_menu_bar()
 
     # Story left panel
@@ -971,7 +971,7 @@ def _render_debug_panels(display_w: int, display_h: int):
 
     imgui.set_next_window_position(rcol_x, row_y)
     imgui.set_next_window_size(rcol_w, int(display_h * 0.20))
-    panel_script_monitor()
+    panel_effect_monitor()
     row_y += int(display_h * 0.20) + 3
 
     imgui.set_next_window_position(rcol_x, row_y)
@@ -982,6 +982,30 @@ def _render_debug_panels(display_w: int, display_h: int):
 # ══════════════════════════════════════════════════════════════════
 #  MAIN LOOP
 # ══════════════════════════════════════════════════════════════════
+
+#: The atlas keeps the ranges alive until the texture is built from them, so the
+#: object stands here rather than in a local that the loaders could outlive.
+_GLYPH_RANGES: list = []
+
+
+def _glyph_ranges():
+    """Everything the game's text is written with, in one atlas.
+
+    Both alphabets the sessions are played in, the punctuation prose arrives
+    with (long dashes, ellipses, quotes), the arrows and marks the reader uses
+    to point at things, and the Latin-1 range that carries the guillemets.
+    """
+    if not _GLYPH_RANGES:
+        _GLYPH_RANGES.append(imgui.GlyphRanges([
+            0x0020, 0x00FF,   # Latin and Latin-1: « » · and the rest
+            0x0400, 0x04FF,   # Cyrillic
+            0x2000, 0x206F,   # punctuation: — … “ ” • ‰
+            0x2190, 0x21FF,   # arrows: ← → ↑ ↓
+            0x25A0, 0x25FF,   # marks: ▸ ◆ ●
+            0,                # the end of the list
+        ]))
+    return _GLYPH_RANGES[0]
+
 
 def main():
     glfw.init()
@@ -996,12 +1020,10 @@ def main():
     glfw.make_context_current(window)
     glfw.swap_interval(1)
 
+    # The window draws the panels and nothing else behind them: a cleared frame,
+    # with no depth buffer and no view to move through.
     ctx = mgl.create_context()
-    ctx.enable(mgl.DEPTH_TEST)
     ctx.clear_color = (0.02, 0.02, 0.06, 1.0)
-
-    camera = Camera(distance=3.5)
-    glfw.set_scroll_callback(window, lambda w, xo, yo: camera.zoom(-yo * 50))
 
     # Dear ImGui
     imgui.create_context()
@@ -1015,7 +1037,13 @@ def main():
 
     # Load font AFTER GlfwRenderer — clear default ProggyClean, load
     # Segoe UI (has Cyrillic), then rebuild GPU texture.
-    font_size = 16.0 * dpi_scale
+    #
+    # The atlas holds the letters of both alphabets the game is played in *and*
+    # the marks prose is written with — dashes, ellipses, quotes, arrows. A mark
+    # that is not in the atlas reads as a question mark in the middle of a
+    # sentence, and «Точки…» on a button becomes «Точки?».
+    glyph_ranges = _glyph_ranges()
+    font_size = 17.0 * dpi_scale
     font_loaded = False
     for fp in ("C:/Windows/Fonts/segoeui.ttf",
                "C:/Windows/Fonts/arial.ttf",
@@ -1024,14 +1052,25 @@ def main():
         if os.path.exists(fp):
             try:
                 io.fonts.clear()
-                io.fonts.add_font_from_file_ttf(fp, font_size, None,
-                                                io.fonts.get_glyph_ranges_cyrillic())
+                io.fonts.add_font_from_file_ttf(fp, font_size, None, glyph_ranges)
                 font_loaded = True
                 break
             except Exception:
                 continue
 
     if font_loaded:
+        # The sessions are read, so they are read in a size meant for reading:
+        # the same face, one step larger, for the reader alone.
+        from opengl_app import reader_panels as _reader
+        for fp in ("C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/arial.ttf"):
+            if not os.path.exists(fp):
+                continue
+            try:
+                _reader.set_reader_font(io.fonts.add_font_from_file_ttf(
+                    fp, 20.0 * dpi_scale, None, glyph_ranges))
+                break
+            except Exception:
+                continue
         impl.refresh_font_texture()
     else:
         print("[App] Warning: no TTF font found, using default (ASCII only)")
@@ -1071,6 +1110,9 @@ def main():
         elif state == GameState.PAUSED:
             _render_game_view(dw, dh)
             _render_pause_menu(dw, dh)
+        elif state == GameState.READER:
+            from opengl_app import reader_panels as _reader
+            _reader.render(dw, dh)
 
         if _show_demo:
             imgui.show_demo_window()

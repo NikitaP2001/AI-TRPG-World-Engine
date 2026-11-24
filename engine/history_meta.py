@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 class HistoryMeta:
@@ -35,6 +35,8 @@ class HistoryMeta:
         return {
             "entries": [],
             "invocation_count": 0,
+            "session_count": 0,
+            "cycle_count": 0,
             "last_summarized_at_idx": -1,
             "last_summarized_paragraph": "",
             "paragraph_count": 0,
@@ -89,6 +91,25 @@ class HistoryMeta:
         self.save(data)
         return data["paragraph_count"]
 
+    def increment_session(self) -> int:
+        """Increment session counter, return new count."""
+        data = self.load()
+        data["session_count"] = data.get("session_count", 0) + 1
+        self.save(data)
+        return data["session_count"]
+
+    def increment_cycle(self) -> int:
+        """Count one resolved cycle and return its number.
+
+        The world's own numbering, through every session: a cycle is the stretch
+        play is actually lived in, and the number is how one stretch is told from
+        another in the agent's memory without a label to say so.
+        """
+        data = self.load()
+        data["cycle_count"] = int(data.get("cycle_count") or 0) + 1
+        self.save(data)
+        return data["cycle_count"]
+
     # ------------------------------------------------------------------
     # Summarization state
     # ------------------------------------------------------------------
@@ -110,6 +131,14 @@ class HistoryMeta:
         return self.load().get("paragraph_count", 0)
 
     @property
+    def session_count(self) -> int:
+        return self.load().get("session_count", 0)
+
+    @property
+    def cycle_count(self) -> int:
+        return int(self.load().get("cycle_count") or 0)
+
+    @property
     def last_summarized_paragraph(self) -> str:
         return self.load().get("last_summarized_paragraph", "")
 
@@ -117,24 +146,26 @@ class HistoryMeta:
     # Last call time tracking
     # ------------------------------------------------------------------
 
-    def set_last_call_time(self, time_str: str) -> None:
+    def set_last_call(self, time_str: str, tick: Optional[int] = None) -> None:
+        """Record when this agent was last invoked.
+
+        Both forms are kept: the readable world time, and the tick that can be
+        compared against the clock to see how long the agent has been idle.
+        """
         data = self.load()
         data["last_call_time"] = str(time_str or "")
+        if tick is not None:
+            data["last_call_tick"] = int(tick)
         self.save(data)
 
     @property
     def last_call_time(self) -> str:
         return self.load().get("last_call_time", "")
 
-    # ------------------------------------------------------------------
-    # News digest marker
-    # ------------------------------------------------------------------
-
-    def set_last_seen_event_id(self, event_id: str) -> None:
-        data = self.load()
-        data["last_seen_event_id"] = str(event_id or "")
-        self.save(data)
-
     @property
-    def last_seen_event_id(self) -> str:
-        return self.load().get("last_seen_event_id", "")
+    def last_call_tick(self) -> int:
+        """World tick of the last invocation; 0 means none recorded yet."""
+        try:
+            return int(self.load().get("last_call_tick") or 0)
+        except Exception:
+            return 0

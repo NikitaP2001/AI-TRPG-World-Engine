@@ -29,10 +29,9 @@ def _get_backend() -> CompositeBackend:
 
 
 def reset_backend() -> None:
-    """Reset the singleton (for testing) and invocation counter."""
+    """Reset the singleton (for testing)."""
     global _backend
     _backend = None
-    JsonFileBackend.reset_invocation_counter()
 
 
 # ── Helpers ──
@@ -66,11 +65,6 @@ def _compact(record: Dict[str, Any]) -> Dict[str, Any]:
 # ── Public API ──
 
 
-def reset_creation_counter() -> None:
-    """Reset per-invocation creation rate limit. Call at start of agent invocation."""
-    JsonFileBackend.reset_invocation_counter()
-
-
 def set_entity(
     id: str = "",
     type: str = "",
@@ -86,7 +80,7 @@ def set_entity(
     parent_location: str = "",
     sublocations: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Create or update any entity.
+    """Create an entity, or change what an existing one is.
 
     Entity type is an arbitrary string defined by the WM — there are no
     reserved types and no per-type schema. Only non-empty values are
@@ -98,19 +92,14 @@ def set_entity(
     Per-type structural rules ("location must have facts") are the WM's
     responsibility via base_type templates, not the engine's.
     """
-    # 1. Check if entity already exists (set_entity is create-only)
-    if id:
-        existing = _get_backend().get(id)
-        if existing is not None:
-            return {"status": "error", "error": f"Entity '{id}' already exists. Use adjust_entity to modify runtime state or position."}
-
-    # 2. Generic form validation (position format, facts safety)
+    # 1. Generic form validation (position format, facts safety)
     err = validate_position(position)
     if err:
         return {"status": "error", "error": f"Invalid position: {err}"}
 
-    # 3. Collect all API params and strip empty/None values
-    #    (tool defaults like gurps={} become "not provided" — not stored)
+    # 2. Collect all API params and strip empty/None values
+    #    (tool defaults like gurps={} become "not provided" — not stored,
+    #    and on an update "not provided" means "leave as it was")
     record = _compact({
         "id": id,
         "type": type,
@@ -178,6 +167,26 @@ def query_entities(
     )
 
 
+def query_page(
+    type_filter: str = "",
+    base_type: str = "",
+    tags: Optional[List[str]] = None,
+    position: Optional[Dict[str, Any]] = None,
+    radius: float = -1.0,
+    facts_search: str = "",
+    include_templates: bool = False,
+    limit: int = 10,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """Search entities and return a bounded picture of the store and the match."""
+    return _get_backend().query_page(
+        type_filter=type_filter, base_type=base_type,
+        tags=tags, position=position, radius=radius,
+        facts_search=facts_search,
+        include_templates=include_templates, limit=limit, offset=offset,
+    )
+
+
 def add_tags(entity_id: str, tags: List[str]) -> Dict[str, Any]:
     """Add tags to an entity."""
     return _get_backend().add_tags(entity_id, tags)
@@ -192,42 +201,21 @@ def set_effect(
     entity_id: str,
     effect_id: str = "",
     stat_deltas: Optional[Dict[str, Any]] = None,
-    per_tick: bool = True,
-    duration_ticks: int = -1,
+    period: int = 0,
+    duration: int = 0,
     description: str = "",
 ) -> Dict[str, Any]:
-    """Apply a persistent stat modifier to an entity."""
+    """Store a stat modifier that lands once every *period* world seconds."""
     return _get_backend().set_effect(
         entity_id=entity_id, effect_id=effect_id,
-        stat_deltas=stat_deltas, per_tick=per_tick,
-        duration_ticks=duration_ticks, description=description,
+        stat_deltas=stat_deltas, period=period,
+        duration=duration, description=description,
     )
 
 
 def remove_effect(entity_id: str, effect_id: str) -> Dict[str, Any]:
     """Remove a named effect from an entity."""
     return _get_backend().remove_effect(entity_id, effect_id)
-
-
-def attach_script(
-    entity_id: str,
-    script_id: str = "",
-    trigger_type: str = "",
-    trigger_params: Optional[Dict[str, Any]] = None,
-    script: str = "",
-    comment: str = "",
-) -> Dict[str, Any]:
-    """Attach a behavior script to an entity."""
-    return _get_backend().attach_script(
-        entity_id=entity_id, script_id=script_id,
-        trigger_type=trigger_type, trigger_params=trigger_params,
-        script=script, comment=comment,
-    )
-
-
-def detach_script(entity_id: str, script_id: str) -> Dict[str, Any]:
-    """Remove a script from an entity."""
-    return _get_backend().detach_script(entity_id, script_id)
 
 
 def adjust_entity(
@@ -331,27 +319,26 @@ def compute_entry_offset(
     return {"offset": entry}
 
 
-def tick(current_tick: int, world_time: int = 0) -> Dict[str, Any]:
-    """Process all effects (per_tick, expiry, auras) and scripts for all entities.
+def advance_world_processes(current_tick: int, world_time: int = 0) -> Dict[str, Any]:
+    """Land every effect that is due.
 
-    Called by orchestrator after each world tick.
+    Called once per cycle, with the world time the cycle has reached. An effect
+    lands every period that has elapsed since it last did, so a world that has
+    moved a day moves a day's worth of its processes with it.
 
     Args:
-        current_tick: Current world tick number.
+        current_tick: World time now, in seconds.
         world_time: Current world time for context.
 
     Returns:
-        Combined summary dict from effect engine and script engine.
+        The effect engine's summary, with the world time it ran at.
     """
     from world_manager.effect_engine import process_all_entities as _process_effects
-    from world_manager.script_engine import process_all_entities as _process_scripts
     backend = _get_backend()._json
 
     effects_result = _process_effects(current_tick, world_time, backend)
-    scripts_result = _process_scripts(current_tick, world_time, backend)
 
     return {
-        "tick": current_tick,
+        "world_time": current_tick,
         "effects": effects_result,
-        "scripts": scripts_result,
     }

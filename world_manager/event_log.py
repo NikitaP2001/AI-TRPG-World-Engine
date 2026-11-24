@@ -1,4 +1,4 @@
-"""4D Event Log — append-only JSONL store for record_event / query_events.
+"""The world's past — append-only JSONL store for create_event / query_events.
 
 Storage: game/entity_store/events.jsonl (append-only JSONL file).
 Index: game/entity_store/events_index.json (rebuilt on write for efficient queries).
@@ -31,7 +31,7 @@ from openrouter_langchain_logging import logs_enabled
 # Storage paths
 # ---------------------------------------------------------------------------
 
-_EVENT_DIR = Path("game") / "entity_store"
+_EVENT_DIR = Path(__file__).resolve().parent.parent / "game" / "entity_store"
 _EVENT_FILE = _EVENT_DIR / "events.jsonl"
 _INDEX_FILE = _EVENT_DIR / "events_index.json"
 
@@ -113,42 +113,37 @@ def _generate_event_id() -> str:
 # ---------------------------------------------------------------------------
 
 
-def record_event(
+def create_event(
     description: str,
     entity_ids: Optional[List[str]] = None,
     position: Optional[Dict[str, Any]] = None,
-    t_override: int = -1,
     tag: str = "",
-    narrative_flag: bool = False,
     causal_parent: str = "",
-    current_tick: int = 0,
 ) -> Dict[str, Any]:
-    """Write an event to the 4D causal log. Append-only.
+    """State that something took place in the world.
+
+    An event is stamped with the world time it took place at, and that stamp is
+    its only time: time in this world is WorldTime, not a count.
 
     Args:
-        description: What happened.
-        entity_ids: Entities causally involved.
-        position: Where it happened.
-        t_override: Specific tick. -1 = current_tick.
-        tag: Single categorical label.
-        narrative_flag: True = appears in GM/SM newspaper.
-        causal_parent: event_id that caused this one.
-        current_tick: Current world tick (provided by orchestrator).
+        description: What took place.
+        entity_ids: Entities involved.
+        position: Where it took place.
+        tag: One label for the kind of occurrence.
+        causal_parent: event_id this one came out of.
     """
     _load()
     event_id = _generate_event_id()
-    tick = t_override if t_override >= 0 else current_tick
+    logged_at = _game_time_str()
 
     event = {
         "event_id": event_id,
         "description": description,
         "entity_ids": entity_ids or [],
         "position": position or {},
-        "tick": tick,
         "tag": tag,
-        "narrative_flag": narrative_flag,
         "causal_parent": causal_parent,
-        "logged_at": _game_time_str(),
+        "logged_at": logged_at,
     }
     _events.append(event)
     global _dirty
@@ -156,14 +151,32 @@ def record_event(
     _save()
 
     if logs_enabled():
-        print(f"[event_log] {event_id}: {tag} @ tick {tick}")
+        print(f"[event_log] {event_id}: {tag} @ {logged_at}")
 
     return {
         "event_id": event_id,
-        "logged_at_tick": tick,
+        "logged_at": logged_at,
         "position_indexed": bool(position),
         "warnings": [],
     }
+
+
+def _seconds_of(value: Any) -> Optional[int]:
+    """World seconds for a world time as written, or None when it cannot be read.
+
+    Accepts the form a record carries (``Y1491-08-17 19:12:00``), with or without
+    the brackets a stamped record wears. A missing or unreadable time is None,
+    never zero: zero is a real moment and a missing one is not.
+    """
+    text = str(value or "").strip().strip("[]").strip()
+    if not text:
+        return None
+    try:
+        from world.time import WorldTime
+
+        return int(WorldTime.parse(text).to_seconds())
+    except Exception:
+        return None
 
 
 def query_events(
@@ -171,17 +184,23 @@ def query_events(
     radius: float = -1.0,
     z_min: float = -999999.0,
     z_max: float = 999999.0,
-    t_from: int = -1,
-    t_to: int = -1,
+    from_time: str = "",
+    to_time: str = "",
     entity_id: str = "",
     tag: str = "",
-    narrative_flag_only: bool = False,
     since_event_id: str = "",
     causal_parent: str = "",
     limit: int = 100,
 ) -> List[Dict[str, Any]]:
-    """Read from the 4D causal event log."""
+    """Read from the causal event log.
+
+    A time bound is a world time — the same written form a record carries in its
+    ``logged_at``. An event whose own time cannot be read is in no window: with a
+    bound given it is left out rather than guessed into place.
+    """
     _load()
+    start = _seconds_of(from_time)
+    end = _seconds_of(to_time)
     results = []
     found_since = not since_event_id  # if no marker, include all
 
@@ -193,11 +212,14 @@ def query_events(
             continue  # skip events before/at the marker
 
         # Time filter
-        ev_tick = ev.get("tick", 0)
-        if t_from >= 0 and ev_tick < t_from:
-            continue
-        if t_to >= 0 and ev_tick > t_to:
-            continue
+        if start is not None or end is not None:
+            at = _seconds_of(ev.get("logged_at"))
+            if at is None:
+                continue
+            if start is not None and at < start:
+                continue
+            if end is not None and at > end:
+                continue
 
         # Tag filter
         if tag and ev.get("tag", "") != tag:
@@ -205,10 +227,6 @@ def query_events(
 
         # Entity filter
         if entity_id and entity_id not in ev.get("entity_ids", []):
-            continue
-
-        # Narrative flag filter
-        if narrative_flag_only and not ev.get("narrative_flag", False):
             continue
 
         # Causal parent filter
@@ -228,9 +246,8 @@ def query_events(
             "description": ev.get("description", ""),
             "entity_ids": ev.get("entity_ids", []),
             "position": ev.get("position", {}),
-            "tick": ev.get("tick", 0),
+            "logged_at": ev.get("logged_at", ""),
             "tag": ev.get("tag", ""),
-            "narrative_flag": ev.get("narrative_flag", False),
             "causal_parent": ev.get("causal_parent", ""),
         })
 

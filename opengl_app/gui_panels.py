@@ -6,7 +6,7 @@ Panels are assembled in opengl_app/main.py.
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import imgui
 
@@ -30,6 +30,14 @@ _COL_HP_LOW = (0.94, 0.27, 0.27, 1.0)   # red
 _COL_FP = (0.23, 0.51, 0.96, 1.0)       # blue
 
 
+def _short_duration(seconds: int) -> str:
+    """World seconds as the shortest readable duration: "2d", "6h", "30m"."""
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size and seconds % size == 0:
+            return f"{seconds // size}{unit}"
+    return f"{seconds}s"
+
+
 def _health_color(ratio: float):
     if ratio > 0.5:
         return _COL_HP
@@ -49,20 +57,47 @@ def _init_style(scale: float = 1.0):
     style.colors[imgui.COLOR_WINDOW_BACKGROUND] = _COL_SURFACE
     style.colors[imgui.COLOR_TITLE_BACKGROUND] = _COL_BG
     style.colors[imgui.COLOR_TITLE_BACKGROUND_ACTIVE] = _COL_BG
+    style.colors[imgui.COLOR_TITLE_BACKGROUND_COLLAPSED] = _COL_BG
     style.colors[imgui.COLOR_FRAME_BACKGROUND] = _COL_SURFACE2
+    style.colors[imgui.COLOR_FRAME_BACKGROUND_HOVERED] = (0.26, 0.31, 0.40, 1.0)
     style.colors[imgui.COLOR_TEXT] = _COL_TEXT
+    style.colors[imgui.COLOR_TEXT_DISABLED] = (0.48, 0.53, 0.60, 1.0)
     style.colors[imgui.COLOR_BORDER] = _COL_BORDER
-    style.colors[imgui.COLOR_BUTTON] = _COL_SURFACE2
+    style.colors[imgui.COLOR_SEPARATOR] = (0.21, 0.26, 0.33, 1.0)
+    style.colors[imgui.COLOR_BUTTON] = (0.19, 0.25, 0.35, 1.0)
+    style.colors[imgui.COLOR_BUTTON_HOVERED] = (0.27, 0.36, 0.50, 1.0)
+    style.colors[imgui.COLOR_BUTTON_ACTIVE] = (0.20, 0.44, 0.85, 1.0)
     style.colors[imgui.COLOR_HEADER] = _COL_SURFACE2
-    # Style dimensions � scale for HiDPI
-    style.window_rounding = 4.0 * scale
-    style.frame_rounding = 3.0 * scale
-    style.child_rounding = 2.0 * scale
-    style.popup_rounding = 2.0 * scale
-    style.grab_rounding = 2.0 * scale
-    style.scrollbar_rounding = 9.0 * scale
-    style.scrollbar_size = 14.0 * scale
-    style.grab_min_size = 10.0 * scale
+    style.colors[imgui.COLOR_HEADER_HOVERED] = (0.24, 0.30, 0.40, 1.0)
+    style.colors[imgui.COLOR_HEADER_ACTIVE] = (0.20, 0.42, 0.80, 1.0)
+    style.colors[imgui.COLOR_SCROLLBAR_BACKGROUND] = (0.10, 0.13, 0.19, 1.0)
+    style.colors[imgui.COLOR_SCROLLBAR_GRAB] = (0.29, 0.35, 0.45, 1.0)
+    style.colors[imgui.COLOR_SCROLLBAR_GRAB_HOVERED] = (0.37, 0.44, 0.56, 1.0)
+    style.colors[imgui.COLOR_SCROLLBAR_GRAB_ACTIVE] = (0.20, 0.44, 0.85, 1.0)
+    style.colors[imgui.COLOR_RESIZE_GRIP] = (0.24, 0.30, 0.40, 1.0)
+    style.colors[imgui.COLOR_RESIZE_GRIP_HOVERED] = (0.34, 0.42, 0.55, 1.0)
+    style.colors[imgui.COLOR_RESIZE_GRIP_ACTIVE] = (0.20, 0.44, 0.85, 1.0)
+    style.colors[imgui.COLOR_POPUP_BACKGROUND] = _COL_SURFACE2
+
+    # Room around and inside the controls — this is what makes them look made
+    # rather than drawn: a label with air, and a body behind it.
+    style.frame_padding = (11.0 * scale, 6.0 * scale)
+    style.window_padding = (14.0 * scale, 12.0 * scale)
+    style.item_spacing = (10.0 * scale, 8.0 * scale)
+    style.item_inner_spacing = (8.0 * scale, 6.0 * scale)
+    style.cell_padding = (8.0 * scale, 6.0 * scale)
+    style.button_text_align = (0.5, 0.5)
+    style.selectable_text_align = (0.0, 0.5)
+    style.window_title_align = (0.0, 0.5)
+    # Style dimensions — scale for HiDPI
+    style.window_rounding = 6.0 * scale
+    style.frame_rounding = 5.0 * scale
+    style.child_rounding = 4.0 * scale
+    style.popup_rounding = 6.0 * scale
+    style.grab_rounding = 4.0 * scale
+    style.scrollbar_rounding = 8.0 * scale
+    style.scrollbar_size = 16.0 * scale
+    style.grab_min_size = 12.0 * scale
     style.indent_spacing = 21.0 * scale
     style.columns_min_spacing = 6.0 * scale
     style.frame_border_size = 1.0 * scale
@@ -214,7 +249,7 @@ def panel_scene_view():
             text = _scene_char_inputs.get(input_key, "").strip()
             if text:
                 # Record as user input event
-                B.record_event(
+                B.create_event(
                     description=f"[player] {current_char}: {text}",
                     entity_ids=[current_char],
                     tag="player_input")
@@ -325,7 +360,7 @@ def panel_entity_editor():
     imgui.separator()
 
     # Tabs
-    tabs = ["facts", "gurps/state", "skills", "equipment", "tags/position", "effects/scripts"]
+    tabs = ["facts", "gurps/state", "skills", "equipment", "tags/position", "effects"]
     for tab in tabs:
         if _editor_tab == tab:
             imgui.text_colored(f"> {tab}", *_COL_ACCENT)
@@ -445,24 +480,21 @@ def panel_entity_editor():
             pos["inside"] = new_inside
             _editor_dirty = True
 
-    elif _editor_tab == "effects/scripts":
+    elif _editor_tab == "effects":
         effects = data.get("effects", [])
         imgui.text(f"Effects ({len(effects)})")
         for ef in effects[:5]:
             desc = ef.get("description", "?")
             delta = ef.get("stat_deltas", {})
-            dur = ef.get("duration_ticks", -1)
-            imgui.bullet_text(f"{desc}  {delta}  {'permanent' if dur < 0 else f'{dur} ticks'}")
+            dur = int(ef.get("duration") or 0)
+            period = int(ef.get("period") or 0)
+            cadence = "once" if period <= 0 else f"every {_short_duration(period)}"
+            lifespan = "until removed" if dur <= 0 else f"for {_short_duration(dur)}"
+            imgui.bullet_text(f"{desc}  {delta}  {cadence}, {lifespan}")
             eid = ef.get("effect_id", "")
             if imgui.small_button(f"Remove##{eid}"):
                 B.remove_effect(data.get("id", ""), eid)
                 _editor_data = B.get_entity(_editor_id) or {}
-
-        imgui.separator()
-        scripts = data.get("scripts", [])
-        imgui.text(f"Scripts ({len(scripts)})")
-        for sc in scripts[:3]:
-            imgui.bullet_text(f"{sc.get('trigger_type', '?')}: {sc.get('comment', '')[:60]}")
 
     imgui.separator()
 
@@ -568,7 +600,7 @@ def panel_event_log():
     for ev in events[:50]:
         desc = ev.get("description", "")
         tag = ev.get("tag", "")
-        tick = ev.get("tick", 0)
+        when = str(ev.get("logged_at") or "")
 
         if _event_filter.strip() and _event_filter.lower() not in desc.lower():
             continue
@@ -583,7 +615,7 @@ def panel_event_log():
         elif tag == "system":
             color = _COL_TEXT2
 
-        imgui.text_colored(f"[{tick}]", *_COL_TEXT2)
+        imgui.text_colored(f"[{when}]", *_COL_TEXT2)
         imgui.same_line()
         imgui.text_colored(desc[:120], *color)
 
@@ -600,13 +632,6 @@ def panel_agent_dashboard():
 
     for agent in ("wm", "gm", "sm"):
         imgui.text_colored(f"[{agent.upper()}]", *_COL_ACCENT)
-
-        # News queue
-        news = B.get_news_queue(agent)
-        if news:
-            imgui.text_colored(f"  news: {len(news)} items", *_COL_WARN)
-        else:
-            imgui.text("  news: empty")
 
         if imgui.small_button(f"Invoke##{agent}"):
             B.invoke_agent(agent, comment="GUI trigger")
@@ -684,13 +709,21 @@ def panel_prompt_inspector():
         # Detect type/label
         label = role
         if role == "system":
-            # Detect known block prefixes
-            for prefix in ["[world_setting]", "[arc_summaries]", "[gm_summaries]",
-                          "[character:", "[reason]", "[newspaper]", "[tools_available]",
-                          "[storage_notice]", "[world_registry]", "[subscription_trigger]",
-                          "[event_summary]", "[human_input]"]:
+            # A pinned block announces itself in its first line; the debug panel
+            # names what it is by that heading.
+            for prefix in ["## World Setting", "## Arc Summaries",
+                          "## Paragraph Summaries", "## Campaign Summaries",
+                          "## Scene Summaries", "## World Summaries",
+                          "## Character — ", "## Storage Notice",
+                          "## World Registry", "## World Orientation",
+                          "## Subscription Trigger", "## Event Summary",
+                          "## Pending Events", "## Faction Snapshot",
+                          "[reason]", "[sm_changes]", "[gm_changes]",
+                          "[wm_changes]", "[awareness]", "[scene]",
+                          "[session_begin]", "[session_end]",
+                          "[tools_available]", "[human_input]"]:
                 if prefix in content[:100]:
-                    label = prefix.rstrip(":]").lstrip("[")
+                    label = prefix.lstrip("#").strip().strip(":]")
                     break
             else:
                 label = f"UNKNOWN: {content[:60]}..."
@@ -727,31 +760,26 @@ def panel_prompt_inspector():
 
 # ── Script/Effect Monitor ──
 
-def panel_script_monitor():
+def panel_effect_monitor():
     imgui.begin("Automations", None, imgui.WINDOW_NO_MOVE | imgui.WINDOW_NO_COLLAPSE | imgui.WINDOW_NO_RESIZE)
 
     entities = B.query_entities(limit=100)
-    active_scripts = 0
     active_effects = 0
 
     for ent in entities:
         eid = ent.get("id", "?")
         effects = ent.get("active_effects", []) or ent.get("effects", [])
-        scripts = ent.get("scripts", [])
         if effects:
             for ef in effects[:3]:
                 desc = ef.get("description", "?")
-                dur = ef.get("duration_ticks", -1)
-                imgui.bullet_text(f"{eid}: {desc} ({'perm' if dur < 0 else f'{dur} ticks'})")
+                dur = int(ef.get("duration") or 0)
+                period = int(ef.get("period") or 0)
+                cadence = "once" if period <= 0 else f"every {_short_duration(period)}"
+                lifespan = "until removed" if dur <= 0 else f"for {_short_duration(dur)}"
+                imgui.bullet_text(f"{eid}: {desc} ({cadence}, {lifespan})")
                 active_effects += 1
-        if scripts:
-            for sc in scripts[:2]:
-                tt = sc.get("trigger_type", "?")
-                cmt = sc.get("comment", "") or sc.get("trigger_type", "")
-                imgui.text_colored(f"  {eid}: [{tt}] {cmt[:60]}", *_COL_WARN)
-                active_scripts += 1
 
-    if active_scripts == 0 and active_effects == 0:
+    if active_effects == 0:
         imgui.text_colored("No active automations", *_COL_TEXT2)
 
     imgui.end()

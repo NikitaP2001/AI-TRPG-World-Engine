@@ -135,7 +135,7 @@ When a scene is running, the main panel shows:
 Requirements:
 - HP/FP bars for each character (color: green > yellow > red)
 - NPC list with current_state visible
-- Recent events from event_log (narrative_flag=True)
+- Recent events from event_log, by world time
 - Character input box sends to SM → character agent loop
 - "Advance turn" button for the orchestrator
 
@@ -162,8 +162,8 @@ Clicking a character in the scene opens a detail overlay:
 ```
 
 Requirements:
-- Read from entity_store via CharacterFileBackend (character files)
-- Read from entity_store via JsonFileBackend (NPC entities)
+- Read player mechanical data from the entity store (`game/entity_store/entities.json`);
+  the player-specific files live under `game/players/{name}/`
 - HP/FP bars for both
 
 ---
@@ -294,7 +294,7 @@ Requirements:
 
 Requirements:
 - Read from `events.jsonl` via `query_events()`
-- Filter by tag, entity_id, time range, narrative_flag
+- Filter by tag, entity_id, world time range
 - Tick marks for automatic events (effects, scripts)
 - Color-coded by source (GM/SM/WM/auto/system)
 - Auto-scroll toggle (default on for new events)
@@ -324,7 +324,7 @@ The OpenGL app (`opengl_app/`) is the intended host for this.
 │    last summary: "Created merchant guild faction..."    │
 │                                                         │
 │  GM ── active ── in scene: The Siren's Rest            │
-│    news queue: 3 items  [show ▾]                       │
+│    unreported changes: 3 items  [show ▾]               │
 │    last summary: "Set negotiation scene..."             │
 │                                                         │
 │  SM ── running ── turn 4/10                             │
@@ -341,7 +341,7 @@ The OpenGL app (`opengl_app/`) is the intended host for this.
 
 Requirements:
 - Agent status: idle, active, error
-- Queue lengths (news queue, scheduler queue)
+- Queue lengths (scheduler queue, pending change outlines)
 - Force-invoke button for each agent
 - Phase/step indicator for SM
 
@@ -375,8 +375,8 @@ rigid categorizer would miss.
 │   7  system  [UNKNOWN: "store_    124   "Storage notice..."   │
 │               age_notice"]                                     │
 │   8  user    [reason]              45    "Negotiation scene"   │
-│   9  user    [newspaper]          210   "Guard injured, door  │
-│                                         opened"               │
+│   9  user    [wm_changes]         210   "entities: 1 changed  │
+│                                         — Guard struck..."    │
 │  10  system  [tools_available]    120   "19 tools"            │
 │  11  user    [human_input]         56    "Continue the scene" │
 │ ───────────────────────────────────────────────────────────── │
@@ -407,11 +407,13 @@ rigid categorizer would miss.
 Requirements:
 - **Every message** in the sequence shown, numbered, with role, detected
   type/label, token size, and a preview of content.
-- **Type/label detection** — scans message content for known block prefixes:
-  `[world_setting]`, `[arc_summaries]`, `[gm_summaries]`,
-  `[character:{name}]`, `[reason]`, `[newspaper]`, `[tools_available]`,
-  `[storage_notice]`, `[world_registry]`, `[subscription_trigger]`,
-  `[event_summary]`, `[human_input]`.
+- **Type/label detection** — scans message content for known block headings:
+  `## World Setting`, `## Arc Summaries`, `## Paragraph Summaries`,
+  `## Campaign Summaries`, `## Scene Summaries`, `## World Summaries`,
+  `## Character — {name}`, `## Storage Notice`, `## World Registry`,
+  `## Subscription Trigger`, `## Event Summary`, and the record markers
+  (`[reason]`, `[sm_changes]`, `[gm_changes]`, `[wm_changes]`,
+  `[session_begin]`, `[session_end]`, `[human_input]`).
 - **Unknown blocks** are labeled `[UNKNOWN: first_60_chars...]` — never hidden.
 - **Tool calls** shown with tool name, arguments preview, return value size.
 - **Tool results** expandable — click to see full JSON.
@@ -549,12 +551,11 @@ class GuiBridge:
 │  │   Engine          │  │   GUI (Dear ImGui panels)    │  │
 │  │                   │  │                              │  │
 │  │  console_app.py   │  │  SceneView    EntityEditor   │  │
-│  │  turn_runner.py   │  │  StoryPanel   EventLogView   │  │
-│  │  entity_core.py   │  │  AgentDash    ScriptMonitor  │  │
+│  │  cycle_runner.py  │  │  StoryPanel   EventLogView   │  │
+│  │  orchestrator.py  │  │  AgentDash    EffectMonitor  │  │
 │  │  tool_registry.py │  │  WorldMap (3D)               │  │
 │  │  effect_engine.py │  │                              │  │
-│  │  script_engine.py │  │  ┌────────────────────────┐  │  │
-│  │  news_queue.py    │  │  │  GuiBridge (thin API) │  │  │
+│  │  history_pipeline │  │  ┌────────────────────────┐  │  │
 │  └──────────────────┘  │  └────────────────────────┘  │  │
 │        │ direct calls  │         │                     │  │
 │        └───────────────┴─────────┘                     │  │
