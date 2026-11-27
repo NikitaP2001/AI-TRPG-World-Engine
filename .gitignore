@@ -17,3 +17,7 @@ rag.txt
 *.parquet
 init
 game
+
+.ohds/
+session_*
+AGENTS.md

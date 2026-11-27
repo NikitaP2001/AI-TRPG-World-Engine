@@ -249,6 +249,12 @@ class Orchestrator:
                     dst_dir.mkdir(parents=True, exist_ok=True)
                     for json_file in char_dir.glob("*.json"):
                         shutil.copy2(json_file, dst_dir / json_file.name)
+                    desc_path = dst_dir / "description.json"
+                    if desc_path.exists():
+                        desc = read_json(desc_path)
+                        if isinstance(desc, dict):
+                            desc["name"] = char_name
+                            write_json(desc_path, desc)
 
             # Also check for legacy flat JSON files
             for f in ["characters.json", "locations.json", "plot.json"]:
@@ -271,6 +277,7 @@ class Orchestrator:
                 for ch_data in chars:
                     char_name = str(ch_data.get("name") or "").strip()
                     if char_name:
+                        ch_data["name"] = char_name
                         dst_dir = game_root / "players" / char_name
                         dst_dir.mkdir(parents=True, exist_ok=True)
                         (dst_dir / "description.json").write_text(
