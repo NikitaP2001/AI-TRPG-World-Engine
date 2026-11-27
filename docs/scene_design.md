@@ -158,9 +158,9 @@ Absorption states how available a character is to the world beyond their own
 declared trigger_condition, for the duration of this intent. The character sets
 this themselves.
 
-- **alert** (default): the character retains background awareness. They remain a
-  candidate for interruption based on significant events within their awareness,
-  even without a matching trigger_condition.
+- **alert** (default): the character retains background awareness, so the manager
+  may interrupt them for significant events within it, even without a matching
+  trigger_condition.
 - **immersed**: the character has committed full attention to this action. They are
   not re-invoked by ordinary events. Interruption only for direct physical threat
   to the character themself.
@@ -205,15 +205,9 @@ A character agent is invoked when:
 
 - They have no currently active intent (their previous interval just ended, or they
   are newly present in the scene). They declare their next intent.
-- An "alert" character at the same location as another character who just declared
-  a new active intent is then invoked to reconsider — they may react or confirm
-  their existing intent continues unchanged.
 - If no character at a location currently has zero active intents — everyone
-  present already has something ongoing declared — no "alert" character at that
-  location is invoked.
-- "Immersed" characters are never invoked by this condition. They are only
-  re-invoked by their own trigger_condition match or by explicit interruption
-  (see §7.1).
+  present already has something ongoing declared — no one at that location is
+  invoked.
 
 This condition is evaluated independently per location.
 

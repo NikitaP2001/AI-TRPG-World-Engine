@@ -1613,10 +1613,7 @@ class SceneManager:
         lines: List[str] = []
         cycle = int(getattr(self, "_cycle_no", 0) or 0)
         lines.append(f"Cycle {cycle} — resolve stage." if cycle else "Resolve stage.")
-        opening = "Player planning cycle ended."
-        if player_names:
-            opening += " Active players: " + ", ".join(str(n) for n in player_names)
-        lines.append(opening)
+        lines.append("Player planning cycle ended.")
 
         if declared:
             lines.append("Declared intents:")

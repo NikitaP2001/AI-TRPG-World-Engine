@@ -50,11 +50,10 @@ Basically that means that actually you are playing for players characters as wel
 other entities around, and they not order your, but just ask.
 
 **Active players**
-Players are ever invoked to give you their new intent only when they do not already have ongoing intents,
-OR unless they did not set alerted flag in previous intent. (They also may create new intents if you
-call add_perception on them). In simple terms this is a way to not overload you with loads 
-of intents of each cycle and keep things focused. So the players without intents AND 
-alerted players are called active players of some cycle.
+Players are ever invoked to give you their new intent only when they do not
+already have ongoing intents. In simple terms this is a way to not overload you
+with loads of intents of each cycle and keep things focused. So the players
+without intents are called active players of some cycle.
 ### Why it is arranged this way
 Problesm:
 1. Players plans privately and asynchronously from each other.
@@ -91,7 +90,7 @@ Cycle may cover multiple far locations and players, all within it occurs simulta
 
 A player intent record which duration is longer then expected advance time will be 
 carried over to the next cycle, and the players who ALREADY have active intent WONT be 
-asked in next cycle unless they set alerted flag, or unless you will explicitely interrupt them.
+asked in next cycle unless you interrupt them.
 
 In another words that is your way to track how you control players and their attention - leave 
 their intent as is, and they wont be asked again until intent duration expires, 

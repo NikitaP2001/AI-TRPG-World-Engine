@@ -843,8 +843,8 @@ def _run_cycle_body(app: "GameOrchestrator", user_msg: Optional[HumanMessage]) -
         except Exception:
             all_players = []
 
-        # Group by location, pick the largest group. Every player standing here
-        # has a place the world holds — the gate above is what decides that.
+        # Group by location. Every player standing here has a place the world
+        # holds; every location is called.
         location_groups: Dict[str, List[str]] = {}
         for ch in all_players:
             if not isinstance(ch, dict):
@@ -859,21 +859,19 @@ def _run_cycle_body(app: "GameOrchestrator", user_msg: Optional[HumanMessage]) -
                 print("[cycle] No players at any location")
             return
 
-        target_loc = max(location_groups, key=lambda k: len(location_groups[k]))
-        players_at_loc = location_groups[target_loc]
-        location = target_loc
         start_time = app.world.get_world_time().to_string()
 
-        # Step 1: players with no active intent
-        no_intent = _players_without_active_intent(app, location)
-        if no_intent:
-            print(f"  Invoking {len(no_intent)} player(s) without active intent: {', '.join(no_intent)}")
-            _invoke_players(
-                app, no_intent,
-                location=location, start_time=start_time,
-                npcs=[], players=players_at_loc,
-                scene_data={},
-            )
+        # Step 1: players with no active intent, at every location
+        for location, players_at_loc in location_groups.items():
+            no_intent = _players_without_active_intent(app, location)
+            if no_intent:
+                print(f"  Invoking {len(no_intent)} player(s) without active intent at {location}: {', '.join(no_intent)}")
+                _invoke_players(
+                    app, no_intent,
+                    location=location, start_time=start_time,
+                    npcs=[], players=players_at_loc,
+                    scene_data={},
+                )
 
         # Step 2 removed: alert re-invoke with generic notice was uninformative.
         # SegmentScheduler handles re-invocation via trigger matching (§4).
