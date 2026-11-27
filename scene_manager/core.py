@@ -1850,11 +1850,13 @@ class SceneManager:
         """Enter what a round brought to pass, where it resolved.
 
         The attempt's own record stands where the review read it, and it is not
-        said again here: what a round adds is that the attempt reached its end and
-        who was there to notice that. So the record names the attempt by the id it
-        stood under and carries those who could see it, and no text of the attempt
-        stands a second time in the memory — an attempt written out again where it
-        resolved would read as if it happened then.
+        said again here: what a round adds is that the attempt reached its end.
+        So the record names the attempt by the id it stood under, and no text of
+        the attempt stands a second time in the memory — an attempt written out
+        again where it resolved would read as if it happened then.
+
+        Who is told of it is not part of the record: that is the scene manager's
+        own call, made with add_perception or an interruption.
 
         Entered here, where the round reached that moment, and not gathered at the
         session's close: a group written at the close would land after everything
@@ -1878,10 +1880,6 @@ class SceneManager:
             if not actor or not ident or actor not in players:
                 continue
             line = f"[accepted] [{ident}] — resolved"
-            seen = [str(n) for n in (getattr(entry, "perceivers", None) or [])
-                    if str(n).strip()]
-            if seen:
-                line += "\n  perceived by: " + ", ".join(seen)
             self._record_history(line)
 
     #: How a record of an exchange opens, by the kind of exchange it was.
