@@ -28,12 +28,6 @@ def _get_backend() -> CompositeBackend:
     return _backend
 
 
-def reset_backend() -> None:
-    """Reset the singleton (for testing)."""
-    global _backend
-    _backend = None
-
-
 # ── Helpers ──
 
 
@@ -270,53 +264,6 @@ def adjust_entity(
         skills=skills,
         equipment=equipment,
     )
-
-
-def compute_entry_offset(
-    source_id: str,
-    target_id: str,
-    exit_offset: List[float],
-) -> Dict[str, Any]:
-    """Compute the entry point offset in target's local space.
-
-    Given a connection from source to target where both entities are inside
-    the same parent (same position.inside), computes where the connection
-    opens in the target's local coordinate system.
-
-    Returns {"offset": [x, y, z]} with the computed entry point,
-    or {"offset": exit_offset} if entities are not in the same parent
-    or position data is insufficient.
-    """
-    backend = _get_backend()
-    source = backend.get(source_id)
-    target = backend.get(target_id)
-    if not source or not target:
-        return {"offset": list(exit_offset)}
-
-    src_pos = source.get("position") or {}
-    tgt_pos = target.get("position") or {}
-
-    src_parent = src_pos.get("inside", "")
-    tgt_parent = tgt_pos.get("inside", "")
-    src_off = src_pos.get("offset")
-    tgt_off = tgt_pos.get("offset")
-
-    # Both must share the same parent and have offsets
-    if not src_parent or src_parent != tgt_parent:
-        return {"offset": list(exit_offset)}
-    if not isinstance(src_off, (list, tuple)) or len(src_off) != 3:
-        return {"offset": list(exit_offset)}
-    if not isinstance(tgt_off, (list, tuple)) or len(tgt_off) != 3:
-        return {"offset": list(exit_offset)}
-
-    # Door position in parent space
-    door_x = src_off[0] + exit_offset[0]
-    door_y = src_off[1] + exit_offset[1]
-    door_z = src_off[2] + exit_offset[2]
-
-    # Entry point in target's local space
-    entry = [door_x - tgt_off[0], door_y - tgt_off[1], door_z - tgt_off[2]]
-    return {"offset": entry}
 
 
 def advance_world_processes(current_tick: int, world_time: int = 0) -> Dict[str, Any]:

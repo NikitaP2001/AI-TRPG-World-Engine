@@ -81,42 +81,6 @@ def answer_lore_question(content: str) -> str:
     return "ok"
 
 
-def parse_game_master_json(text: str) -> Dict[str, Any]:
-    """Best-effort JSON parser for GM outputs.
-
-    Accepts raw JSON, fenced json blocks, or the first outermost object.
-    """
-    raw = (text or "").strip()
-    if not raw:
-        return {}
-    try:
-        obj = json.loads(raw)
-        return obj if isinstance(obj, dict) else {}
-    except Exception:
-        pass
-    fence_start = raw.find("```json")
-    if fence_start != -1:
-        fence_end = raw.find("```", fence_start + 7)
-        if fence_end != -1:
-            inner = raw[fence_start + 7:fence_end].strip()
-            try:
-                obj = json.loads(inner)
-                return obj if isinstance(obj, dict) else {}
-            except Exception:
-                pass
-    brace_start = raw.find("{")
-    if brace_start != -1:
-        brace_end = raw.rfind("}")
-        if brace_end > brace_start:
-            inner = raw[brace_start:brace_end + 1]
-            try:
-                obj = json.loads(inner)
-                return obj if isinstance(obj, dict) else {}
-            except Exception:
-                pass
-    return {}
-
-
 class GameMaster:
     """Game Master agent: ReAct-based world manager. Called on-demand via call_gm()."""
 
@@ -133,14 +97,6 @@ class GameMaster:
     def set_peer_history(self, path: Optional[Path]) -> None:
         """Name the memory this agent reports its changes into (the WM's)."""
         self._peer_history_path = path
-    def inject_delta(self, content: str) -> None:
-        """Inject a standalone world-state delta message into GM history."""
-        if not content or not content.strip():
-            return
-        if not self._history_path:
-            return
-        memory_at(self._history_path).record(content.strip())
-        self._meta.append_entry("auto_injection", content.strip()[:60])
 
     def call_gm(
         self,

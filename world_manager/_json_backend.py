@@ -154,8 +154,6 @@ def _world_time_str() -> str:
 # Helpers
 # ---------------------------------------------------------------------------
 
-_3D_CACHE: Dict[str, List[float]] = {}
-
 
 def _default_store_path() -> Path:
     """Where the entity store lives, anchored at the repository root.
@@ -166,17 +164,6 @@ def _default_store_path() -> Path:
     that one finds a world with nothing in it.
     """
     return Path(__file__).resolve().parent.parent / "game" / "entity_store" / "entities.json"
-
-
-def _latlon_to_3d(lat: float, lon: float) -> List[float]:
-    key = f"{lat:.4f}_{lon:.4f}"
-    if key in _3D_CACHE:
-        return _3D_CACHE[key]
-    lat_r = math.radians(lat)
-    lon_r = math.radians(lon)
-    v = [math.cos(lat_r) * math.cos(lon_r), math.sin(lat_r), math.cos(lat_r) * math.sin(lon_r)]
-    _3D_CACHE[key] = v
-    return v
 
 
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -360,32 +347,6 @@ class JsonFileBackend(EntityBackend):
                     config[field] = dict(rules)
             bt = tmpl.get("base_type", "") or ""
         return config
-
-    def _enforce_budget(self, field: str, value: Any, cfg: Dict) -> Optional[str]:
-        """Check and optionally trim field value against budget. Returns error or None."""
-        budget = cfg.get("budget", {})
-        if not budget:
-            return None
-
-        # Count-based budget
-        count_budget = budget.get("count")
-        if count_budget is not None and isinstance(value, (list, tuple)):
-            if len(value) > count_budget:
-                return f"Field '{field}' exceeds count limit of {count_budget}"
-
-        # Byte budget
-        hard = budget.get("hard")
-        soft = budget.get("soft")
-        if hard is None and soft is None:
-            return None
-        serialized = json.dumps(value, ensure_ascii=False)
-        size = len(serialized.encode("utf-8"))
-
-        if hard is not None and size > hard:
-            return f"Field '{field}' exceeds hard limit of {hard} bytes ({size} bytes)"
-        if soft is not None and size > soft:
-            return None  # Will be soft-trimmed in caller
-        return None
 
     # ── Entity CRUD ──
 

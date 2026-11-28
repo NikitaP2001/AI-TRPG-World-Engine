@@ -296,25 +296,6 @@ def _answers_to_records(
     return out
 
 
-@dataclass
-class CharacterDecision:
-    character_name: str
-    intent: str
-    thoughts: str
-
-
-def _decision_to_json(decision: CharacterDecision) -> str:
-    return json.dumps(
-        {
-            "character": decision.character_name,
-            "intent": decision.intent,
-            "thoughts": decision.thoughts,
-        },
-        ensure_ascii=False,
-        indent=2,
-    )
-
-
 def _safe_filename_stem(text: str) -> str:
     raw = str(text or "").strip()
     if not raw:

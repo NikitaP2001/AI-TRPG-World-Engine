@@ -188,9 +188,3 @@ def pop_due_invocations(
 def pending_invocations() -> List[Dict[str, Any]]:
     """Every queued wake-up, read-only, whatever its time."""
     return _load()
-
-
-def peek_due_invocations(current_tick: int) -> List[Dict[str, Any]]:
-    """Read due invocations without removing them."""
-    queue = _load()
-    return [e for e in queue if 0 <= e.get("scheduled_tick", -1) <= current_tick]

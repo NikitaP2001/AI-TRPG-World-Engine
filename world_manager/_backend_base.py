@@ -124,7 +124,3 @@ class EntityBackend(ABC):
     @abstractmethod
     def remove_effect(self, entity_id: str, effect_id: str) -> Dict[str, Any]:
         ...
-
-    def validate_facts(self, facts: str, entity_id: str = "") -> List[str]:
-        """Check facts for mechanical data. Override in subclass."""
-        return []

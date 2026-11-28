@@ -3,8 +3,6 @@
 Every tool is defined ONCE here. Each agent gets a subset via classmethods:
   ToolRegistry.for_wm() → List[Tool]  (19 tools)
   ToolRegistry.for_gm() → List[Tool]  (18 tools)
-  ToolRegistry.for_sm() → List[Tool]  (11 tools, not used by the Scene Manager,
-    which builds its own set)
 
 A tool's docstring is its whole specification: what the operation means, and
 what every parameter does. Nothing about a tool is documented anywhere else,
@@ -947,17 +945,4 @@ class ToolRegistry:
             # close_invocation.
             close_invocation,
             notify_wm,
-        ]
-
-    @classmethod
-    def for_sm(cls) -> list:
-        return [
-            get_entity_facts,
-            *cls._EVENT_TOOLS,
-            *cls._LIFECYCLE_TOOLS,
-            get_location_info,
-            get_entity_state,
-            adjust_entity,
-            set_effect, remove_effect,
-            escalate_to_gm,
         ]

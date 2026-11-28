@@ -245,42 +245,6 @@ class Ledger:
         known = [(self._records[rid].order, rid) for rid in ids if rid in self._records]
         return [rid for _order, rid in sorted(known)]
 
-    def menu(self, characters: Sequence[str]) -> str:
-        """The session's knowledge at a glance: what it holds, and who knows it.
-
-        Not what an invocation is given — an invocation is given what changed —
-        but what a reader wants when the question is "who knows what by now".
-
-        What each piece says is not repeated here. The piece WAS entered as that
-        text: it stands in the conversation that entered it, and an index that
-        copies it says the same thing twice for the price of both. An id is read
-        beside the act that made it, and there it means something.
-
-        Each character is stated with both sides: what he knows, and what he has
-        not been given. The second is the work still to do, and it is the side
-        that asks for something.
-        """
-        with _LOCK:
-            if not self._records:
-                return ""
-            lines = ["What is known, and who knows it:"]
-            lines.append("  the session holds: " + knowledge_ids(
-                rid for rid, _rec in self._unordered()
-            ))
-            for raw in characters:
-                name = str(raw or "").strip()
-                if not name:
-                    continue
-                knows = self.knows(name)
-                not_known = self.not_known(name)
-                lines.append(f"  {name}")
-                lines.append(f"    {_KNOWS}: {knowledge_ids(knows)}")
-                lines.append(f"    {_NOT_KNOWS}: {knowledge_ids(not_known)}")
-            return "\n".join(lines)
-
-    def __len__(self) -> int:
-        return len(self._records)
-
     def clear(self) -> None:
         """Empty the ledger in place — a new session starts from nothing.
 

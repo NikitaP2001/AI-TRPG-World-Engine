@@ -1,9 +1,8 @@
 """Segment-based intent scheduler — implementation of docs/scene_design.md §3-§5.
 
-This is the deterministic engine described as missing in
-docs/scene_design_implementation_plan.md: everything here is pure/structural
-code. The only two hooks that may call out to the Scene Manager are
-``perception_gate`` (§3.3/§8, private-visibility matches) and
+This is the deterministic engine once described as missing: everything here is
+pure/structural code. The only two hooks that may call out to the Scene Manager
+are ``perception_gate`` (§3.3/§8, private-visibility matches) and
 ``schema_semantic_check`` (§3.1/§8, optional — not wired by default).
 
 Not covered yet (see the implementation plan doc):
@@ -231,22 +230,6 @@ class ResolvedEntry:
             "note": self.note,
             "intent_id": self.intent_id,
         }
-
-    @staticmethod
-    def from_dict(d: Dict[str, Any]) -> "ResolvedEntry":
-        return ResolvedEntry(
-            t_start=int(d.get("t_start") or 0),
-            t_end=int(d.get("t_end") or 0),
-            actor=str(d.get("actor") or ""),
-            action_type=str(d.get("action_type") or ""),
-            target=str(d.get("target") or ""),
-            description=str(d.get("description") or ""),
-            visibility=str(d.get("visibility") or "public"),
-            kind=str(d.get("kind") or "action"),
-            perceivers=list(d.get("perceivers") or []),
-            note=str(d.get("note") or ""),
-            intent_id=str(d.get("intent_id") or ""),
-        )
 
 
 def format_resolved_history_for_sm(entries: List[ResolvedEntry], base_sec: int) -> str:

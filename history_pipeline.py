@@ -13,7 +13,7 @@ session instead of a session later (a branch is read by its owner as it grows).
 What it owns, in one place:
 
 * the branch, and what happens to it when it closes;
-* the world-time stamp on a record (through ``memory_store.stamp``);
+* the world-time stamp on a record (through ``_with_moment``);
 * the identity test — the same thing said twice is written once;
 * replacement, for kinds that are versions of one fact (the catalogue declares
   which: see ``history_kinds``);
@@ -36,7 +36,6 @@ from memory_store import (
     limits_from_env,
     load_history,
     save_history,
-    stamp,
 )
 
 _LOCK = threading.RLock()
@@ -186,42 +185,6 @@ class History:
                                          str(r.get("at") or ""))}
                 for r in self._branch]
         return out
-
-    def envelopes(self) -> List[Dict[str, str]]:
-        """The thread with what the code reads of each record: its kind and moment.
-
-        What a reader of the memory itself needs — the one that finds a session's
-        bounds, what a fact's latest version is, or what happened in a stretch of
-        cycles — without looking at a word of the text to tell.
-        """
-        out: List[Dict[str, str]] = [
-            _stored(r, content=str(r.get("content") or ""))
-            for r in load_history(self._path)]
-        out += [_stored(r, content=_with_moment(str(r.get("content") or ""),
-                                                str(r.get("at") or "")))
-                for r in self._branch]
-        return out
-
-    def drop_fact(self, kind_name: str, key: str) -> int:
-        """Remove the record that versions a fact — the counterpart of replacement.
-
-        A versioned record is written when it differs and replaced when a newer
-        version arrives; when the fact itself stops being true there is nothing
-        left to version, and the record goes. Called with the kind and the key
-        (``history_kinds.replacement_key`` of the record it removes).
-        """
-        with _LOCK:
-            def _matches(record: Dict[str, Any]) -> bool:
-                return self._same_fact(record, kind_name, key)
-
-            self._branch = [r for r in self._branch if not _matches(r)]
-            thread = load_history(self._path)
-            kept = [r for r in thread if not _matches(r)]
-            if len(kept) == len(thread):
-                return 0
-            dropped = len(thread) - len(kept)
-            save_history(self._path, kept, limits=self.limits)
-            return dropped
 
     # ── the write entry point ─────────────────────────────────────────────
 
@@ -472,10 +435,4 @@ def memory_at(path: Path | str, *, limits: Optional[HistoryLimits] = None) -> Hi
         return existing
 
 
-def reset_histories() -> None:
-    """Forget every handle. For tests, and for a restarted process."""
-    with _LOCK:
-        _HISTORIES.clear()
-
-
-__all__ = ["History", "WriteResult", "memory_at", "reset_histories"]
+__all__ = ["History", "WriteResult", "memory_at"]

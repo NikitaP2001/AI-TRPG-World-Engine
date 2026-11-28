@@ -502,51 +502,6 @@ def replacement_key(text: str) -> Optional[str]:
     return _VERSION_SUFFIX_RE.sub("", first)
 
 
-def durability_of(text: str) -> str:
-    """Whether a record survives the close of its branch.
-
-    An unrecognised record follows ``UNKNOWN_DURABILITY``: see the note there.
-    """
-    k = resolve(text)
-    return k.durability if k is not None else UNKNOWN_DURABILITY
-
-
-def is_durable(text: str) -> bool:
-    return durability_of(text) == DURABLE
-
-
-def markerless() -> List[Kind]:
-    """Declared kinds that carry no marker yet, so migration work stays visible."""
-    return [k for k in KINDS if k.match is None]
-
-
-def debris() -> List[Kind]:
-    """Kinds that are not records any more: found in a thread, they go."""
-    return [k for k in KINDS if k.debris]
-
-
 def is_debris(text: str) -> bool:
     k = resolve(text)
     return bool(k is not None and k.debris)
-
-
-def by_durability() -> Dict[str, List[str]]:
-    """The adjustable list itself: what is kept, and what is dropped."""
-    out: Dict[str, List[str]] = {DURABLE: [], BRANCH: []}
-    for k in KINDS:
-        out.setdefault(k.durability, []).append(k.name)
-    return out
-
-
-def describe() -> str:
-    """The catalogue as text — for review, and for anyone changing the list."""
-    lines = []
-    for k in KINDS:
-        marker = k.match.pattern if k.match is not None else "(no marker yet)"
-        key = f" key={k.key}" if k.key else ""
-        replace = " replaces stale" if k.replace_stale else ""
-        lines.append(f"{k.name:22s} {k.durability:8s} {k.author:9s} {marker}{key}{replace}")
-        lines.append(f"{'':22s} {k.doc}")
-        for n in k.notes:
-            lines.append(f"{'':22s} note: {n}")
-    return "\n".join(lines)

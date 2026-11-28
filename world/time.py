@@ -93,28 +93,6 @@ class WorldTime:
             f"{self.hour:02d}:{self.minute:02d}:{int(self.second or 0):02d}"
         )
 
-    def time_of_day(self) -> str:
-        """Return a human-readable label for the current hour."""
-        h = self.hour
-        if h < 5:
-            return "night"
-        if h < 7:
-            return "dawn"
-        if h < 12:
-            return "morning"
-        if h < 14:
-            return "midday"
-        if h < 17:
-            return "afternoon"
-        if h < 19:
-            return "dusk"
-        if h < 22:
-            return "evening"
-        return "night"
-
-    def to_minutes(self) -> int:
-        return self.to_seconds() // 60
-
     def to_seconds(self) -> int:
         return (
             self.year * _seconds_per_year()
@@ -124,10 +102,6 @@ class WorldTime:
             + self.minute * 60
             + int(self.second or 0)
         )
-
-    @staticmethod
-    def from_minutes(total_minutes: int) -> "WorldTime":
-        return WorldTime.from_seconds(int(total_minutes) * 60)
 
     @staticmethod
     def from_seconds(total_seconds: int) -> "WorldTime":
@@ -148,15 +122,6 @@ class WorldTime:
             minute=int(minute),
             second=int(second),
         )
-
-    def add_minutes(self, delta_minutes: int) -> "WorldTime":
-        return WorldTime.from_minutes(self.to_minutes() + int(delta_minutes))
-
-    def add_seconds(self, delta_seconds: int) -> "WorldTime":
-        return WorldTime.from_seconds(self.to_seconds() + int(delta_seconds))
-
-    def add_duration(self, duration: "WorldDuration") -> "WorldTime":
-        return self.add_seconds(duration.to_seconds())
 
 
 @dataclass(frozen=True)
@@ -215,76 +180,6 @@ class WorldDuration:
             raise ValueError("Invalid duration unit")
 
         return WorldDuration.from_seconds(seconds)
-
-    @staticmethod
-    def parse(value: str) -> "WorldDuration":
-        m = _TIME_RE.match((value or "").strip())
-        if not m:
-            raise ValueError("Invalid duration format. Expected: Y0000-00-00 00:00 (optional :SS)")
-
-        year = int(m.group("year"))
-        month = int(m.group("month"))
-        day = int(m.group("day"))
-        hour = int(m.group("hour"))
-        minute = int(m.group("minute"))
-        second = int(m.group("second") or "0")
-
-        if not (0 <= year <= 9999):
-            raise ValueError("Duration year out of range (0..9999)")
-        if not (0 <= month <= 11):
-            raise ValueError("Duration month out of range (0..11)")
-        if not (0 <= day <= 30):
-            raise ValueError("Duration day out of range (0..30)")
-        if not (0 <= hour <= 23):
-            raise ValueError("Duration hour out of range (0..23)")
-        if not (0 <= minute <= 59):
-            raise ValueError("Duration minute out of range (0..59)")
-        if not (0 <= second <= 59):
-            raise ValueError("Duration second out of range (0..59)")
-
-        if year == 0 and month == 0 and day == 0 and hour == 0 and minute == 0 and second == 0:
-            raise ValueError("Duration must be greater than zero")
-
-        return WorldDuration(year=year, month=month, day=day, hour=hour, minute=minute, second=second)
-
-    def to_string(self) -> str:
-        base = f"Y{self.year:04d}-{self.month:02d}-{self.day:02d} {self.hour:02d}:{self.minute:02d}"
-        if int(self.second or 0) != 0:
-            return base + f":{self.second:02d}"
-        return base
-
-    def to_user_string(self) -> str:
-        """Render as the single user-facing duration format.
-
-        Format: <number><unit> using the largest unit that divides evenly.
-        Units: d, h, m, s.
-        """
-
-        total_seconds = int(self.to_seconds())
-        if total_seconds <= 0:
-            raise ValueError("Duration must be greater than zero")
-
-        if total_seconds % _seconds_per_day() == 0:
-            return f"{total_seconds // _seconds_per_day()}d"
-        if total_seconds % 3600 == 0:
-            return f"{total_seconds // 3600}h"
-        if total_seconds % 60 == 0:
-            return f"{total_seconds // 60}m"
-        return f"{total_seconds}s"
-
-    def to_seconds(self) -> int:
-        return (
-            self.year * _seconds_per_year()
-            + self.month * _seconds_per_month()
-            + self.day * _seconds_per_day()
-            + self.hour * 3600
-            + self.minute * 60
-            + int(self.second or 0)
-        )
-
-    @staticmethod
-    def from_minutes(total_minutes: int) -> "WorldDuration":
-        return WorldDuration.from_seconds(int(total_minutes) * 60)
 
     @staticmethod
     def from_seconds(total_seconds: int) -> "WorldDuration":

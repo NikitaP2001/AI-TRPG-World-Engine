@@ -28,12 +28,6 @@ from engine.history_meta import HistoryMeta as WMHistoryMeta
 from engine.invocation import opening
 
 
-WORLD_SETTING_FIELDS = [
-    "world_essence",
-    "gurps_calibration",
-    "initial_world_time",
-]
-
 #: A notice that names only the mode of the wake. It says nothing a later reader
 #: can use, so it is not a record: the invocation itself is kept in the metadata.
 _BARE_NOTICES = {"initialize_world"}
@@ -416,27 +410,6 @@ class WorldManager:
             pass
 
     # ── ReAct-based invocation (world events / subscription triggers) ──
-
-    def initialize_world(
-        self,
-        *,
-        context: Optional[Dict[str, Any]] = None,
-        tools: Optional[List[Any]] = None,
-    ) -> Dict[str, Any]:
-        """First-time WM invocation to define concepts, factions, rules, entities.
-
-        Args:
-            context: Optional dict with characters, plot info.
-            tools: Override tool list (defaults to all WM tools).
-
-        Returns:
-            Dict with "exit_tool", "exit_args", "thinking".
-        """
-        return self.call_wm(
-            notice="initialize_world",
-            context=context,
-            tools=tools,
-        )
 
     def set_peer_history(self, path: Optional[Path]) -> None:
         """Name the memory this agent reports its changes into (the GM's)."""

@@ -190,46 +190,6 @@ def trim_history(messages: List[Dict[str, str]], *, limits: HistoryLimits) -> Li
     return kept
 
 
-def append_message(
-    path: Path,
-    *,
-    role: str,
-    content: str,
-    limits: Optional[HistoryLimits] = None,
-) -> List[Dict[str, str]]:
-    """Append one record, stamped with the world time, trimming if needed.
-
-    The stamp is what lets a record say when it happened: a history without one
-    cannot be summarised in terms of when — only in terms of what.
-
-    Returns the records that no longer fit, oldest first — empty when nothing
-    fell out. What fell out is still in the caller's own context, which is why
-    the caller, and not this function, is the one that can write it down.
-
-    The records are written to the file immediately either way: retention is the
-    caller's business (see engine/history_retirement.py), not this function's.
-    """
-    role = (role or "").strip().lower()
-    if role not in {"user", "assistant"}:
-        return []
-    content = content or ""
-    if not content.strip():
-        return []
-    content = _stamped(content)
-
-    lim = limits or limits_from_env()
-    msgs = load_history(path)
-    msgs.append({"role": role, "content": content})
-    trimmed = trim_history(msgs, limits=lim)
-    dropped: List[Dict[str, str]] = []
-    # Bump trim counter if messages were actually removed
-    if len(trimmed) < len(msgs):
-        _increment_trim_counter(path)
-        dropped = msgs[: len(msgs) - len(trimmed)]
-    _write_json(path, trimmed)
-    return dropped
-
-
 def save_history(
     path: Path,
     messages: List[Dict[str, str]],
@@ -251,30 +211,6 @@ def save_history(
         dropped = msgs[: len(msgs) - len(trimmed)]
     _write_json(path, trimmed)
     return dropped
-
-
-#: A record's own world time, at its front.
-_STAMP_RE = re.compile(r"^\[Y\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] ")
-
-
-def stamp(content: str) -> str:
-    """Prepend the world time, unless there is no clock or it is already there.
-
-    Public because the pipeline that owns the write (history_pipeline) decides
-    what a record looks like; this function only says what the stamp is.
-    """
-    try:
-        from world.clock import now_string
-        now = now_string()
-    except Exception:
-        now = ""
-    if not now or _STAMP_RE.match(content):
-        return content
-    return f"[{now}] {content}"
-
-
-#: Kept for readers of the older private name.
-_stamped = stamp
 
 
 # ---------------------------------------------------------------------------

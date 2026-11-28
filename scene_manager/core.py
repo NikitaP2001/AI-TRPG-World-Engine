@@ -33,32 +33,6 @@ from engine.incidents import phase_guard
 from engine.tool_errors import tool_failure
 from scene_manager.awareness import knowledge_label
 
-_DURATION_EXTRACT_RE = re.compile(
-    r"(\d+)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\b",
-    flags=re.IGNORECASE,
-)
-
-
-def _coerce_duration(raw: str) -> Optional[str]:
-    """Normalize a messy GM-supplied duration string."""
-    raw = (raw or "").strip()
-    if not raw:
-        return None
-    try:
-        WorldDuration.parse_user_input(raw)
-        return raw
-    except ValueError:
-        pass
-    m = _DURATION_EXTRACT_RE.search(raw)
-    if m:
-        candidate = m.group(1) + " " + m.group(2)
-        try:
-            WorldDuration.parse_user_input(candidate)
-            return candidate
-        except ValueError:
-            pass
-    return None
-
 
 def _extract_tool_calls(msg: Any) -> List[Dict[str, Any]]:
     """Extract tool calls from a LangChain message."""
@@ -438,47 +412,6 @@ def _format_intent_lines(
 
 def _context_for_narration(context_text: str) -> str:
     return str(context_text or "")
-
-
-def _prune_context_sections(context_text: str, *, drop_titles: List[str]) -> str:
-    raw = str(context_text or "")
-    if not raw.strip() or not drop_titles:
-        return raw
-    lines = raw.splitlines()
-    drop = {str(x).strip().lower() for x in drop_titles if str(x).strip()}
-    out: List[str] = []
-    skip = False
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("### "):
-            title = stripped[4:].strip().lower()
-            skip = title in drop
-            if not skip:
-                out.append(line)
-            continue
-        if not skip:
-            out.append(line)
-    pruned = "\n".join(out).strip()
-    return (pruned + "\n") if pruned else ""
-
-
-def _format_position(pos: dict) -> str:
-    """Format a position dict to a short string like 'tavern @ (+3,0,0)'."""
-    if not pos or not isinstance(pos, dict):
-        return "?"
-    inside = str(pos.get("inside") or "").strip()
-    near = str(pos.get("near") or "").strip()
-    coords = pos.get("coords")
-    offset = pos.get("offset")
-    if inside:
-        if offset and isinstance(offset, (list, tuple)) and len(offset) >= 2:
-            return f"{inside} @ ({offset[0]},{offset[1]},{offset[2] if len(offset) > 2 else 0})"
-        return inside
-    if near:
-        return f"near {near}"
-    if coords and isinstance(coords, (list, tuple)) and len(coords) >= 2:
-        return f"({coords[0]},{coords[1]})"
-    return str(pos.get("id") or "?")
 
 
 # Tool names that change entity state — results are logged to persistent history
@@ -1445,7 +1378,7 @@ class SceneManager:
     def get_entities_at_location(self, location: str) -> Dict[str, List[str]]:
         """Return {characters: [...], npcs: [...]} at this location.
 
-        Used by determine_next_scene() to auto-include entities.
+        Used by resolve_active_groups() to auto-include entities.
         """
         chars = []
         try:
@@ -1469,82 +1402,6 @@ class SceneManager:
         except Exception:
             pass
         return {"players": chars, "npcs": npcs}
-
-    def determine_next_scene(self, last_scene_location: str) -> Dict[str, Any]:
-        """Find all characters who need a scene (haven't acted) and group them.
-
-        Scene = characters who need to act. No location validation.
-        Returns:
-            {"type": "auto", "location": str, "character_names": [str],
-             "npc_names": [str], "scene_description": ""}
-            or {"type": "no_scene", "reason": "..."}
-        """
-        try:
-            chars = self._world.get_players()
-            wt = self._world.get_world_time()
-            wt_sec = wt.to_seconds()
-
-            # Check for next_scene_hint from end_scene tool
-            next_hint = str(self._world.get_info().get("next_scene_hint") or "").strip()
-            if next_hint:
-                # Clear the hint so it's only used once
-                try:
-                    from world.io import write_json
-                    info = self._world.get_info()
-                    info["next_scene_hint"] = ""
-                    write_json(self._world.paths.info_json, info)
-                except Exception:
-                    pass
-                # Try to find this location
-                locs = self._world.get_locations()
-                if next_hint in locs:
-                    # Gather all characters at or near this location
-                    all_at_loc = self.get_entities_at_location(next_hint)
-                    all_names = all_at_loc["players"]
-                    if all_names:
-                        return {
-                            "type": "auto",
-                            "location": next_hint,
-                            "character_names": all_names,
-                            "npc_names": all_at_loc["npcs"],
-                            "scene_description": "",
-                        }
-
-            # Group characters by location
-            location_groups: Dict[str, List[str]] = {}
-            for ch in chars:
-                if not isinstance(ch, dict):
-                    continue
-                name = str(ch.get("name") or "").strip()
-                loc = str(ch.get("location") or "").strip()
-                if not name or not loc:
-                    continue
-                location_groups.setdefault(loc, []).append(name)
-
-            if not location_groups:
-                return {"type": "no_scene", "reason": "no_characters"}
-
-            # Pick the largest group (all characters at the same location resume together)
-            target_loc = max(location_groups, key=lambda k: len(location_groups[k]))
-            target_chars = location_groups[target_loc]
-
-            # Include other entities at this location
-            all_at_loc = self.get_entities_at_location(target_loc)
-            all_char_names = list(dict.fromkeys(target_chars + all_at_loc["players"]))
-
-            if not all_char_names:
-                return {"type": "no_scene", "reason": "no characters available"}
-
-            return {
-                "type": "auto",
-                "location": target_loc,
-                "character_names": all_char_names,
-                "npc_names": all_at_loc["npcs"],
-                "scene_description": "",
-            }
-
-        except Exception as e:
-            return {"type": "no_scene", "reason": f"error: {e}"}
 
     def resolve_active_groups(self) -> List[Dict[str, Any]]:
         """Return all location groups with characters and NPCs.
@@ -2197,69 +2054,6 @@ class SceneManager:
             if close_after:
                 return
 
-    def run_summary_task(
-        self,
-        *,
-        task_type: str,
-        last_ref: str = "",
-        label: str = "",
-    ) -> Optional[str]:
-        """Run a summarization task: paragraph or arc.
-
-        Builds a request referencing only interaction entries since last summary.
-        No big context dump РІР‚вЂќ the model already has full details in its history.
-
-        Args:
-            task_type: "paragraph" or "arc"
-            last_ref: Last paragraph/arc name to reference as starting point.
-            label: Short label for the task message.
-
-        Returns: summary text or None.
-        """
-        if not self._history_path:
-            return None
-        try:
-            from engine.summarizer import SummaryRunner
-
-            runner = SummaryRunner(
-                self._meta, self._history_path, self._prompt_text,
-                temperature=self._temperature, scope="scene_manager",
-            )
-
-            if task_type == "paragraph":
-                template = (
-                    "[sm_summary_task]\n"
-                    "Summarize the story since \"{last_ref}\".\n"
-                    "Below are the events (auto-injected context excluded):\n\n"
-                    "{refs}\n\n"
-                    "Write a paragraph with short title (3-10 words) and 5-10 sentence summary.\n"
-                )
-            else:
-                template = (
-                    "[sm_arc_summary_task]\n"
-                    "Since arc \"{last_ref}\", "
-                    "10 paragraphs have been summarized.\n"
-                    "Write an arc-level summary.\n"
-                    "Events covered:\n{refs}\n"
-                )
-
-            task_prompt = runner.build_task_prompt(template, last_ref=last_ref)
-            result = runner.run_summary(
-                task_prompt=task_prompt,
-                title_suffix="-scene-manager-summary",
-                label=label or f"{task_type}_summary",
-                extra_pinned=self._pinned_summaries(),
-            )
-            if result:
-                name, summary = result
-                name = name or "Summary"
-                return json.dumps({"name": name, "summary": summary}, ensure_ascii=False)
-            return None
-        except Exception as e:
-            if logs_enabled():
-                print(f"[trace] SM run_summary_task error: {e}")
-            return None
-
     def _run_paragraph_summary(self) -> None:
         """Run paragraph summary from SM's own context. Every 10 sessions.
 
@@ -2361,15 +2155,6 @@ class SceneManager:
         except Exception as e:
             import logging
             logging.exception(f"[scheduler] SM arc_summary failed: {e}")
-
-    def inject_delta(self, content: str) -> None:
-        """Inject a standalone world-state delta message into SM history."""
-        if not content or not content.strip():
-            return
-        if not self._history_path:
-            return
-        self._record_history(content.strip())
-        self._meta.append_entry("auto_injection", content.strip()[:60])
 
     def _pinned_summaries(self) -> List[SystemMessage]:
         """Build pinned summary SystemMessages via PinnedContext (trim-delayed)."""
@@ -2519,38 +2304,3 @@ class SceneManager:
                 "kind": kind,
                 "content": content,
             })
-
-    def clear_session_context_buffer(self) -> None:
-        """Clear the session context buffer after publication."""
-        self._session_context_buffer.clear()
-
-    def _build_history_message(self, payload: Dict[str, Any], default_msg: str) -> str:
-        """Build a compact, durable history entry for a turn."""
-        location = str(payload.get("location") or "").strip()
-        start_time = str(payload.get("cycle_start_time") or "").strip()
-        end_time = str(payload.get("cycle_end_time") or "").strip()
-        char_plans = payload.get("character_plans") if isinstance(payload.get("character_plans"), list) else []
-
-        header_parts: List[str] = []
-        if location:
-            header_parts.append(f"location: {location}")
-        if start_time:
-            header_parts.append(f"start: {start_time}")
-        if end_time:
-            header_parts.append(f"end: {end_time}")
-        parts: List[str] = ["Turn | " + " | ".join(header_parts) if header_parts else "Turn"]
-
-        if char_plans:
-            parts.append("Final character intentions:")
-            for plan in char_plans:
-                if not isinstance(plan, dict):
-                    continue
-                name = str(plan.get("name") or "").strip() or "Unknown"
-                intent = str(plan.get("intent") or plan.get("action") or plan.get("decision") or "").strip()
-                thoughts = str(plan.get("thoughts") or "").strip()
-                line = f"- {name}: {intent or '(no intent)'}"
-                if thoughts:
-                    line += f"\n  thoughts: {thoughts}"
-                parts.append(line)
-
-        return "\n".join(parts)

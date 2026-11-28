@@ -212,10 +212,10 @@ attempt, change its span, cut it short or strike it out, and the advance follows
 what the pool becomes, not what it was.
 
 A cycle that reaches nowhere — nothing declared, nothing standing — moves the
-clock nowhere. The mechanical "no progress" stride of 30s proposed in
-`design/03_zero_progress_fallbacks.md` is gone: a stride nothing named would make
-the stated default false, and the half of that design which gave the stride meaning
-(escalating a stalled cycle to the scene manager) was never built.
+clock nowhere. The mechanical "no progress" stride of 30s proposed earlier is
+gone: a stride nothing named would make the stated default false, and the half
+of that design which gave the stride meaning (escalating a stalled cycle to the
+scene manager) was never built.
 
 The manager shapes that reach through the intents themselves — declaring,
 truncating and cancelling them — rather than by naming a look-ahead point:

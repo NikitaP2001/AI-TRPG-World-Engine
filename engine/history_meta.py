@@ -123,20 +123,8 @@ class HistoryMeta:
         self.save(data)
 
     @property
-    def invocation_count(self) -> int:
-        return self.load().get("invocation_count", 0)
-
-    @property
     def paragraph_count(self) -> int:
         return self.load().get("paragraph_count", 0)
-
-    @property
-    def session_count(self) -> int:
-        return self.load().get("session_count", 0)
-
-    @property
-    def cycle_count(self) -> int:
-        return int(self.load().get("cycle_count") or 0)
 
     @property
     def last_summarized_paragraph(self) -> str:

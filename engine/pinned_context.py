@@ -206,9 +206,6 @@ class PinnedContext:
     def build_invocation(self) -> List[SystemMessage]:
         return list(self._invocation)
 
-    def build_all(self) -> List[SystemMessage]:
-        return self._persistent + self._invocation
-
     def rebuild_storage_notice(self) -> List[SystemMessage]:
         """Rebuild the storage notice from current world state.
         Returns a list with one SystemMessage, or empty list if nothing missing.

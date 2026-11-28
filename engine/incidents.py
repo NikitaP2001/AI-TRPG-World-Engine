@@ -5,7 +5,7 @@ inconsistent. Everything else must be recorded and surfaced.
 
 Three mechanisms:
 
-- ``record_incident`` / ``best_effort`` — count and log a swallowed failure.
+- ``record_incident`` — count and log a swallowed failure.
   Used where the failure is tolerable (best-effort reads, telemetry, optional
   maintenance), so the code stays quiet but we can answer "did this ever fire?".
 - ``guarded_buffer`` — an atomic boundary around a pipeline phase. On failure
@@ -71,18 +71,6 @@ def record_incident(
 
 
 @contextmanager
-def best_effort(category: str, **ctx: Any) -> Iterator[None]:
-    """Silently absorb a failure, but count it.
-
-    Use where the failure is tolerable and the code must keep running.
-    """
-    try:
-        yield
-    except Exception as exc:
-        record_incident(category, exc, **ctx)
-
-
-@contextmanager
 def guarded_buffer(
     buffer: MutableSequence[Any],
     phase: str,
@@ -127,12 +115,6 @@ def phase_guard(phase: str, buffer_attr: str = "_hot_buffer"):
 def incident_counts() -> Dict[str, int]:
     with _LOCK:
         return dict(_COUNTS)
-
-
-def reset_incidents() -> None:
-    with _LOCK:
-        _COUNTS.clear()
-        _LOGGED.clear()
 
 
 def format_incident_report() -> str:

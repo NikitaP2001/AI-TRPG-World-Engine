@@ -158,19 +158,6 @@ class TickScheduler:
             if j.id not in self._state:
                 self._state[j.id] = JobState()
 
-    @property
-    def all_jobs(self) -> Dict[str, Job]:
-        return dict(self._jobs)
-
-    @property
-    def all_states(self) -> Dict[str, JobState]:
-        self._load_state()
-        return dict(self._state)
-
-    def job_state(self, job_id: str) -> Optional[JobState]:
-        self._load_state()
-        return self._state.get(job_id)
-
     # ------------------------------------------------------------------
     # State persistence
     # ------------------------------------------------------------------
@@ -405,16 +392,6 @@ class TickScheduler:
             self._save_state()
 
         return fired
-
-    def reset(self, job_id: Optional[str] = None) -> None:
-        """Reset one or all jobs to idle (next tick re-evaluates triggers)."""
-        if job_id:
-            if job_id in self._state:
-                self._state[job_id] = JobState()
-        else:
-            for jid in self._state:
-                self._state[jid] = JobState()
-        self._save_state()
 
     def increment_session(self) -> None:
         """Call at program start to bump the persistent session counter."""

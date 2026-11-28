@@ -24,17 +24,13 @@ from world import World, WorldTime
 from world.time import WorldTime as _WorldTime
 from scene_manager import SceneManager
 from world_manager import WorldManager
-from gm.game_master import GameMaster, parse_game_master_json
-from gm.history_injector import GMHistoryInjector
-from gm.injection_builders import build_world_meta
-from gm.injection_models import InjectionProfile, InjectionRule, InjectionEngine
+from gm.game_master import GameMaster
 from gm.tools import reset_cycle_lock
-from engine.gm_context import GMContextManager
 from engine.incidents import format_incident_report, record_incident
 
 from scheduler import TickScheduler
 from scheduler.jobs import register_all_jobs
-from memory_store import HistoryLimits, limits_from_env, trim_history, load_history
+from memory_store import limits_from_env
 from openrouter_langchain_logging import logs_enabled
 from bootstrap import initialize_game_dir
 from gm.full_history import gm_max_cycles_from_env
@@ -68,12 +64,6 @@ class Orchestrator:
         # ── GM ──
         self.gm_master_history_path = (self.world.game_root / "game_master_messages.json").resolve()
         self._game_master = GameMaster(history_path=self.gm_master_history_path)
-        self._gm_injector = GMHistoryInjector(
-            game_master=self._game_master,
-            gm_history_path=self.gm_master_history_path,
-            history_limits=self.limits,
-        )
-        self._gm_ctx = GMContextManager(gm_injector=self._gm_injector, world=self.world)
 
         # ── SM ──
         self._sm = SceneManager(
@@ -115,17 +105,6 @@ class Orchestrator:
             ensure_call_records()
         except Exception:
             pass
-
-        # ── Injection engines ──
-        self._engines: Dict[str, InjectionEngine] = {}
-        _gm_loader = lambda: trim_history(load_history(self.gm_master_history_path), limits=self.limits)
-        self._engines["gm"] = InjectionEngine(
-            profile=InjectionProfile("game_master", [
-                InjectionRule("[world_snapshot:world_meta]", build_world_meta, scope="world", priority=100),
-            ]),
-            history_loader=_gm_loader,
-            delta_injector=self._game_master.inject_delta,
-        )
 
         # ── Scheduler ──
         self._scheduler = TickScheduler(
@@ -1102,10 +1081,6 @@ class Orchestrator:
                 break
         # end_session is called by the caller (_run_session.py) —
         # do NOT call it here to avoid double narration.
-
-    def run_cycle(self, user_msg: Optional[HumanMessage] = None) -> None:
-        """Execute one resolution cycle: bootstrap → characters → finalize."""
-        run_cycle(self, user_msg)
 
     def begin_session(self) -> None:
         """Start a new session: SM + character contexts (§1.1)."""

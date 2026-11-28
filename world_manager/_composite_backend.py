@@ -59,7 +59,3 @@ class CompositeBackend(EntityBackend):
 
     def remove_effect(self, entity_id: str, effect_id: str) -> Dict[str, Any]:
         return self._json.remove_effect(entity_id, effect_id)
-
-    def validate_facts(self, facts: str, entity_id: str = "") -> List[str]:
-        from world_manager.entity_validation import validate_facts as _vfacts
-        return _vfacts(facts, entity_id)

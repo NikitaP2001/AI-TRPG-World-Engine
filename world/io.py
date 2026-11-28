@@ -212,14 +212,6 @@ def ensure_file_under_storage_limit(
         )
 
 
-def append_jsonl(path: Path, obj: Any) -> None:
-    with file_lock(path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("", encoding="utf-8") if not path.exists() else None
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
-
-
 def parse_value(value: str) -> Any:
     """Best-effort parse: JSON if possible, otherwise treat as string."""
 
@@ -236,6 +228,5 @@ def parse_value(value: str) -> Any:
 _json_error_snippet = json_error_snippet
 _read_json = read_json
 _write_json = write_json
-_append_jsonl = append_jsonl
 _parse_value = parse_value
 _file_lock = file_lock

@@ -33,10 +33,6 @@ from world.io import _read_json as _locked_read_json, _write_json as _locked_wri
 # ---------------------------------------------------------------------------
 
 DEFAULT_REFLECTION_INTERVAL = 5  # every N memory entries
-MAX_RELATIONSHIPS = 12
-MAX_GOALS = 8
-MAX_BELIEFS = 20
-MAX_EMOTIONAL_STATE_CHARS = 320
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -60,17 +56,6 @@ def _character_dir(name: str) -> Path:
     return _game_root() / "players" / name
 
 
-def _append_jsonl(path: Path, row: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-
-def _clean_text(value: Any, *, max_chars: int = 500) -> str:
-    s = str(value or "").strip()
-    return s
-
-
 def _safe_name_for_logging(name: str) -> str:
     """Sanitize character name for ASCII-safe contexts (HTTP headers, filenames, logging).
 
@@ -84,105 +69,6 @@ def _safe_name_for_logging(name: str) -> str:
     # Also strip Windows-illegal filename chars as a safety net.
     safe = "".join(ch for ch in safe if ch not in '<>:"/\\|?*')
     return safe.strip() or "unknown"
-
-
-def _dedupe_strings(values: Any, *, max_items: int, max_chars: int = 280) -> List[str]:
-    if not isinstance(values, list):
-        return []
-    out: List[str] = []
-    seen: set[str] = set()
-    for item in values:
-        s = _clean_text(item, max_chars=max_chars)
-        if not s:
-            continue
-        key = s.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(s)
-        if len(out) >= max(1, int(max_items)):
-            break
-    return out
-
-
-def _normalize_relationships(values: Any, *, max_items: int) -> List[Dict[str, str]]:
-    if not isinstance(values, list):
-        return []
-    out: List[Dict[str, str]] = []
-    seen: set[str] = set()
-    for item in values:
-        if not isinstance(item, dict):
-            continue
-        entity = _clean_text(item.get("entity"), max_chars=120)
-        if not entity:
-            continue
-        key = entity.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(
-            {
-                "entity": entity,
-                "nature": _clean_text(item.get("nature"), max_chars=120),
-                "attitude": _clean_text(item.get("attitude"), max_chars=120),
-                "notes": _clean_text(item.get("notes"), max_chars=0),
-            }
-        )
-        if len(out) >= max(1, int(max_items)):
-            break
-    return out
-
-
-def _normalize_goals(values: Any, *, max_items: int) -> List[Dict[str, str]]:
-    if not isinstance(values, list):
-        return []
-    out: List[Dict[str, str]] = []
-    seen: set[str] = set()
-    valid_priority = {"immediate", "short-term", "long-term"}
-    valid_status = {"active", "planned", "completed", "abandoned"}
-    for item in values:
-        if not isinstance(item, dict):
-            continue
-        goal = _clean_text(item.get("goal"), max_chars=220)
-        if not goal:
-            continue
-        key = goal.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        pr = _clean_text(item.get("priority"), max_chars=32).lower() or "short-term"
-        st = _clean_text(item.get("status"), max_chars=32).lower() or "active"
-        if pr not in valid_priority:
-            pr = "short-term"
-        if st not in valid_status:
-            st = "active"
-        out.append({"goal": goal, "priority": pr, "status": st})
-        if len(out) >= max(1, int(max_items)):
-            break
-    return out
-
-
-def _apply_reflection_limits(
-    *,
-    character_name: str,
-    new_result: Dict[str, Any],
-    previous_result: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
-    goals = _normalize_goals(new_result.get("goals"), max_items=MAX_GOALS)
-    beliefs = _dedupe_strings(new_result.get("beliefs"), max_items=MAX_BELIEFS, max_chars=220)
-    emotional_state = _clean_text(new_result.get("emotional_state"), max_chars=MAX_EMOTIONAL_STATE_CHARS)
-
-    # Upsert relationships into separate persistent storage (no total-count cap).
-    new_rels = _normalize_relationships(new_result.get("relationships"), max_items=20)
-    if new_rels:
-        _upsert_relationships(character_name, new_rels)
-
-    # reflection.json stores goals / beliefs / emotional_state only.
-    return {
-        "goals": goals,
-        "beliefs": beliefs,
-        "emotional_state": emotional_state,
-    }
 
 
 def _has_nonempty_reflection_content(value: Any) -> bool:
@@ -245,19 +131,6 @@ def relationship_update(
         observation=observation,
     )
     return f"Relationship with {entity} updated."
-
-
-@tool
-def relationship_read(name: str) -> str:
-    """Bring back what you hold about one person.
-
-    Your own accumulated view of them, as it has formed across your dealings —
-    not what the world records about them.
-
-    Args:
-        name: The one to recall, by name.
-    """
-    return _format_relationship_memory(name)
 
 
 # These are referenced by the tools above but defined at module level.
@@ -329,13 +202,6 @@ def _record_observation(
     _write_json(rels_path, data)
 
 
-def _format_relationship_memory(name: str) -> str:
-    """Format stored observations about an entity into a readable string."""
-    # This is called from relationship_read tool, which is invoked during
-    # character agent execution — figure out which character from context.
-    return "Relationship memory lookup requires an active character context."
-
-
 def _get_known_relationships(character_name: str) -> List[Dict[str, str]]:
     """Return a simple name-attitude list for all entities the character has met.
 
@@ -389,32 +255,6 @@ def load_reflection(character_name: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def needs_reflection(character_name: str) -> bool:
-    """Check whether this character is due for a reflection.
-
-    Returns True when reflection OR diary has not been produced in the last
-    `interval` memory entries. This makes retries self-healing: if either
-    phase fails on one turn, the next turn will trigger it again.
-    """
-    interval = get_reflection_interval()
-    entry_count = count_memory_entries(character_name)
-    if entry_count < interval:
-        return False
-
-    reflection = load_reflection(character_name)
-    diary = load_diary(character_name)
-
-    last_reflection_entry_count = 0
-    if reflection:
-        last_reflection_entry_count = int(reflection.get("_meta", {}).get("entry_count", 0) or 0)
-
-    last_diary_entry_count = int(diary.get("_meta", {}).get("entry_count", 0) or 0)
-
-    reflection_is_stale = (entry_count - last_reflection_entry_count) >= interval
-    diary_is_stale = (entry_count - last_diary_entry_count) >= interval
-    return reflection_is_stale or diary_is_stale
-
-
 # ---------------------------------------------------------------------------
 # Relationships storage
 # ---------------------------------------------------------------------------
@@ -451,21 +291,6 @@ def load_relationships(character_name: str) -> List[Dict[str, str]]:
                     })
                     return migrated
     return []
-
-
-def _get_known_entity_names() -> set:
-    """Return lowercase names of all known characters and NPCs from entity store."""
-    known: set = set()
-    try:
-        from world_manager.entity_core import _get_backend
-        backend = _get_backend()
-        for e in backend.query(include_templates=False, limit=200):
-            n = str(e.get("id") or "").strip()
-            if n:
-                known.add(n.lower())
-    except Exception:
-        pass
-    return known
 
 
 def _upsert_relationships(character_name: str, new_rels: List[Dict[str, str]]) -> None:
@@ -519,64 +344,6 @@ def _upsert_relationships(character_name: str, new_rels: List[Dict[str, str]]) -
             "count": len(rel_list),
         },
     })
-
-
-def _get_relevant_relationships(character_name: str) -> List[Dict[str, str]]:
-    """Return relationships for entities currently present at the character's recent locations.
-
-    Algorithm:
-    1. Collect ``scene_location`` values from the last 10 memory.json entries.
-    2. From world/info.json (player characters) and world/npc.json (NPCs), find
-       every entity whose current location matches any of those locations.
-    3. Return the subset of relationships.json whose entity is in that set.
-    """
-    # Step 1: locations from last 10 memory entries.
-    memory_path = _character_dir(character_name) / "memory.json"
-    data = _read_json(memory_path)
-    recent_locs: set = set()
-    if isinstance(data, list):
-        for entry in data[-10:]:
-            if isinstance(entry, dict):
-                meta = entry.get("meta") or {}
-                loc = str(meta.get("scene_location") or "").strip()
-                if loc:
-                    recent_locs.add(loc)
-
-    if not recent_locs:
-        return []
-
-    # Step 2: who is currently at those locations (characters + NPCs).
-    game_root = _game_root()
-    npc_names_from_store = set()
-    try:
-        from world_manager.entity_core import _get_backend
-        backend = _get_backend()
-        for e in backend.query(include_templates=False, limit=200):
-            n = str(e.get("id") or "").strip()
-            if n:
-                npc_names_from_store.add(n.lower())
-    except Exception:
-        pass
-    present_keys: set = set()
-
-    try:
-        from world_manager.entity_core import _get_backend
-        backend = _get_backend()
-        for e in backend.query(include_templates=False, limit=200):
-            name = str(e.get("id") or "").strip()
-            pos = e.get("position", {}) or {}
-            loc = str(pos.get("inside", pos.get("near", ""))).strip()
-            if name and loc in recent_locs:
-                present_keys.add(name.lower())
-    except Exception:
-        pass
-
-    # Step 3: filter relationships to entities that are present.
-    all_rels = load_relationships(character_name)
-    return [
-        r for r in all_rels
-        if str(r.get("entity") or "").strip().lower() in present_keys
-    ]
 
 
 def _get_recently_met_names(character_name: str, exclude_name: str = "") -> List[str]:
@@ -1016,19 +783,6 @@ def _roll_diary_arc_if_needed(character_name: str, diary: Dict[str, Any]) -> Non
         print(f"[trace] diary arc rolled for {safe_name_c} ({len(paras)} paragraphs -> arc)")
 
 
-@tool
-def write_diary_entry(summary: str) -> str:
-    """Write the entry that closes this stretch of your life.
-
-    Args:
-        summary: What happened to you, as you would tell it to yourself later:
-            the events that mattered, what you learned, what you felt about it.
-            It becomes part of the record your own summaries are written from,
-            so write it for a reader who was not there.
-    """
-    return json.dumps({"summary": str(summary or "").strip()}, ensure_ascii=False)
-
-
 def cover_retired_turns(
     character_name: str,
     messages_path: Path,
@@ -1093,7 +847,7 @@ def _run_diary_summary(*, character_name: str, messages_path: Path) -> None:
     """Run the diary summary phase: ask the character to write a diary entry.
 
     This is called AFTER the reflection phase completes.  It uses a separate
-    tool (write_diary_entry) so the character doesn't confuse it with
+    tool so the character doesn't confuse it with
     output_reflection.
     """
     if logs_enabled():

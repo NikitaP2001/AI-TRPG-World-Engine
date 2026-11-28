@@ -6,11 +6,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .json_pointer import get_at_pointer, set_at_pointer, remove_at_pointer
+from .json_pointer import set_at_pointer, remove_at_pointer
 from .time import WorldDuration, WorldTime
 
 from .io import (
-    _append_jsonl,
     _json_error_snippet,
     _parse_value,
     _read_json,
@@ -37,12 +36,6 @@ class WorldPaths:
     @property
     def info_json(self) -> Path:
         return self.root / "info.json"
-
-    @property
-    def locations_json(self) -> Path:
-        # Legacy path — kept for backward compat during migration, now unused.
-        # Locations are stored in entity_store/entities.json with type="location".
-        return self.root / "locations.json"
 
     @property
     def timeline_json(self) -> Path:
@@ -138,15 +131,6 @@ class World:
 
     def _character_description_path(self, name: str) -> Path:
         return self._character_dir(name) / "description.json"
-
-    def _character_state_path(self, name: str) -> Path:
-        return self._character_dir(name) / "state.json"
-
-    def _character_skills_path(self, name: str) -> Path:
-        return self._character_dir(name) / "skills.json"
-
-    def _character_equipment_path(self, name: str) -> Path:
-        return self._character_dir(name) / "equipment.json"
 
     def list_character_names(self) -> List[str]:
         chars_dir = (self._game_root / "players").resolve()
@@ -395,47 +379,6 @@ class World:
         _write_json(desc_path, core)
         return True
 
-    # ------------------------------------------------------------------
-    # Character state.json (GURPS runtime: hp, fp, hunger, etc.)
-    # ------------------------------------------------------------------
-
-    def get_character_state(self, name: str) -> Dict[str, Any]:
-        """Return state.json or {} if not yet initialized."""
-        p = self._character_state_path(name)
-        try:
-            return _read_json(p) if p.exists() else {}
-        except Exception:
-            return {}
-
-    # NOTE: set_character_state — removed (dead code, 0 callers)
-
-    # ------------------------------------------------------------------
-    # Character skills.json (GURPS abilities: core + LRU cache)
-    # ------------------------------------------------------------------
-
-    def get_character_skills(self, name: str) -> Dict[str, Any]:
-        """Return skills.json or {} if not yet initialized."""
-        p = self._character_skills_path(name)
-        try:
-            return _read_json(p) if p.exists() else {}
-        except Exception:
-            return {}
-
-    # NOTE: set_character_skills/set_character_equipment/set_character_state
-    # and _strip_description_field/_strip_noncore_fields have been REMOVED.
-    # These were dead code (0 external callers). Byte budgets, LRU eviction,
-    # and narrative-strip mechanisms are now in _json_backend.py as generic
-    # field-config, applied via _field_config on base_type templates or
-    # form-based defaults — not tied to any type string.
-
-    def get_character_equipment(self, name: str) -> Dict[str, Any]:
-        """Return equipment.json or {} if not yet initialized."""
-        p = self._character_equipment_path(name)
-        try:
-            return _read_json(p) if p.exists() else {}
-        except Exception:
-            return {}
-
     def update_character_json(self, *, name: str, pointer: str, value: str) -> Dict[str, Any]:
         p = self._character_description_path(name)
         parsed = _parse_value(value)
@@ -497,12 +440,6 @@ class World:
     def get_scene(self) -> Dict[str, Any]:
         return self._scene_cache
 
-    def set_scene(self, scene: Dict[str, Any]) -> None:
-        self._scene_cache = dict(scene)
-
-    def clear_scene(self) -> None:
-        self._scene_cache = {"state": ""}
-
     # ------------------------------------------------------------------
     # Timeline store
     def get_timeline(self) -> Dict[str, Any]:
@@ -519,8 +456,3 @@ class World:
 
     def set_timeline(self, timeline: Dict[str, Any]) -> None:
         _write_json(self._paths.timeline_json, timeline)
-
-    def clear_timeline(self) -> None:
-        _write_json(self._paths.timeline_json, {
-            "intents": [], "resolved_history": [], "cursor": 0, "horizon": 0,
-        })

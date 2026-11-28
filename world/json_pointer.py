@@ -30,20 +30,6 @@ def _is_append_token(token: str) -> bool:
     return token == "-"
 
 
-def get_at_pointer(doc: Any, pointer: str) -> Any:
-    cur = doc
-    for token in _split_pointer(pointer):
-        if isinstance(cur, list):
-            if not _is_int_token(token):
-                raise KeyError(f"Expected list index at '{token}'")
-            idx = int(token)
-            cur = cur[idx]
-        elif isinstance(cur, dict):
-            cur = cur[token]
-        else:
-            raise KeyError(f"Cannot traverse into non-container at '{token}'")
-    return cur
-
 
 def set_at_pointer(doc: Any, pointer: str, value: Any, *, create_missing: bool) -> Any:
     tokens = _split_pointer(pointer)

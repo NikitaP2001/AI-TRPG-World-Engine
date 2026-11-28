@@ -19,17 +19,13 @@ from memory_store import approx_token_count, limits_from_env
 # Import watchdog-related items from the dedicated module
 from stream_watchdog import (
     InvalidGMOutputError,
-    StreamAbortError,
-    StreamWatchdog,
     _clear_watchdog_abort,
     _is_watchdog_abort_requested,
     _set_detected_invalid_pattern,
     get_detected_invalid_pattern,
     clear_detected_invalid_pattern,
     _set_shared_accumulated_text,
-    _get_shared_accumulated_text,
     _set_shared_in_tool_call,
-    _get_shared_in_tool_call,
     log_abort_triggered,
 )
 
@@ -271,11 +267,6 @@ class LiveStreamCallback(BaseCallbackHandler):
         self._in_tool_call: bool = False  # Track if we're inside a tool call
         self._in_tool_call_lock = threading.Lock()
         self._current_tool_name: str = "<tool>"  # Track current tool name for context change detection
-
-    def get_accumulated_text(self) -> str:
-        """Thread-safe getter for accumulated text (used by watchdog)."""
-        with self._accumulated_text_lock:
-            return self._accumulated_text
 
     def is_in_tool_call(self) -> bool:
         """Thread-safe check if currently in a tool call (used by watchdog)."""
@@ -682,10 +673,6 @@ def _tool_label(tool_name: str, parsed_input: Any, input_str: str) -> Optional[s
     return None
 
 
-def _truncate_value(value: Any, *, max_chars: int) -> Any:
-    return value
-
-
 def _extract_tool_payload_from_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
     """Best-effort: pull the literal tool schema payload from LangChain callback kwargs.
 
@@ -744,33 +731,6 @@ def _sanitize_tool_output(output: Any) -> Any:
         pass
 
     return output
-
-
-def _get_model_from_any(inp: Any, llm_output: Any) -> Optional[str]:
-    # Prefer llm_output metadata if present.
-    if isinstance(llm_output, dict):
-        for k in ("model", "model_name"):
-            v = llm_output.get(k)
-            if isinstance(v, str) and v.strip():
-                return v
-    if isinstance(inp, dict):
-        # We avoid storing the full serialized payload, but if verbose mode
-        # captured it, we can still extract the model.
-        serialized = inp.get("serialized")
-        if isinstance(serialized, dict):
-            kwargs = serialized.get("kwargs")
-            if isinstance(kwargs, dict):
-                v = kwargs.get("model_name") or kwargs.get("model")
-                if isinstance(v, str) and v.strip():
-                    return v
-    return None
-
-
-def _extract_usage(llm_output: Any) -> Optional[Dict[str, Any]]:
-    if not isinstance(llm_output, dict):
-        return None
-    usage = llm_output.get("token_usage") or llm_output.get("usage")
-    return usage if isinstance(usage, dict) else None
 
 
 def _console_trace_enabled() -> bool:

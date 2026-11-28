@@ -33,13 +33,6 @@ from typing import Any, Dict, List, Optional, Tuple
 #: for the world's own machinery, not for him.
 BLOCKS: Tuple[str, ...] = ("facts", "gurps", "state", "skills", "equipment")
 
-_MARKER_RE = re.compile(
-    r"^\[entity:(?P<name>[^/\]]+)/(?P<block>[^@\]]+)@v:(?P<ver>[0-9a-f]{8})\]$"
-)
-
-#: A record's own world time, at its front (memory_store stamps every record).
-_STAMP_RE = re.compile(r"^\[Y\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] ")
-
 
 def canonical(value: Any) -> str:
     """One text for one content, whatever order the keys arrived in."""
@@ -57,16 +50,6 @@ def render(value: Any) -> str:
 
 def marker(character_name: str, block: str, value: Any) -> str:
     return f"[entity:{character_name}/{block}@v:{block_version(value)}]"
-
-
-def named_block(content: str) -> Optional[Tuple[str, str, str]]:
-    """(owner, block, version) named by a record, or None if it names no block."""
-    first = str(content or "").split("\n", 1)[0]
-    first = _STAMP_RE.sub("", first.strip()).strip()
-    m = _MARKER_RE.match(first)
-    if not m:
-        return None
-    return m.group("name"), m.group("block"), m.group("ver")
 
 
 def current_sheet(character_name: str) -> Dict[str, Any]:
